@@ -1,0 +1,681 @@
+"use strict";
+
+/**
+ * NTQQ Renderer-Layer Bridge (`bridge_renderer.js`)
+ *
+ * Injected into `BrowserWindow.webContents` after page load, and also importable
+ * in standard Node.js for unit tests.
+ *
+ * Exposes `window.__ROSMONTIS_RENDERER_BRIDGE__`:
+ * - Discovers `windowId` (`window.webContentId` / `?webcontentsid=`) and `window.ipcRenderer` / `window.ipcImpl`.
+ * - Executes `invokeNtApi(cmd, args)` over `RM_IPCFROM_RENDERER{windowId}` using the genuine
+ *   NTQQ 3.2.32 frame structure:
+ *     meta: `{ type: "request", callbackId, eventName: "ntApi", peerId: windowId }`
+ *     data: `{ cmdName: cmd, cmdType: "invoke", payload: [args, null] }`
+ *   and resolves/rejects when `RM_IPCFROM_MAIN{windowId}` replies with matching `callbackId`
+ *   and `promiseStatue: "full" | "err"`.
+ * - Registers `ntApi-register` listeners so the main process forwards kernel events to
+ *   `RM_IPCFROM_MAIN{windowId}`.
+ * - Implements `simulateHumanSessionFlow({ chatType, peerUid, guildId, markRead, sendTyping })`
+ *   with session-switch state tracking (`enterType: 2` on old AIO, `enterType: 1` on new AIO)
+ *   and 5-second anti-burst deduplication for `setMsgRead` and `sendShowInputStatusReq`.
+ */
+
+const DEFAULT_REGISTERED_EVENTS = [
+  "nodeIKernelMsgListener/onRecvMsg",
+  "nodeIKernelMsgListener/onMsgInfoListUpdate",
+  "nodeIKernelMsgListener/onAddSendMsg",
+  "nodeIKernelMsgListener/onRichMediaDownloadComplete",
+  "nodeIKernelMsgListener/onKickedOffLine",
+  "nodeIKernelGroupListener/onGroupListUpdate",
+  "nodeIKernelGroupListener/onGroupNotifiesUpdated",
+  "nodeIKernelGroupListener/onMemberInfoChange",
+  "nodeIKernelBuddyListener/onBuddyListChange",
+  "nodeIKernelBuddyListener/onBuddyListChangedV2",
+  "nodeIKernelBuddyListener/onBuddyReqChange",
+  "nodeIKernelProfileListener/onProfileSimpleChanged",
+  "nodeIKernelLoginListener/onQRCodeGetPicture",
+  "nodeIKernelLoginListener/onQRCodeSessionQuickLoginFailed",
+  "nodeIKernelLoginListener/onQRCodeLoginSucceed",
+  "nodeIKernelLoginListener/onUserLoggedIn",
+  "nodeIKernelSessionListener/onSessionInitComplete",
+];
+
+const KNOWN_MAP_FIELDS = new Set(["msgAttributeInfos", "thumbPath", "picThumbPath"]);
+
+function encodeBridgeMaps(val, depth = 0) {
+  if (val === null || val === undefined || depth > 8) return val;
+  if (typeof val === "bigint") return val.toString();
+  if (typeof val !== "object") return val;
+  if (val instanceof Map) {
+    return {
+      __rosmontisMap__: Array.from(val.entries()).map(([k, v]) => [
+        encodeBridgeMaps(k, depth + 1),
+        encodeBridgeMaps(v, depth + 1),
+      ]),
+    };
+  }
+  if (val instanceof Set) {
+    return Array.from(val.values()).map((v) => encodeBridgeMaps(v, depth + 1));
+  }
+  if (val instanceof Uint8Array || ArrayBuffer.isView(val)) {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => encodeBridgeMaps(item, depth + 1));
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(val)) {
+    out[k] = encodeBridgeMaps(v, depth + 1);
+  }
+  return out;
+}
+
+function reviveBridgePayload(val, fieldName = "") {
+  if (val === null || val === undefined || typeof val !== "object") {
+    return val;
+  }
+  if (val instanceof Map || val instanceof Uint8Array || ArrayBuffer.isView(val)) {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => reviveBridgePayload(item));
+  }
+  if (Array.isArray(val.__rosmontisMap__) && Object.keys(val).length === 1) {
+    return new Map(
+      val.__rosmontisMap__.map((entry) => [
+        Array.isArray(entry) ? entry[0] : undefined,
+        Array.isArray(entry) ? reviveBridgePayload(entry[1]) : undefined,
+      ])
+    );
+  }
+  if (KNOWN_MAP_FIELDS.has(fieldName)) {
+    return new Map(
+      Object.entries(val).map(([k, v]) => [
+        /^\d+$/.test(k) && fieldName !== "msgAttributeInfos" ? Number(k) : k,
+        reviveBridgePayload(v),
+      ])
+    );
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(val)) {
+    out[k] = reviveBridgePayload(v, k);
+  }
+  return out;
+}
+
+function installRendererBridge(targetWindow, options = {}) {
+  const win =
+    targetWindow ||
+    (typeof window !== "undefined" ? window : typeof globalThis !== "undefined" ? globalThis : {});
+
+  if (win.__ROSMONTIS_RENDERER_BRIDGE__ && !options.forceReinstall) {
+    if (options.windowId && !win.__ROSMONTIS_RENDERER_BRIDGE__.windowId) {
+      win.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(options.windowId);
+    }
+    if (typeof win.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") {
+      win.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners();
+    }
+    return win.__ROSMONTIS_RENDERER_BRIDGE__;
+  }
+
+  function resolveIpcRenderer() {
+    if (options.ipcRenderer) return options.ipcRenderer;
+    if (win.ipcImpl && typeof win.ipcImpl.send === "function") {
+      return win.ipcImpl;
+    }
+    if (
+      win.ipcRenderer &&
+      (typeof win.ipcRenderer.send === "function" || typeof win.ipcRenderer.invoke === "function")
+    ) {
+      return win.ipcRenderer;
+    }
+    if (win.ntqq && win.ntqq.ipcRenderer) return win.ntqq.ipcRenderer;
+    if (win.electron && win.electron.ipcRenderer) return win.electron.ipcRenderer;
+    if (win.qqnt && win.qqnt.ipcRenderer) return win.qqnt.ipcRenderer;
+    try {
+      if (typeof require === "function") {
+        const el = require("electron");
+        if (el && el.ipcRenderer) return el.ipcRenderer;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function discoverWindowId(ipc) {
+    if (options.windowId && Number(options.windowId) > 0) {
+      return Number(options.windowId);
+    }
+    if (typeof win.webContentId === "number" && win.webContentId > 0) {
+      return win.webContentId;
+    }
+    if (win.__ROSMONTIS_WINDOW_ID__ && Number(win.__ROSMONTIS_WINDOW_ID__) > 0) {
+      return Number(win.__ROSMONTIS_WINDOW_ID__);
+    }
+    try {
+      if (ipc && typeof ipc.eventNames === "function") {
+        for (const name of ipc.eventNames()) {
+          const m = /^RM_IPCFROM_MAIN(\d+)$/.exec(String(name));
+          if (m) return Number(m[1]);
+        }
+      }
+    } catch (_) {}
+    try {
+      const urlParams = new URLSearchParams(win.location ? win.location.search : "");
+      const wid = Number(
+        urlParams.get("webcontentsid") ||
+          urlParams.get("webContentsId") ||
+          urlParams.get("windowId") ||
+          0
+      );
+      if (Number.isFinite(wid) && wid > 0) return wid;
+    } catch (_) {}
+    return 1;
+  }
+
+  const ipcRenderer = resolveIpcRenderer();
+  let windowId = discoverWindowId(ipcRenderer);
+  const pendingCallbacks = new Map();
+  const observedChannels = new Set();
+  const attachedIpcByChannel = new Map();
+  const registeredWindowIds = new Set();
+
+  const sessionState = {
+    activeAioPeer: null,
+    activeAioPeerKey: "",
+    focused: false,
+    lastReadAtByPeer: new Map(),
+    lastTypingAtByPeer: new Map(),
+  };
+
+  function setBoundedMap(map, key, value, maxEntries = 2000) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, value);
+    while (map.size > maxEntries) {
+      const oldest = map.keys().next().value;
+      if (oldest === undefined) break;
+      map.delete(oldest);
+    }
+  }
+
+  function makeCallbackId() {
+    try {
+      if (win.crypto && typeof win.crypto.randomUUID === "function") {
+        return win.crypto.randomUUID();
+      }
+    } catch (_) {}
+    try {
+      if (typeof crypto !== "undefined" && crypto && typeof crypto.randomUUID === "function") {
+        return crypto.randomUUID();
+      }
+      if (typeof require === "function") {
+        const nodeCrypto = require("crypto");
+        if (nodeCrypto && typeof nodeCrypto.randomUUID === "function") {
+          return nodeCrypto.randomUUID();
+        }
+      }
+    } catch (_) {}
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  }
+
+  function forwardToMain(payload) {
+    const ipc = resolveIpcRenderer() || ipcRenderer;
+    if (!ipc) return;
+    const encoded = encodeBridgeMaps(payload);
+    try {
+      if (typeof ipc.send === "function") {
+        ipc.send("__ROSMONTIS_BRIDGE_EVENT__", encoded);
+        return;
+      }
+      if (typeof ipc.invoke === "function") {
+        Promise.resolve(ipc.invoke("__ROSMONTIS_BRIDGE_EVENT__", encoded)).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  function handleIncomingMainIpc(_event, header, body) {
+    try {
+      // 1. Resolve or reject any pending invokeNtApi callback if callbackId matches
+      if (header && typeof header === "object" && header.callbackId) {
+        const pending = pendingCallbacks.get(header.callbackId);
+        if (pending) {
+          pendingCallbacks.delete(header.callbackId);
+          clearTimeout(pending.timer);
+          if (
+            header.promiseStatue &&
+            header.promiseStatue !== "full" &&
+            header.promiseStatue !== "fulfilled"
+          ) {
+            const errMsg =
+              body instanceof Error
+                ? body.message
+                : typeof body === "string"
+                ? body
+                : JSON.stringify(body);
+            pending.reject(new Error(`NTQQ IPC error (${pending.cmd}): ${errMsg}`));
+          } else {
+            pending.resolve(body);
+          }
+          return;
+        }
+      }
+
+      // 2. Passively forward kernel listener events to main process
+      if (body && typeof body === "object" && !Array.isArray(body) && typeof body.cmdName === "string") {
+        forwardToMain({
+          source: "renderer_ipc",
+          windowId,
+          eventName: header?.eventName || "ntApi",
+          cmdName: body.cmdName,
+          payload: body.payload,
+          timestamp: Date.now(),
+        });
+      } else if (Array.isArray(body) && body.length >= 1) {
+        const first = body[0];
+        if (first && typeof first === "object" && typeof first.cmdName === "string") {
+          forwardToMain({
+            source: "renderer_ipc",
+            windowId,
+            eventName: header?.eventName || "ntApi",
+            cmdName: first.cmdName,
+            payload: first.payload !== undefined ? first.payload : body[1],
+            rawBody: body,
+            timestamp: Date.now(),
+          });
+        } else if (typeof first === "string" && (first.startsWith("nodeIKernel") || first.startsWith("on"))) {
+          forwardToMain({
+            source: "renderer_ipc",
+            windowId,
+            eventName: header?.eventName || "ntApi",
+            cmdName: first,
+            payload: body[1],
+            rawBody: body,
+            timestamp: Date.now(),
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  function attachPassiveListener(wid, force = false) {
+    const ipc = resolveIpcRenderer() || ipcRenderer;
+    if (!ipc || typeof ipc.on !== "function") return;
+    const channel = `RM_IPCFROM_MAIN${wid}`;
+    if (observedChannels.has(channel) && attachedIpcByChannel.get(channel) === ipc) {
+      if (!force) return;
+      if (typeof ipc.removeListener === "function") {
+        try {
+          ipc.removeListener(channel, handleIncomingMainIpc);
+        } catch (_) {}
+      } else if (typeof ipc.off === "function") {
+        try {
+          ipc.off(channel, handleIncomingMainIpc);
+        } catch (_) {}
+      } else {
+        return;
+      }
+    }
+    observedChannels.add(channel);
+    attachedIpcByChannel.set(channel, ipc);
+    try {
+      ipc.on(channel, handleIncomingMainIpc);
+    } catch (_) {}
+  }
+
+  function reattachListeners() {
+    attachPassiveListener(windowId, true);
+    if (windowId === 1) {
+      attachPassiveListener(2, true);
+    }
+  }
+
+  function registerNtApiListeners(wid = windowId, eventNames = DEFAULT_REGISTERED_EVENTS) {
+    const ipc = resolveIpcRenderer() || ipcRenderer;
+    if (!ipc || typeof ipc.send !== "function") return false;
+    const targetWid = Number(wid) || windowId || 1;
+    if (registeredWindowIds.has(targetWid)) return true;
+    registeredWindowIds.add(targetWid);
+    const channel = `RM_IPCFROM_RENDERER${targetWid}`;
+    try {
+      for (const evtName of eventNames) {
+        ipc.send(
+          channel,
+          {
+            type: "request",
+            eventName: "ntApi-register",
+            peerId: targetWid,
+          },
+          evtName
+        );
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Attach passive listener on discovered windowId (and fallback 2 when windowId === 1)
+  attachPassiveListener(windowId);
+  if (windowId === 1) {
+    attachPassiveListener(2);
+  }
+
+  if (options.autoRegisterListeners) {
+    registerNtApiListeners(windowId);
+  }
+
+  function inspectVueAppState() {
+    try {
+      const doc = win.document;
+      if (!doc || typeof doc.querySelector !== "function") {
+        return { mounted: false };
+      }
+      const appEl = doc.querySelector("#app");
+      const vueApp = appEl && appEl.__vue_app__;
+      if (!vueApp) {
+        return { mounted: false };
+      }
+      const globalProps = vueApp.config?.globalProperties || {};
+      const router = globalProps.$router;
+      const route = globalProps.$route;
+      const pinia = globalProps.$pinia;
+      const store = globalProps.$store;
+      return {
+        mounted: true,
+        currentRoute:
+          router?.currentRoute?.value?.fullPath ||
+          router?.currentRoute?.fullPath ||
+          route?.fullPath ||
+          route?.path ||
+          "",
+        hasPinia: Boolean(pinia),
+        hasVuex: Boolean(store),
+      };
+    } catch (_) {
+      return { mounted: false };
+    }
+  }
+
+  async function invokeNtApi(cmd, args, timeoutMs = 15000) {
+    const ipc = resolveIpcRenderer();
+    if (!ipc || (typeof ipc.send !== "function" && typeof ipc.invoke !== "function")) {
+      // Tagged so the main process knows nothing was dispatched and fallback is safe.
+      throw new Error("ROSMONTIS_BRIDGE_UNAVAILABLE: Renderer ipcRenderer (send/invoke) is not available");
+    }
+    attachPassiveListener(windowId);
+
+    const callbackId = makeCallbackId();
+    const requestHeader = {
+      type: "request",
+      callbackId,
+      eventName: "ntApi",
+      peerId: windowId,
+    };
+    const rawPayloadList =
+      args === undefined || args === null
+        ? [null, null]
+        : Array.isArray(args)
+        ? args.length === 1
+          ? [args[0], null]
+          : [...args]
+        : [args, null];
+    const payloadList = rawPayloadList.map((item) => reviveBridgePayload(item));
+    const requestPayload = {
+      cmdName: cmd,
+      cmdType: "invoke",
+      payload: payloadList,
+    };
+    const channel = `RM_IPCFROM_RENDERER${windowId}`;
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingCallbacks.delete(callbackId);
+        reject(new Error(`invokeNtApi timeout (${timeoutMs}ms): ${cmd}`));
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+
+      pendingCallbacks.set(callbackId, {
+        resolve,
+        reject,
+        timer,
+        cmd,
+      });
+
+      try {
+        if (typeof ipc.send === "function") {
+          ipc.send(channel, requestHeader, requestPayload);
+        } else {
+          Promise.resolve(ipc.invoke(channel, requestHeader, requestPayload)).then(
+            (directResult) => {
+              if (directResult !== undefined && pendingCallbacks.has(callbackId)) {
+                pendingCallbacks.delete(callbackId);
+                clearTimeout(timer);
+                resolve(directResult);
+              }
+            },
+            (err) => {
+              if (pendingCallbacks.has(callbackId)) {
+                pendingCallbacks.delete(callbackId);
+                clearTimeout(timer);
+                reject(err);
+              }
+            }
+          );
+        }
+      } catch (err) {
+        pendingCallbacks.delete(callbackId);
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  }
+
+  async function simulateHumanSessionFlow({
+    chatType = 1,
+    peerUid = "",
+    guildId = "",
+    markRead = true,
+    sendTyping = false,
+    eventType = 1,
+    dedupeWindowMs = 5000,
+  } = {}) {
+    const peer = {
+      chatType: Number(chatType),
+      peerUid: String(peerUid || ""),
+      guildId: String(guildId || ""),
+    };
+    const vueState = inspectVueAppState();
+    const steps = {
+      vueState,
+      exitedPreviousAio: false,
+      alreadyInAio: false,
+      enterOrExitAio: false,
+      addActiveChatByUid: false,
+      setFocusOnBase: false,
+      markRead: false,
+      markReadSkipped: false,
+      sendTyping: false,
+      sendTypingSkipped: false,
+    };
+
+    if (!peer.peerUid) {
+      return steps;
+    }
+
+    const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId}`;
+    const now = Date.now();
+
+    if (sessionState.activeAioPeerKey !== peerKey) {
+      if (sessionState.activeAioPeer && sessionState.activeAioPeerKey) {
+        try {
+          await invokeNtApi(
+            "nodeIKernelMsgService/enterOrExitAio",
+            [
+              {
+                info: {
+                  peer: sessionState.activeAioPeer,
+                  enterType: 2,
+                },
+              },
+              null,
+            ],
+            4000
+          );
+          steps.exitedPreviousAio = true;
+        } catch (_) {}
+      }
+
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/enterOrExitAio",
+          [
+            {
+              info: {
+                peer,
+                enterType: 1,
+              },
+            },
+            null,
+          ],
+          4000
+        );
+        steps.enterOrExitAio = true;
+      } catch (_) {}
+
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/addActiveChatByUid",
+          [{ peer }, null],
+          4000
+        );
+        steps.addActiveChatByUid = true;
+      } catch (_) {}
+
+      if (!sessionState.focused) {
+        try {
+          await invokeNtApi(
+            "nodeIKernelMsgService/setFocusOnBase",
+            [{ isFocus: true }, null],
+            4000
+          );
+          steps.setFocusOnBase = true;
+          sessionState.focused = true;
+        } catch (_) {}
+      } else {
+        steps.setFocusOnBase = true;
+      }
+
+      sessionState.activeAioPeer = peer;
+      sessionState.activeAioPeerKey = peerKey;
+    } else {
+      steps.alreadyInAio = true;
+      steps.enterOrExitAio = true;
+      steps.addActiveChatByUid = true;
+      steps.setFocusOnBase = sessionState.focused;
+    }
+
+    if (markRead) {
+      const lastReadAt = sessionState.lastReadAtByPeer.get(peerKey) || 0;
+      if (now - lastReadAt >= dedupeWindowMs) {
+        try {
+          await invokeNtApi(
+            "nodeIKernelMsgService/setMsgRead",
+            [{ peer }, null],
+            4000
+          );
+          steps.markRead = true;
+          setBoundedMap(sessionState.lastReadAtByPeer, peerKey, Date.now());
+        } catch (_) {}
+      } else {
+        steps.markReadSkipped = true;
+      }
+    }
+
+    if (sendTyping && Number(chatType) === 1) {
+      const effEventType = Number(eventType ?? 1);
+      const lastTypingAt = sessionState.lastTypingAtByPeer.get(peerKey) || 0;
+      if (effEventType !== 1 || now - lastTypingAt >= dedupeWindowMs) {
+        try {
+          await invokeNtApi(
+            "nodeIKernelMsgService/sendShowInputStatusReq",
+            [
+              {
+                eventType: effEventType,
+                peer: {
+                  chatType: 1,
+                  peerUid: peer.peerUid,
+                  guildId: "",
+                },
+              },
+              null,
+            ],
+            4000
+          );
+          steps.sendTyping = true;
+          if (effEventType === 1) {
+            setBoundedMap(sessionState.lastTypingAtByPeer, peerKey, Date.now());
+          }
+        } catch (_) {}
+      } else {
+        steps.sendTypingSkipped = true;
+      }
+    }
+
+    return steps;
+  }
+
+  const bridgeApi = {
+    version: "1.1.0",
+    get windowId() {
+      return windowId;
+    },
+    setWindowId(newId) {
+      if (Number(newId) > 0) {
+        windowId = Number(newId);
+        attachPassiveListener(windowId);
+      }
+      return windowId;
+    },
+    get sessionState() {
+      return sessionState;
+    },
+    resetSessionState() {
+      sessionState.activeAioPeer = null;
+      sessionState.activeAioPeerKey = "";
+      sessionState.focused = false;
+      sessionState.lastReadAtByPeer.clear();
+      sessionState.lastTypingAtByPeer.clear();
+    },
+    makeCallbackId,
+    reattachListeners,
+    registerNtApiListeners,
+    inspectVueAppState,
+    invokeNtApi,
+    async invokeNtApiSerialized(cmd, args, timeoutMs = 15000) {
+      const res = await invokeNtApi(cmd, args, timeoutMs);
+      return JSON.stringify(res === undefined ? { __rosmontisVoid__: true } : encodeBridgeMaps(res));
+    },
+    simulateHumanSessionFlow,
+    _handleIncomingMainIpc: handleIncomingMainIpc,
+  };
+
+  win.__ROSMONTIS_RENDERER_BRIDGE__ = bridgeApi;
+  return bridgeApi;
+}
+
+if (typeof window !== "undefined") {
+  try {
+    installRendererBridge(window, { autoRegisterListeners: true });
+  } catch (_) {}
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    installRendererBridge,
+    DEFAULT_REGISTERED_EVENTS,
+  };
+}
