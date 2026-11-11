@@ -19,10 +19,14 @@
  */
 
 const crypto = require("crypto");
+const dns = require("dns");
 const fs = require("fs");
+const net = require("net");
+const os = require("os");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const { fileURLToPath } = require("url");
 
 // ============================================================================
 // 1. MessageIdStore (Bounded LRU, 32-bit positive integer OneBot message_id)
@@ -777,11 +781,108 @@ function buildNtqqUserAgent(options = {}) {
   return getNtqqVersionMetadata(options).userAgent;
 }
 
+const DEFAULT_MAX_MEDIA_BYTES = 256 * 1024 * 1024;
+
+function resolveMaxMediaBytes(options = {}) {
+  const candidate =
+    options &&
+    options.maxMediaBytes !== undefined &&
+    options.maxMediaBytes !== null &&
+    options.maxMediaBytes !== ""
+      ? options.maxMediaBytes
+      : process.env.ROSMONTIS_MAX_MEDIA_BYTES;
+  const num = Number(candidate);
+  return Number.isFinite(num) && num > 0 ? Math.floor(num) : DEFAULT_MAX_MEDIA_BYTES;
+}
+
+function _isPrivateOrReservedIpv4Octets(a, b) {
+  if (a === 0) return true; // 0.0.0.0/8
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 100 && (b & 0xc0) === 64) return true; // 100.64.0.0/10
+  if (a === 127) return true; // 127.0.0.0/8
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16
+  if (a === 172 && (b & 0xf0) === 16) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a >= 224) return true; // 224.0.0.0/4 multicast & reserved
+  return false;
+}
+
+function _parseIpv6Groups(ipv6Str) {
+  let addr = ipv6Str.toLowerCase();
+  const lastColon = addr.lastIndexOf(":");
+  if (lastColon !== -1 && addr.indexOf(".", lastColon) !== -1) {
+    const ipv4Part = addr.slice(lastColon + 1);
+    if (net.isIP(ipv4Part) !== 4) return null;
+    const octets = ipv4Part.split(".").map((x) => Number(x));
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    addr = `${addr.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+  const dblIdx = addr.indexOf("::");
+  let groups;
+  if (dblIdx !== -1) {
+    if (addr.indexOf("::", dblIdx + 2) !== -1) return null;
+    const leftStr = addr.slice(0, dblIdx);
+    const rightStr = addr.slice(dblIdx + 2);
+    const left = leftStr ? leftStr.split(":") : [];
+    const right = rightStr ? rightStr.split(":") : [];
+    const fill = 8 - left.length - right.length;
+    if (fill < 0) return null;
+    groups = [...left, ...new Array(fill).fill("0"), ...right];
+  } else {
+    groups = addr.split(":");
+    if (groups.length !== 8) return null;
+  }
+  const nums = new Array(8);
+  for (let i = 0; i < 8; i++) {
+    const v = parseInt(groups[i], 16);
+    if (!Number.isFinite(v) || v < 0 || v > 0xffff) return null;
+    nums[i] = v;
+  }
+  return nums;
+}
+
+function isPrivateOrReservedIp(ip) {
+  if (typeof ip !== "string") return false;
+  const cleaned = ip.trim().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  if (!cleaned) return false;
+  const family = net.isIP(cleaned);
+  if (family === 4) {
+    const parts = cleaned.split(".").map((x) => Number(x));
+    if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+      return true;
+    }
+    return _isPrivateOrReservedIpv4Octets(parts[0], parts[1]);
+  }
+  if (family === 6) {
+    const g = _parseIpv6Groups(cleaned);
+    if (!g) return true;
+    const first5Zero = g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0;
+    if (first5Zero && g[5] === 0 && g[6] === 0 && (g[7] === 0 || g[7] === 1)) {
+      return true; // :: or ::1
+    }
+    if (first5Zero && (g[5] === 0 || g[5] === 0xffff)) {
+      // IPv4-mapped ::ffff:x.x.x.x (or hex ::ffff:7f00:1) & IPv4-compatible ::x.x.x.x
+      return _isPrivateOrReservedIpv4Octets((g[6] >> 8) & 0xff, g[6] & 0xff);
+    }
+    if (g[0] === 0x0064 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) {
+      // NAT64 64:ff9b::/96
+      return _isPrivateOrReservedIpv4Octets((g[6] >> 8) & 0xff, g[6] & 0xff);
+    }
+    if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10
+    if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 (fc00-fdff)
+    if ((g[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+    return false;
+  }
+  return false;
+}
+
 function pruneTempDir(tempDir, maxFiles = 128) {
   try {
     if (!tempDir || !fs.existsSync(tempDir)) return 0;
     const entries = fs
       .readdirSync(tempDir)
+      .filter((name) => !name.endsWith(".part"))
       .map((name) => {
         const fullPath = path.join(tempDir, name);
         try {
@@ -809,51 +910,380 @@ function pruneTempDir(tempDir, maxFiles = 128) {
   }
 }
 
-function downloadBufferFromUrl(urlStr, timeoutMs = 20000, redirectsLeft = 4) {
+const _pruneTempDirStates = new Map();
+
+async function _runPruneTempDirOnce(tempDir, maxFiles) {
+  try {
+    if (!tempDir) return 0;
+    let names;
+    try {
+      names = await fs.promises.readdir(tempDir);
+    } catch (_) {
+      return 0;
+    }
+    const candidateNames = names.filter((name) => !name.endsWith(".part"));
+    if (candidateNames.length <= maxFiles) return 0;
+    const stats = await Promise.all(
+      candidateNames.map(async (name) => {
+        const fullPath = path.join(tempDir, name);
+        try {
+          const st = await fs.promises.stat(fullPath);
+          if (st.isFile()) {
+            return { fullPath, mtimeMs: Number(st.mtimeMs || 0) };
+          }
+        } catch (_) {}
+        return null;
+      })
+    );
+    const entries = stats.filter(Boolean);
+    if (entries.length <= maxFiles) return 0;
+    entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const toRemove = entries.slice(0, entries.length - maxFiles);
+    let removed = 0;
+    await Promise.all(
+      toRemove.map(async (item) => {
+        try {
+          await fs.promises.unlink(item.fullPath);
+          removed++;
+        } catch (_) {}
+      })
+    );
+    return removed;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function pruneTempDirAsync(tempDir, maxFiles = 128) {
+  if (!tempDir) return Promise.resolve(0);
+  const lockKey =
+    process.platform === "win32" ? path.resolve(tempDir).toLowerCase() : path.resolve(tempDir);
+  let state = _pruneTempDirStates.get(lockKey);
+  if (state) {
+    state.queuedMaxFiles =
+      state.queuedMaxFiles === null ? maxFiles : Math.min(state.queuedMaxFiles, maxFiles);
+    return state.promise;
+  }
+  state = { queuedMaxFiles: null, promise: null };
+  state.promise = (async () => {
+    let totalRemoved = 0;
+    let currentMax = maxFiles;
+    try {
+      while (true) {
+        totalRemoved += await _runPruneTempDirOnce(tempDir, currentMax);
+        if (state.queuedMaxFiles === null) break;
+        currentMax = state.queuedMaxFiles;
+        state.queuedMaxFiles = null;
+      }
+    } finally {
+      _pruneTempDirStates.delete(lockKey);
+    }
+    return totalRemoved;
+  })();
+  _pruneTempDirStates.set(lockKey, state);
+  return state.promise;
+}
+
+function downloadBufferFromUrl(urlStr, timeoutOrOptions = 20000, redirectsLeftArg = 4, extraOptions = {}) {
+  let options;
+  let timeoutMs;
+  let redirectsLeft;
+  if (timeoutOrOptions && typeof timeoutOrOptions === "object") {
+    options = timeoutOrOptions;
+    timeoutMs = Number(options.timeoutMs) || 20000;
+    redirectsLeft = options.redirectsLeft !== undefined ? Number(options.redirectsLeft) : 4;
+  } else {
+    options =
+      extraOptions && typeof extraOptions === "object"
+        ? extraOptions
+        : redirectsLeftArg && typeof redirectsLeftArg === "object"
+        ? redirectsLeftArg
+        : {};
+    timeoutMs = Number(timeoutOrOptions) || Number(options.timeoutMs) || 20000;
+    redirectsLeft = typeof redirectsLeftArg === "number" ? redirectsLeftArg : 4;
+  }
+
+  const maxMediaBytes = resolveMaxMediaBytes(options);
+  const allowPrivateUrls =
+    options.allowPrivateUrls === true || process.env.ROSMONTIS_ALLOW_PRIVATE_MEDIA_URLS === "1";
+
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const settleResolve = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
+    const settleReject = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
     let parsed;
     try {
       parsed = new URL(urlStr);
     } catch (e) {
-      return reject(e);
+      return settleReject(e);
     }
-    const mod = parsed.protocol === "https:" ? https : http;
-    const req = mod.get(
-      urlStr,
-      {
-        headers: {
-          "User-Agent": buildNtqqUserAgent(),
-        },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        if (
-          res.statusCode &&
-          [301, 302, 303, 307, 308].includes(res.statusCode) &&
-          res.headers.location &&
-          redirectsLeft > 0
-        ) {
-          res.resume();
-          const nextUrl = new URL(res.headers.location, urlStr).toString();
-          return downloadBufferFromUrl(nextUrl, timeoutMs, redirectsLeft - 1).then(
-            resolve,
-            reject
-          );
-        }
-        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          res.resume();
-          return reject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
-        }
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks)));
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      const protoErr = new Error(`Unsupported media URL protocol: ${parsed.protocol}`);
+      protoErr.code = "ERR_UNSUPPORTED_PROTOCOL";
+      return settleReject(protoErr);
+    }
+
+    const hostNoBrackets = String(parsed.hostname || "").replace(/^\[|\]$/g, "");
+    if (!allowPrivateUrls && net.isIP(hostNoBrackets) !== 0 && isPrivateOrReservedIp(hostNoBrackets)) {
+      const ipErr = new Error(`Blocked private or reserved media URL IP: ${hostNoBrackets}`);
+      ipErr.code = "ERR_SSRF_BLOCKED";
+      return settleReject(ipErr);
+    }
+
+    const rawLookup =
+      typeof options.lookup === "function"
+        ? options.lookup
+        : typeof options.dnsLookup === "function"
+        ? options.dnsLookup
+        : dns.lookup;
+
+    const safeLookup = (hostname, lookupOpts, cb) => {
+      let opts = lookupOpts;
+      let callback = cb;
+      if (typeof lookupOpts === "function") {
+        callback = lookupOpts;
+        opts = {};
       }
-    );
+      const wantAll = Boolean(opts && typeof opts === "object" && opts.all === true);
+      const cleanHost = String(hostname || "").replace(/^\[|\]$/g, "");
+      if (!allowPrivateUrls && net.isIP(cleanHost) !== 0 && isPrivateOrReservedIp(cleanHost)) {
+        const blockErr = new Error(`Blocked private or reserved IP address: ${cleanHost}`);
+        blockErr.code = "ERR_SSRF_BLOCKED";
+        return callback(blockErr);
+      }
+
+      rawLookup.call(dns, hostname, opts, (err, address, family) => {
+        if (err) return callback(err);
+        if (!allowPrivateUrls) {
+          if (Array.isArray(address)) {
+            for (const entry of address) {
+              const addrStr = entry && typeof entry === "object" ? entry.address : String(entry || "");
+              if (isPrivateOrReservedIp(addrStr)) {
+                const blockErr = new Error(
+                  `Blocked DNS resolution to private or reserved IP (${addrStr}) for ${hostname}`
+                );
+                blockErr.code = "ERR_SSRF_BLOCKED";
+                return callback(blockErr);
+              }
+            }
+            return callback(null, address);
+          }
+          const addrStr = String(address || "");
+          if (isPrivateOrReservedIp(addrStr)) {
+            const blockErr = new Error(
+              `Blocked DNS resolution to private or reserved IP (${addrStr}) for ${hostname}`
+            );
+            blockErr.code = "ERR_SSRF_BLOCKED";
+            return callback(blockErr);
+          }
+        }
+        if (wantAll && !Array.isArray(address) && typeof address === "string") {
+          return callback(null, [{ address, family: family || net.isIP(address) || 4 }]);
+        }
+        return Array.isArray(address) ? callback(null, address) : callback(null, address, family);
+      });
+    };
+
+    const mod = parsed.protocol === "https:" ? https : http;
+    const reqOpts = {
+      headers: {
+        "User-Agent": buildNtqqUserAgent(),
+      },
+      timeout: timeoutMs,
+      agent: options.agent !== undefined ? options.agent : false,
+    };
+    if (!allowPrivateUrls || typeof options.lookup === "function" || typeof options.dnsLookup === "function") {
+      reqOpts.lookup = safeLookup;
+    }
+
+    const req = mod.get(urlStr, reqOpts, (res) => {
+      res.on("error", settleReject);
+
+      if (
+        res.statusCode &&
+        [301, 302, 303, 307, 308].includes(res.statusCode) &&
+        res.headers.location
+      ) {
+        res.resume();
+        if (redirectsLeft <= 0) {
+          return settleReject(new Error(`Too many redirects fetching ${urlStr}`));
+        }
+        let nextUrl;
+        try {
+          nextUrl = new URL(res.headers.location, urlStr).toString();
+        } catch (e) {
+          return settleReject(e);
+        }
+        return downloadBufferFromUrl(nextUrl, timeoutMs, redirectsLeft - 1, options).then(
+          settleResolve,
+          settleReject
+        );
+      }
+
+      if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return settleReject(new Error(`HTTP ${res.statusCode} fetching ${urlStr}`));
+      }
+
+      const contentLength = Number(res.headers["content-length"]);
+      if (Number.isFinite(contentLength) && contentLength > maxMediaBytes) {
+        const sizeErr = new Error(
+          `Media Content-Length (${contentLength} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+        );
+        sizeErr.code = "ERR_MEDIA_TOO_LARGE";
+        res.destroy();
+        req.destroy();
+        return settleReject(sizeErr);
+      }
+
+      const chunks = [];
+      let totalBytes = 0;
+      res.on("data", (chunk) => {
+        if (settled) return;
+        totalBytes += chunk.length;
+        if (totalBytes > maxMediaBytes) {
+          chunks.length = 0;
+          const sizeErr = new Error(
+            `Media stream (${totalBytes} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+          );
+          sizeErr.code = "ERR_MEDIA_TOO_LARGE";
+          res.destroy();
+          req.destroy();
+          settleReject(sizeErr);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on("end", () => {
+        if (settled) return;
+        settleResolve(Buffer.concat(chunks, totalBytes));
+      });
+    });
+
     req.on("timeout", () => {
       req.destroy(new Error(`Timeout fetching ${urlStr}`));
     });
-    req.on("error", reject);
+    req.on("error", settleReject);
   });
+}
+
+function _isSubPathOrEqual(targetPath, rootPath) {
+  if (!targetPath || !rootPath) return false;
+  const normTarget =
+    process.platform === "win32" ? path.resolve(targetPath).toLowerCase() : path.resolve(targetPath);
+  const normRoot =
+    process.platform === "win32" ? path.resolve(rootPath).toLowerCase() : path.resolve(rootPath);
+  const rel = path.relative(normRoot, normTarget);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+async function _expandDirCandidates(rawDirs) {
+  const seen = new Set();
+  const result = [];
+  const add = (p) => {
+    if (!p) return;
+    const key = process.platform === "win32" ? p.toLowerCase() : p;
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(p);
+    }
+  };
+  await Promise.all(
+    rawDirs.map(async (rawDir) => {
+      const trimmed = String(rawDir || "").trim();
+      if (!trimmed) return;
+      const resolved = path.resolve(trimmed);
+      add(resolved);
+      try {
+        const real = await fs.promises.realpath(resolved);
+        add(real);
+      } catch (_) {}
+    })
+  );
+  return result;
+}
+
+function _getBlacklistedLocalDirs() {
+  const homeDir = process.env.HOME || os.homedir();
+  const sysHome = os.homedir();
+  const configuredCfgDirs = [
+    process.env.ROSMONTIS_CONFIG_DIR,
+    process.env.ONEBOT_CONFIG_DIR,
+    process.env.XIAO_BRIDGE_CONFIG_DIR,
+  ].filter(Boolean);
+  return [
+    ...(configuredCfgDirs.length > 0 ? configuredCfgDirs : []),
+    "/app/data/config",
+    "/etc",
+    "/proc",
+    "/sys",
+    homeDir ? path.join(homeDir, ".ssh") : "",
+    sysHome && sysHome !== homeDir ? path.join(sysHome, ".ssh") : "",
+  ].filter(Boolean);
+}
+
+function _getWhitelistedLocalDirs(tempDir, options = {}) {
+  const homeDir = process.env.HOME || os.homedir();
+  const envAllowed = String(process.env.ROSMONTIS_ALLOWED_FILE_DIRS || "")
+    .split(path.delimiter)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const optAllowed = Array.isArray(options.allowedFileDirs)
+    ? options.allowedFileDirs.map((s) => String(s || "").trim()).filter(Boolean)
+    : typeof options.allowedFileDirs === "string"
+    ? options.allowedFileDirs
+        .split(path.delimiter)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  return [
+    tempDir,
+    os.tmpdir(),
+    "/opt/xiao-data",
+    homeDir ? path.join(homeDir, ".config/QQ") : "",
+    "/app/.config/QQ",
+    ...envAllowed,
+    ...optAllowed,
+  ].filter(Boolean);
+}
+
+async function writeTempMediaAtomically(localPath, buf, hasExplicitPreferredName = false) {
+  if (!hasExplicitPreferredName) {
+    try {
+      const existing = await fs.promises.stat(localPath);
+      if (existing.isFile() && existing.size === buf.length && existing.size > 0) {
+        return;
+      }
+    } catch (_) {}
+  }
+
+  const tmpPart = `${localPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.part`;
+  await fs.promises.writeFile(tmpPart, buf);
+  try {
+    await fs.promises.rename(tmpPart, localPath);
+  } catch (err) {
+    const code = err && err.code ? String(err.code) : "";
+    if (code === "EEXIST" || code === "EPERM" || code === "EACCES" || code === "EBUSY") {
+      try {
+        const afterStat = await fs.promises.stat(localPath);
+        if (afterStat.isFile() && afterStat.size > 0) {
+          await fs.promises.unlink(tmpPart).catch(() => {});
+          return;
+        }
+      } catch (_) {}
+    }
+    await fs.promises.unlink(tmpPart).catch(() => {});
+    throw err;
+  }
 }
 
 async function resolveMediaSource(sourceStr, options = {}) {
@@ -861,31 +1291,51 @@ async function resolveMediaSource(sourceStr, options = {}) {
   if (!raw) {
     throw new Error("Empty media source");
   }
+  const maxMediaBytes = resolveMaxMediaBytes(options);
   const tempDir =
     options.tempDir ||
     process.env.ROSMONTIS_TEMP_DIR ||
     process.env.ONEBOT_TEMP_DIR ||
     process.env.XIAO_BRIDGE_TEMP_DIR ||
-    path.join(process.env.HOME || "/tmp", ".rosmontis_tmp");
-  fs.mkdirSync(tempDir, { recursive: true });
+    path.join(process.env.HOME || os.tmpdir(), ".rosmontis_tmp");
+  await fs.promises.mkdir(tempDir, { recursive: true });
   const maxTempFiles = Math.max(8, Number(options.maxTempFiles || 128));
 
   // 1. base64:// or data:...;base64,...
   if (raw.startsWith("base64://") || /^data:[^;]+;base64,/i.test(raw)) {
-    const b64 = raw.startsWith("base64://")
-      ? raw.slice("base64://".length)
-      : raw.replace(/^data:[^;]+;base64,/i, "");
+    const b64 = (
+      raw.startsWith("base64://")
+        ? raw.slice("base64://".length)
+        : raw.replace(/^data:[^;]+;base64,/i, "")
+    ).replace(/\s+/g, "");
+    const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+    const estimatedBytes = Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+    if (estimatedBytes > maxMediaBytes) {
+      const err = new Error(
+        `Base64 media payload (~${estimatedBytes} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+      );
+      err.code = "ERR_MEDIA_TOO_LARGE";
+      throw err;
+    }
     const buf = Buffer.from(b64, "base64");
+    if (buf.length > maxMediaBytes) {
+      const err = new Error(
+        `Decoded base64 media (${buf.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+      );
+      err.code = "ERR_MEDIA_TOO_LARGE";
+      throw err;
+    }
     const md5HexStr = crypto.createHash("md5").update(buf).digest("hex");
     const dim = inspectImageDimensions(buf);
     const ext = options.preferredExt || dim.ext || ".bin";
     const fileName = options.preferredName || `${md5HexStr}${ext}`;
-    const localPath = path.join(tempDir, path.basename(fileName));
-    fs.writeFileSync(localPath, buf);
-    pruneTempDir(tempDir, maxTempFiles);
+    const safeFileName = path.basename(fileName);
+    const localPath = path.join(tempDir, safeFileName);
+    await writeTempMediaAtomically(localPath, buf, Boolean(options.preferredName));
+    await pruneTempDirAsync(tempDir, maxTempFiles);
     return {
       localPath,
-      fileName: path.basename(fileName),
+      fileName: safeFileName,
       fileSize: buf.length,
       md5HexStr,
       width: dim.width,
@@ -898,17 +1348,22 @@ async function resolveMediaSource(sourceStr, options = {}) {
 
   // 2. http:// or https://
   if (/^https?:\/\//i.test(raw)) {
-    const buf = await downloadBufferFromUrl(raw, options.timeoutMs || 25000);
+    const buf = await downloadBufferFromUrl(raw, {
+      ...options,
+      timeoutMs: options.timeoutMs || 25000,
+      maxMediaBytes,
+    });
     const md5HexStr = crypto.createHash("md5").update(buf).digest("hex");
     const dim = inspectImageDimensions(buf);
     const ext = options.preferredExt || dim.ext || ".bin";
     const fileName = options.preferredName || `${md5HexStr}${ext}`;
-    const localPath = path.join(tempDir, path.basename(fileName));
-    fs.writeFileSync(localPath, buf);
-    pruneTempDir(tempDir, maxTempFiles);
+    const safeFileName = path.basename(fileName);
+    const localPath = path.join(tempDir, safeFileName);
+    await writeTempMediaAtomically(localPath, buf, Boolean(options.preferredName));
+    await pruneTempDirAsync(tempDir, maxTempFiles);
     return {
       localPath,
-      fileName: path.basename(fileName),
+      fileName: safeFileName,
       fileSize: buf.length,
       md5HexStr,
       width: dim.width,
@@ -919,39 +1374,106 @@ async function resolveMediaSource(sourceStr, options = {}) {
     };
   }
 
+  // Reject non-file URL schemes explicitly (e.g. ftp://, gopher://)
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw) && !/^file:\/\//i.test(raw)) {
+    throw new Error(`Media source not found or unsupported: ${raw.slice(0, 120)}`);
+  }
+
   // 3. file:// or local path
   let localPath = raw;
-  if (raw.startsWith("file://")) {
+  if (/^file:\/\//i.test(raw)) {
     try {
-      const u = new URL(raw);
-      localPath = decodeURIComponent(u.pathname);
-      if (process.platform === "win32" && /^\/[a-zA-Z]:/.test(localPath)) {
-        localPath = localPath.slice(1);
-      }
+      localPath = fileURLToPath(raw);
     } catch (_) {
-      localPath = raw.replace(/^file:\/+/, "/");
+      try {
+        const u = new URL(raw);
+        localPath = decodeURIComponent(u.pathname);
+        if (process.platform === "win32" && /^\/[a-zA-Z]:/.test(localPath)) {
+          localPath = localPath.slice(1);
+        }
+      } catch (_2) {
+        localPath = raw.replace(/^file:\/+/i, "/");
+      }
     }
   }
 
-  if (fs.existsSync(localPath) && fs.statSync(localPath).isFile()) {
-    const buf = fs.readFileSync(localPath);
-    const md5HexStr = crypto.createHash("md5").update(buf).digest("hex");
-    const dim = inspectImageDimensions(buf);
-    const fileName = options.preferredName || path.basename(localPath) || `${md5HexStr}${dim.ext}`;
-    return {
-      localPath,
-      fileName: path.basename(fileName),
-      fileSize: buf.length,
-      md5HexStr,
-      width: dim.width,
-      height: dim.height,
-      isGif: dim.isGif,
-      buffer: buf,
-      isTempFile: false,
-    };
+  const allowArbitraryLocalFiles =
+    options.allowArbitraryLocalFiles === true ||
+    process.env.ROSMONTIS_ALLOW_ARBITRARY_LOCAL_FILES === "1";
+
+  let blacklistedDirs = [];
+  if (!allowArbitraryLocalFiles) {
+    blacklistedDirs = await _expandDirCandidates(_getBlacklistedLocalDirs());
+    const resolvedInput = path.resolve(localPath);
+    if (blacklistedDirs.some((dir) => _isSubPathOrEqual(resolvedInput, dir))) {
+      const err = new Error(`Blocked access to restricted local path: ${localPath}`);
+      err.code = "ERR_LFI_BLOCKED";
+      throw err;
+    }
   }
 
-  throw new Error(`Media source not found or unsupported: ${raw.slice(0, 120)}`);
+  let realPath;
+  try {
+    realPath = await fs.promises.realpath(localPath);
+  } catch (_) {
+    throw new Error(`Media source not found or unsupported: ${raw.slice(0, 120)}`);
+  }
+
+  if (!allowArbitraryLocalFiles) {
+    if (blacklistedDirs.some((dir) => _isSubPathOrEqual(realPath, dir))) {
+      const err = new Error(`Blocked access to restricted local path: ${realPath}`);
+      err.code = "ERR_LFI_BLOCKED";
+      throw err;
+    }
+    const whitelistedDirs = await _expandDirCandidates(_getWhitelistedLocalDirs(tempDir, options));
+    if (!whitelistedDirs.some((dir) => _isSubPathOrEqual(realPath, dir))) {
+      const err = new Error(
+        `Blocked local media file outside allowed directories: ${realPath}`
+      );
+      err.code = "ERR_LFI_BLOCKED";
+      throw err;
+    }
+  }
+
+  let st;
+  try {
+    st = await fs.promises.stat(realPath);
+  } catch (_) {
+    throw new Error(`Media source not found or unsupported: ${raw.slice(0, 120)}`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`Media source not found or unsupported: ${raw.slice(0, 120)}`);
+  }
+  if (st.size > maxMediaBytes) {
+    const err = new Error(
+      `Local media file (${st.size} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+    );
+    err.code = "ERR_MEDIA_TOO_LARGE";
+    throw err;
+  }
+
+  const buf = await fs.promises.readFile(realPath);
+  if (buf.length > maxMediaBytes) {
+    const err = new Error(
+      `Local media file (${buf.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+    );
+    err.code = "ERR_MEDIA_TOO_LARGE";
+    throw err;
+  }
+  const md5HexStr = crypto.createHash("md5").update(buf).digest("hex");
+  const dim = inspectImageDimensions(buf);
+  const fileName = options.preferredName || path.basename(realPath) || `${md5HexStr}${dim.ext}`;
+  return {
+    localPath: realPath,
+    fileName: path.basename(fileName),
+    fileSize: buf.length,
+    md5HexStr,
+    width: dim.width,
+    height: dim.height,
+    isGif: dim.isGif,
+    buffer: buf,
+    isTempFile: false,
+  };
 }
 
 // ============================================================================
@@ -1483,7 +2005,13 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "image" })
-          : await resolveMediaSource(src, { tempDir: ctx.tempDir });
+          : await resolveMediaSource(src, {
+              tempDir: ctx.tempDir,
+              maxMediaBytes: ctx.maxMediaBytes,
+              allowPrivateUrls: ctx.allowPrivateUrls,
+              allowArbitraryLocalFiles: ctx.allowArbitraryLocalFiles,
+              allowedFileDirs: ctx.allowedFileDirs,
+            });
       trackTempMedia(media);
       const subType = Number(data.sub_type ?? data.subType ?? 0);
       let finalPath = media.localPath;
@@ -1539,7 +2067,14 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "record", preferredExt: ".amr" })
-          : await resolveMediaSource(src, { tempDir: ctx.tempDir, preferredExt: ".amr" });
+          : await resolveMediaSource(src, {
+              tempDir: ctx.tempDir,
+              preferredExt: ".amr",
+              maxMediaBytes: ctx.maxMediaBytes,
+              allowPrivateUrls: ctx.allowPrivateUrls,
+              allowArbitraryLocalFiles: ctx.allowArbitraryLocalFiles,
+              allowedFileDirs: ctx.allowedFileDirs,
+            });
       trackTempMedia(media);
       let finalPath = media.localPath;
       let duration = Math.max(1, Number(data.duration || 3));
@@ -1579,7 +2114,14 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "video", preferredExt: ".mp4" })
-          : await resolveMediaSource(src, { tempDir: ctx.tempDir, preferredExt: ".mp4" });
+          : await resolveMediaSource(src, {
+              tempDir: ctx.tempDir,
+              preferredExt: ".mp4",
+              maxMediaBytes: ctx.maxMediaBytes,
+              allowPrivateUrls: ctx.allowPrivateUrls,
+              allowArbitraryLocalFiles: ctx.allowArbitraryLocalFiles,
+              allowedFileDirs: ctx.allowedFileDirs,
+            });
       trackTempMedia(media);
       elements.push({
         elementType: 5,
@@ -1615,7 +2157,14 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "file", preferredName })
-          : await resolveMediaSource(src, { tempDir: ctx.tempDir, preferredName });
+          : await resolveMediaSource(src, {
+              tempDir: ctx.tempDir,
+              preferredName,
+              maxMediaBytes: ctx.maxMediaBytes,
+              allowPrivateUrls: ctx.allowPrivateUrls,
+              allowArbitraryLocalFiles: ctx.allowArbitraryLocalFiles,
+              allowedFileDirs: ctx.allowedFileDirs,
+            });
       trackTempMedia(media);
       elements.push({
         elementType: 3,
@@ -2126,6 +2675,7 @@ function formatMetaEvent(metaEventType, payload = {}, ctx = {}) {
 }
 
 module.exports = {
+  DEFAULT_MAX_MEDIA_BYTES,
   MessageIdStore,
   UinUidStore,
   escapeCqText,
@@ -2137,7 +2687,10 @@ module.exports = {
   inspectImageDimensions,
   getNtqqVersionMetadata,
   buildNtqqUserAgent,
+  isPrivateOrReservedIp,
   pruneTempDir,
+  pruneTempDirAsync,
+  downloadBufferFromUrl,
   resolveMediaSource,
   buildNtPicUrl,
   ntMsgToOneBotSegments,

@@ -479,6 +479,11 @@ function loadBridgeConfig(customConfigDir) {
           "autoQuickLogin",
           "keepMapHook",
           "quietLogs",
+          "maxMediaBytes",
+          "allowPrivateMediaUrls",
+          "allowPrivateUrls",
+          "allowArbitraryLocalFiles",
+          "allowedFileDirs",
         ]) {
           if (raw && raw[optKey] !== undefined) {
             defaultConfig[optKey] = raw[optKey];
@@ -3251,6 +3256,19 @@ class NtqqOneBotBridge extends EventEmitter {
     return Math.min(maxTimeout, baseRich + extraMb * 2000);
   }
 
+  _mediaSecurityOptions() {
+    return {
+      maxMediaBytes: this.config.maxMediaBytes,
+      allowPrivateUrls:
+        this.config.allowPrivateUrls === true || this.config.allowPrivateMediaUrls === true
+          ? true
+          : undefined,
+      allowArbitraryLocalFiles:
+        this.config.allowArbitraryLocalFiles === true ? true : undefined,
+      allowedFileDirs: this.config.allowedFileDirs,
+    };
+  }
+
   async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
     // Phase 1 (unlocked): concurrent heavy I/O (HTTP media download, EXIF normalize, @UIN->UID)
     const { elements, sideEffects, cleanupCallbacks } = await oneBotSegmentsToNtElements(message, {
@@ -3260,6 +3278,7 @@ class NtqqOneBotBridge extends EventEmitter {
       messageIdStore: this.messageIdStore,
       invokeNt: this.invokeNt.bind(this),
       prepareNtImagePath: this._prepareNtImagePath.bind(this),
+      ...this._mediaSecurityOptions(),
     });
 
     try {
@@ -5327,7 +5346,7 @@ class NtqqOneBotBridge extends EventEmitter {
       case "ocr_image":
       case ".ocr_image": {
         const imgSrc = String(p.image || "");
-        const media = await resolveMediaSource(imgSrc);
+        const media = await resolveMediaSource(imgSrc, this._mediaSecurityOptions());
         const res = await this.invokeNt("nodeIKernelMiscService/ocr", {
           path: media.localPath,
         });
@@ -5433,7 +5452,7 @@ class NtqqOneBotBridge extends EventEmitter {
       }
 
       case "set_qq_avatar": {
-        const media = await resolveMediaSource(p.file);
+        const media = await resolveMediaSource(p.file, this._mediaSecurityOptions());
         await this.invokeNt(
           "nodeIKernelProfileService/setHeader",
           { path: media.localPath },
