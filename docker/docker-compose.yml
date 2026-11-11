@@ -1,0 +1,30 @@
+services:
+  rosmontis:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        QQ_DEB_URL: ${QQ_DEB_URL:-https://dldir1.qq.com/qqfile/qq/QQNT/Linux/QQ_3.2.32_260508_amd64_01.deb}
+    container_name: rosmontis
+    restart: unless-stopped
+    shm_size: 1gb
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - VNC_PASSWD=${VNC_PASSWD:-}
+      - ROSMONTIS_HTTP_PORT=3000
+      - ROSMONTIS_WS_PORT=3001
+      - ROSMONTIS_REVERSE_WS_URL=${ROSMONTIS_REVERSE_WS_URL:-}
+      - ROSMONTIS_ACCESS_TOKEN=${ROSMONTIS_ACCESS_TOKEN:-}
+    ports:
+      # Bind to localhost by default; expose via SSH tunnel or authenticated reverse proxy
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
+      - "127.0.0.1:6081:6081"
+    volumes:
+      - rosmontis-qq-config:/app/.config
+      - rosmontis-qq-share:/app/.local/share
+      - ./data:/app/data
+
+volumes:
+  rosmontis-qq-config:
+  rosmontis-qq-share:
