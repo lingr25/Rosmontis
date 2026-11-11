@@ -3,18 +3,32 @@
 const assert = require("assert");
 const crypto = require("crypto");
 const dns = require("dns");
-const EventEmitter = require("events");
 const fs = require("fs");
 const http = require("http");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
 const onebot = require("../src/bridge_onebot.js");
+const mediaSecurity = require("../src/core/media_security.js");
 
 const ONE_BY_ONE_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const ONE_BY_ONE_PNG_BUF = Buffer.from(ONE_BY_ONE_PNG_B64, "base64");
+
+function saveEnvVars(keys) {
+  const snapshot = new Map();
+  for (const k of keys) {
+    snapshot.set(k, Object.prototype.hasOwnProperty.call(process.env, k) ? process.env[k] : undefined);
+  }
+  return () => {
+    for (const [k, v] of snapshot.entries()) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  };
+}
 
 async function runMediaSecurityTests() {
   let passed = 0;
@@ -24,13 +38,15 @@ async function runMediaSecurityTests() {
     console.log(`  [PASS] ${name}`);
   }
 
-  console.log("=== Media Security, 256MiB Quota, LFI Boundary & Async Concurrency Tests ===");
+  console.log("=== Media Security, Tight LFI Whitelist, Comprehensive IPv4/IPv6 SSRF & Streaming Quota Tests ===");
 
-  await check("DEFAULT_MAX_MEDIA_BYTES equals 256 MiB (268,435,456 bytes) and isPrivateOrReservedIp classifies IPv4/IPv6 accurately", () => {
+  await check("DEFAULT_MAX_MEDIA_BYTES equals 256 MiB and isPrivateOrReservedIp classifies all IPv4 & IPv6 ranges accurately", () => {
     assert.strictEqual(onebot.DEFAULT_MAX_MEDIA_BYTES, 256 * 1024 * 1024);
     assert.strictEqual(onebot.DEFAULT_MAX_MEDIA_BYTES, 268435456);
+    assert.strictEqual(mediaSecurity.isPrivateOrReservedIp, onebot.isPrivateOrReservedIp);
+    assert.strictEqual(mediaSecurity.downloadMediaStreamToTempDir, onebot.downloadMediaStreamToTempDir);
 
-    const blockedIps = [
+    const privateOrReservedIpv4 = [
       "0.0.0.0",
       "0.1.2.3",
       "10.0.0.1",
@@ -43,60 +59,99 @@ async function runMediaSecurityTests() {
       "169.254.0.1",
       "172.16.0.1",
       "172.31.255.254",
-      "192.168.0.1",
+      "192.168.1.1",
       "192.168.255.254",
+      "192.0.0.1",
+      "192.0.2.1",
+      "192.88.99.1",
+      "198.18.0.1",
+      "198.19.255.254",
+      "198.51.100.1",
+      "203.0.113.1",
       "224.0.0.1",
       "239.255.255.250",
       "255.255.255.255",
+    ];
+    for (const ip of privateOrReservedIpv4) {
+      assert.strictEqual(
+        onebot.isPrivateOrReservedIp(ip),
+        true,
+        `Expected IPv4 ${ip} to be classified as private/reserved`
+      );
+    }
+
+    const publicIpv4 = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "172.15.255.254",
+      "172.32.0.1",
+      "100.63.255.255",
+      "100.128.0.1",
+      "93.184.216.34",
+      "192.169.0.1",
+    ];
+    for (const ip of publicIpv4) {
+      assert.strictEqual(
+        onebot.isPrivateOrReservedIp(ip),
+        false,
+        `Expected IPv4 ${ip} to be classified as public`
+      );
+    }
+
+    const privateOrReservedIpv6 = [
       "::",
       "::1",
       "[::1]",
       "fe80::1",
+      "fe80::1%eth0",
+      "[fe80::1%25eth0]",
       "febf::abcd",
       "fc00::1",
-      "fd12:3456:789a::1",
+      "fd12:3456::1",
+      "ff02::1",
       "::ffff:127.0.0.1",
-      "::ffff:7f00:1",
+      "::ffff:7f00:0001",
       "::ffff:169.254.169.254",
       "::ffff:a9fe:a9fe",
-      "::ffff:10.0.0.8",
+      "::ffff:10.0.0.1",
       "::ffff:192.168.1.10",
+      "64:ff9b::127.0.0.1",
+      "64:ff9b:1::1",
+      "100::1",
+      "2001::1",
+      "2001:2::1",
+      "2001:db8::1",
+      "2002:7f00:0001::1",
+      "fec0::1",
     ];
-    for (const ip of blockedIps) {
+    for (const ip of privateOrReservedIpv6) {
       assert.strictEqual(
         onebot.isPrivateOrReservedIp(ip),
         true,
-        `Expected ${ip} to be classified as private/reserved`
+        `Expected IPv6 ${ip} to be classified as private/reserved`
       );
     }
 
-    const publicIps = [
-      "8.8.8.8",
-      "1.1.1.1",
-      "93.184.216.34",
-      "100.63.255.254",
-      "100.128.0.1",
-      "172.15.255.254",
-      "172.32.0.1",
-      "192.169.0.1",
-      "2606:4700:4700::1111",
+    const publicIpv6 = [
       "2001:4860:4860::8888",
+      "2606:4700:4700::1111",
       "::ffff:8.8.8.8",
       "::ffff:0808:0808",
     ];
-    for (const ip of publicIps) {
+    for (const ip of publicIpv6) {
       assert.strictEqual(
         onebot.isPrivateOrReservedIp(ip),
         false,
-        `Expected ${ip} to be classified as public`
+        `Expected IPv6 ${ip} to be classified as public`
       );
     }
   });
 
-  await check("SSRF guard blocks loopback, metadata IP, IPv6 ::1, 302 redirect to 127.0.0.1, and DNS rebinding; allows opt-in allowPrivateUrls", async () => {
+  await check("Live HTTP SSRF guard blocks loopback, IPv6, 302 redirects to 127.0.0.1 & file:///etc/passwd, and DNS rebinding; allowPrivateMediaUrls: true succeeds", async () => {
     const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_ssrf_test_"));
     let okHits = 0;
-    const srv = http.createServer((req, res) => {
+
+    const targetSrv = http.createServer((req, res) => {
       if (req.url === "/ok.png") {
         okHits += 1;
         res.writeHead(200, {
@@ -106,70 +161,91 @@ async function runMediaSecurityTests() {
         res.end(ONE_BY_ONE_PNG_BUF);
         return;
       }
+      if (req.url === "/redirect-file") {
+        res.writeHead(302, { Location: "file:///etc/passwd" });
+        res.end();
+        return;
+      }
       res.writeHead(404);
       res.end("not found");
     });
 
-    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
-    const port = srv.address().port;
+    await new Promise((resolve) => targetSrv.listen(0, "127.0.0.1", resolve));
+    const targetPort = targetSrv.address().port;
+
+    const redirectSrv = http.createServer((req, res) => {
+      if (req.url === "/to-loopback") {
+        res.writeHead(302, { Location: `http://127.0.0.1:${targetPort}/ok.png` });
+        res.end();
+        return;
+      }
+      if (req.url === "/to-ipv6-loopback") {
+        res.writeHead(302, { Location: `http://[::1]:${targetPort}/ok.png` });
+        res.end();
+        return;
+      }
+      if (req.url === "/to-file-passwd") {
+        res.writeHead(302, { Location: "file:///etc/passwd" });
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => redirectSrv.listen(0, "127.0.0.1", resolve));
+    const redirectPort = redirectSrv.address().port;
+
+    // Route public-cdn.example.com over real TCP to redirectSrv while keeping SSRF guard active
+    const publicRedirectAgent = new http.Agent({ keepAlive: false });
+    publicRedirectAgent.createConnection = (opts, cb) => {
+      if (opts.host === "public-cdn.example.com") {
+        return net.createConnection({ host: "127.0.0.1", port: redirectPort }, cb);
+      }
+      return net.createConnection(opts, cb);
+    };
 
     try {
-      // 1. Direct literal private/reserved IPs blocked before socket connection
-      await assert.rejects(
-        () => onebot.resolveMediaSource(`http://127.0.0.1:${port}/ok.png`, { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked private/i.test(err.message))
-      );
-      assert.strictEqual(okHits, 0, "Loopback HTTP server must not receive SSRF request");
+      // 1. Direct literal private/reserved IPs blocked before TCP socket reaches targetSrv
+      for (const blockedUrl of [
+        `http://127.0.0.1:${targetPort}/ok.png`,
+        "http://169.254.169.254/latest/meta-data/",
+        `http://[::1]:${targetPort}/ok.png`,
+        `http://[::ffff:127.0.0.1]:${targetPort}/ok.png`,
+      ]) {
+        await assert.rejects(
+          () => onebot.resolveMediaSource(blockedUrl, { tempDir: tmpDir }),
+          (err) => err && err.code === "ERR_SSRF_BLOCKED",
+          `Expected ERR_SSRF_BLOCKED for ${blockedUrl}`
+        );
+      }
+      assert.strictEqual(okHits, 0, "Loopback HTTP server must not receive blocked SSRF requests");
 
-      await assert.rejects(
-        () => onebot.resolveMediaSource("http://169.254.169.254/latest/meta-data/", { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked private/i.test(err.message))
-      );
-
-      await assert.rejects(
-        () => onebot.resolveMediaSource(`http://[::1]:${port}/ok.png`, { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked private/i.test(err.message))
-      );
-
-      await assert.rejects(
-        () => onebot.resolveMediaSource(`http://[::ffff:127.0.0.1]:${port}/ok.png`, { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked private/i.test(err.message))
-      );
-
-      // 2. Public URL 302 redirecting to 127.0.0.1 is intercepted on redirect hop
-      const origHttpGet = http.get;
-      http.get = function mockedHttpGet(urlOrOpts, optsOrCb, maybeCb) {
-        const urlStr = typeof urlOrOpts === "string" ? urlOrOpts : String(urlOrOpts?.href || "");
-        const cb = typeof optsOrCb === "function" ? optsOrCb : maybeCb;
-        if (urlStr.startsWith("http://public-cdn.example.com/redirect-ssrf")) {
-          const fakeReq = new EventEmitter();
-          fakeReq.destroy = () => {};
-          process.nextTick(() => {
-            const fakeRes = new EventEmitter();
-            fakeRes.statusCode = 302;
-            fakeRes.headers = { location: `http://127.0.0.1:${port}/ok.png` };
-            fakeRes.resume = () => {};
-            fakeRes.destroy = () => {};
-            cb(fakeRes);
-          });
-          return fakeReq;
-        }
-        return origHttpGet.apply(this, arguments);
-      };
-      try {
+      // 2. Live HTTP 302 redirects from public URL to 127.0.0.1, [::1], and file:///etc/passwd
+      for (const redirectPath of ["/to-loopback", "/to-ipv6-loopback", "/to-file-passwd"]) {
         await assert.rejects(
           () =>
-            onebot.resolveMediaSource("http://public-cdn.example.com/redirect-ssrf", {
+            onebot.resolveMediaSource(`http://public-cdn.example.com${redirectPath}`, {
               tempDir: tmpDir,
+              agent: publicRedirectAgent,
             }),
-          (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked private/i.test(err.message))
+          (err) => err && err.code === "ERR_SSRF_BLOCKED",
+          `Expected ERR_SSRF_BLOCKED on 302 redirect ${redirectPath}`
         );
-        assert.strictEqual(okHits, 0, "302 redirect target on 127.0.0.1 must not be contacted");
-      } finally {
-        http.get = origHttpGet;
       }
+      assert.strictEqual(okHits, 0, "302 redirect target on 127.0.0.1 must never be contacted");
 
-      // 3. Domain name resolving to private IP (DNS Rebinding) is blocked in both single & { all: true } lookup modes
+      // Even with allowPrivateMediaUrls: true, 302 redirect to file:///etc/passwd is blocked
+      await assert.rejects(
+        () =>
+          onebot.resolveMediaSource(`http://127.0.0.1:${targetPort}/redirect-file`, {
+            tempDir: tmpDir,
+            allowPrivateMediaUrls: true,
+          }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+
+      // 3. DNS rebinding to private IPv4/IPv6 blocked in both single & { all: true } lookup modes
       const origDnsLookup = dns.lookup;
       dns.lookup = function mockedDnsLookup(hostname, opts, callback) {
         const cb = typeof opts === "function" ? opts : callback;
@@ -186,48 +262,63 @@ async function runMediaSecurityTests() {
               : cb(null, "169.254.169.254", 4)
           );
         }
+        if (hostname === "rebind-v6.example.com") {
+          return process.nextTick(() =>
+            wantAll
+              ? cb(null, [
+                  { address: "2606:4700:4700::1111", family: 6 },
+                  { address: "::ffff:127.0.0.1", family: 6 },
+                ])
+              : cb(null, "::ffff:127.0.0.1", 6)
+          );
+        }
         return origDnsLookup.apply(this, arguments);
       };
       try {
-        await assert.rejects(
-          () =>
-            onebot.resolveMediaSource(`http://rebind-loopback.example.com:${port}/ok.png`, {
-              tempDir: tmpDir,
-            }),
-          (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked DNS resolution/i.test(err.message))
-        );
-        await assert.rejects(
-          () =>
-            onebot.resolveMediaSource("http://rebind-meta.example.com/latest/meta-data/", {
-              tempDir: tmpDir,
-            }),
-          (err) => err && (err.code === "ERR_SSRF_BLOCKED" || /Blocked DNS resolution/i.test(err.message))
-        );
-        assert.strictEqual(okHits, 0, "DNS rebinding to 127.0.0.1 must be aborted before TCP connect");
+        for (const host of [
+          `http://rebind-loopback.example.com:${targetPort}/ok.png`,
+          "http://rebind-meta.example.com/latest/meta-data/",
+          `http://rebind-v6.example.com:${targetPort}/ok.png`,
+        ]) {
+          await assert.rejects(
+            () => onebot.resolveMediaSource(host, { tempDir: tmpDir }),
+            (err) => err && err.code === "ERR_SSRF_BLOCKED"
+          );
+        }
+        assert.strictEqual(okHits, 0, "DNS rebinding to private IP must abort before TCP connect");
       } finally {
         dns.lookup = origDnsLookup;
       }
 
-      // 4. Explicit opt-in allowPrivateUrls: true downloads normally from local mock HTTP server
-      const media = await onebot.resolveMediaSource(`http://127.0.0.1:${port}/ok.png`, {
+      // 4. Explicit allowPrivateMediaUrls: true cleanly downloads from local HTTP server
+      const media = await onebot.resolveMediaSource(`http://127.0.0.1:${targetPort}/ok.png`, {
         tempDir: tmpDir,
-        allowPrivateUrls: true,
+        allowPrivateMediaUrls: true,
       });
       assert.strictEqual(okHits, 1);
       assert.strictEqual(media.fileSize, ONE_BY_ONE_PNG_BUF.length);
       assert.strictEqual(media.width, 1);
       assert.strictEqual(media.height, 1);
       assert.strictEqual(media.isTempFile, true);
-      assert.ok(fs.existsSync(media.localPath));
+      const savedBytes = await fs.promises.readFile(media.localPath);
+      assert.ok(savedBytes.equals(ONE_BY_ONE_PNG_BUF));
     } finally {
-      await new Promise((resolve) => srv.close(resolve));
+      publicRedirectAgent.destroy();
+      await new Promise((resolve) => redirectSrv.close(resolve));
+      await new Promise((resolve) => targetSrv.close(resolve));
       await fs.promises.rm(tmpDir, { recursive: true, force: true });
     }
   });
 
-  await check("256MiB quota enforcement aborts Content-Length, chunked stream, and oversized base64:// at maxMediaBytes: 1024", async () => {
+  await check("Streaming media download & quota enforcement aborts oversized Content-Length and chunked transfers cleanly with zero leftover .part files", async () => {
     const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_quota_test_"));
+    let chunkedHits = 0;
     let streamChunksSent = 0;
+
+    const exact1KbBuf = Buffer.concat([
+      ONE_BY_ONE_PNG_BUF,
+      Buffer.alloc(1024 - ONE_BY_ONE_PNG_BUF.length, 0x33),
+    ]);
 
     const srv = http.createServer((req, res) => {
       if (req.url === "/oversize-header") {
@@ -239,6 +330,8 @@ async function runMediaSecurityTests() {
         return;
       }
       if (req.url === "/oversize-chunked") {
+        chunkedHits += 1;
+        streamChunksSent = 0;
         res.writeHead(200, {
           "Content-Type": "application/octet-stream",
           "Transfer-Encoding": "chunked",
@@ -256,6 +349,14 @@ async function runMediaSecurityTests() {
         sendNext();
         return;
       }
+      if (req.url === "/exact-1kb.png") {
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Content-Length": String(exact1KbBuf.length),
+        });
+        res.end(exact1KbBuf);
+        return;
+      }
       res.writeHead(404);
       res.end();
     });
@@ -264,33 +365,86 @@ async function runMediaSecurityTests() {
     const port = srv.address().port;
 
     try {
-      // 1. Content-Length > 1024 rejected immediately
+      // 1. Immediate abort when Content-Length > maxMediaBytes (both downloadMediaStreamToTempDir & resolveMediaSource)
+      await assert.rejects(
+        () =>
+          onebot.downloadMediaStreamToTempDir(`http://127.0.0.1:${port}/oversize-header`, tmpDir, {
+            allowPrivateMediaUrls: true,
+            maxMediaBytes: 1024,
+          }),
+        (err) => err && err.code === "ERR_MEDIA_TOO_LARGE"
+      );
       await assert.rejects(
         () =>
           onebot.resolveMediaSource(`http://127.0.0.1:${port}/oversize-header`, {
             tempDir: tmpDir,
-            allowPrivateUrls: true,
+            allowPrivateMediaUrls: true,
             maxMediaBytes: 1024,
           }),
-        (err) => err && (err.code === "ERR_MEDIA_TOO_LARGE" || /exceeds maximum limit/i.test(err.message))
+        (err) => err && err.code === "ERR_MEDIA_TOO_LARGE"
+      );
+      assert.deepStrictEqual(
+        (await fs.promises.readdir(tmpDir)).filter((n) => n.endsWith(".part")),
+        [],
+        "Zero .part files may exist after Content-Length rejection"
       );
 
-      // 2. Chunked stream without Content-Length aborted mid-stream once > 1024 bytes
+      // 2. Mid-stream abort on chunked transfer exceeding maxMediaBytes with zero leftover .part files
+      await assert.rejects(
+        () =>
+          onebot.downloadMediaStreamToTempDir(`http://127.0.0.1:${port}/oversize-chunked`, tmpDir, {
+            allowPrivateMediaUrls: true,
+            maxMediaBytes: 1024,
+          }),
+        (err) => err && err.code === "ERR_MEDIA_TOO_LARGE"
+      );
+      assert.ok(
+        streamChunksSent >= 3 && streamChunksSent < 20,
+        `Expected downloadMediaStreamToTempDir to abort chunked stream early, sent ${streamChunksSent} chunks`
+      );
+      assert.deepStrictEqual(
+        await fs.promises.readdir(tmpDir),
+        [],
+        "Zero leftover .part or partial files may remain in tempDir after downloadMediaStreamToTempDir abort"
+      );
+
       await assert.rejects(
         () =>
           onebot.resolveMediaSource(`http://127.0.0.1:${port}/oversize-chunked`, {
             tempDir: tmpDir,
-            allowPrivateUrls: true,
+            allowPrivateMediaUrls: true,
             maxMediaBytes: 1024,
           }),
-        (err) => err && (err.code === "ERR_MEDIA_TOO_LARGE" || /exceeds maximum limit/i.test(err.message))
+        (err) => err && err.code === "ERR_MEDIA_TOO_LARGE"
       );
+      assert.strictEqual(chunkedHits, 2);
       assert.ok(
         streamChunksSent >= 3 && streamChunksSent < 20,
-        `Expected chunked stream to abort early after exceeding 1KB, sent ${streamChunksSent} chunks`
+        `Expected resolveMediaSource to abort chunked stream early, sent ${streamChunksSent} chunks`
+      );
+      assert.deepStrictEqual(
+        await fs.promises.readdir(tmpDir),
+        [],
+        "Zero leftover .part or partial files may remain in tempDir after resolveMediaSource abort"
       );
 
-      // 3. Oversized base64:// & data:...;base64, rejected pre-allocation; exact 1024-byte boundary succeeds
+      // 3. Exact 1024-byte streaming download succeeds cleanly
+      const streamedExact = await onebot.downloadMediaStreamToTempDir(
+        `http://127.0.0.1:${port}/exact-1kb.png`,
+        tmpDir,
+        { allowPrivateMediaUrls: true, maxMediaBytes: 1024 }
+      );
+      assert.strictEqual(streamedExact.fileSize, 1024);
+      assert.strictEqual(
+        streamedExact.md5HexStr,
+        crypto.createHash("md5").update(exact1KbBuf).digest("hex")
+      );
+      assert.deepStrictEqual(
+        (await fs.promises.readdir(tmpDir)).filter((n) => n.endsWith(".part")),
+        []
+      );
+
+      // 4. Oversized base64:// & data:...;base64, rejected pre-allocation; exact 1024-byte boundary succeeds
       const oversizeB64 = Buffer.alloc(2048, 0x5a).toString("base64");
       await assert.rejects(
         () =>
@@ -298,7 +452,7 @@ async function runMediaSecurityTests() {
             tempDir: tmpDir,
             maxMediaBytes: 1024,
           }),
-        (err) => err && (err.code === "ERR_MEDIA_TOO_LARGE" || /exceeds maximum limit/i.test(err.message))
+        (err) => err && err.code === "ERR_MEDIA_TOO_LARGE"
       );
       await assert.rejects(
         () =>
@@ -306,60 +460,91 @@ async function runMediaSecurityTests() {
             tempDir: tmpDir,
             maxMediaBytes: 1024,
           }),
-        (err) => err && (err.code === "ERR_MEDIA_TOO_LARGE" || /exceeds maximum limit/i.test(err.message))
+        (err) => err && err.code === "ERR_MEDIA_TOO_LARGE"
       );
 
-      const exact1KbBuf = Buffer.alloc(1024, 0x33);
-      const exactMedia = await onebot.resolveMediaSource(`base64://${exact1KbBuf.toString("base64")}`, {
-        tempDir: tmpDir,
-        maxMediaBytes: 1024,
-      });
-      assert.strictEqual(exactMedia.fileSize, 1024);
+      const exactB64Media = await onebot.resolveMediaSource(
+        `base64://${Buffer.alloc(1024, 0x33).toString("base64")}`,
+        { tempDir: tmpDir, maxMediaBytes: 1024 }
+      );
+      assert.strictEqual(exactB64Media.fileSize, 1024);
     } finally {
       await new Promise((resolve) => srv.close(resolve));
       await fs.promises.rm(tmpDir, { recursive: true, force: true });
     }
   });
 
-  await check("LFI path boundary allows tempDir & os.tmpdir(), and blocks outside paths, outside symlinks, and ROSMONTIS_CONFIG_DIR/onebot.json", async () => {
+  await check("Tightened LFI boundary allows tempDir, rejects sibling os.tmpdir() subdirs, rejects outside symlinks/junctions, and protects ROSMONTIS_CONFIG_DIR", async () => {
     const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_lfi_tmp_"));
-    const osTmpSubDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_lfi_ostmp_"));
-    // Place config dir inside os.tmpdir() to prove explicit blacklist overrides parent whitelist
+    const osTmpSiblingDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_lfi_ostmp_"));
     const cfgDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_lfi_cfg_"));
-    // Place an outside directory inside the project test folder (outside tempDir / os.tmpdir() / ~/.config/QQ)
     const outsideDir = await fs.promises.mkdtemp(path.join(__dirname, ".tmp_outside_lfi_"));
 
-    const savedCfgEnv = process.env.ROSMONTIS_CONFIG_DIR;
+    const restoreEnv = saveEnvVars([
+      "ROSMONTIS_CONFIG_DIR",
+      "ONEBOT_CONFIG_DIR",
+      "XIAO_BRIDGE_CONFIG_DIR",
+      "ROSMONTIS_ALLOWED_FILE_DIRS",
+      "ONEBOT_ALLOWED_FILE_DIRS",
+      "XIAO_BRIDGE_ALLOWED_FILE_DIRS",
+      "ROSMONTIS_ALLOW_ARBITRARY_LOCAL_FILES",
+      "ONEBOT_ALLOW_ARBITRARY_LOCAL_FILES",
+      "XIAO_BRIDGE_ALLOW_ARBITRARY_LOCAL_FILES",
+    ]);
     process.env.ROSMONTIS_CONFIG_DIR = cfgDir;
+    delete process.env.ONEBOT_CONFIG_DIR;
+    delete process.env.XIAO_BRIDGE_CONFIG_DIR;
+    delete process.env.ROSMONTIS_ALLOWED_FILE_DIRS;
+    delete process.env.ONEBOT_ALLOWED_FILE_DIRS;
+    delete process.env.XIAO_BRIDGE_ALLOWED_FILE_DIRS;
+    delete process.env.ROSMONTIS_ALLOW_ARBITRARY_LOCAL_FILES;
+    delete process.env.ONEBOT_ALLOW_ARBITRARY_LOCAL_FILES;
+    delete process.env.XIAO_BRIDGE_ALLOW_ARBITRARY_LOCAL_FILES;
 
     try {
       const allowedInTemp = path.join(tmpDir, "valid_temp.png");
-      const allowedInOsTmp = path.join(osTmpSubDir, "valid_ostmp.png");
-      const secretCfgFile = path.join(cfgDir, "onebot.json");
+      const disallowedInOsTmp = path.join(osTmpSiblingDir, "sibling_ostmp.png");
+      const secretCfgJson = path.join(cfgDir, "onebot.json");
+      const secretCfgPng = path.join(cfgDir, "cfg_asset.png");
       const outsideSecretFile = path.join(outsideDir, "outside_secret.png");
 
       await fs.promises.writeFile(allowedInTemp, ONE_BY_ONE_PNG_BUF);
-      await fs.promises.writeFile(allowedInOsTmp, ONE_BY_ONE_PNG_BUF);
-      await fs.promises.writeFile(secretCfgFile, '{"accessToken":"super_secret_token"}', "utf8");
+      await fs.promises.writeFile(disallowedInOsTmp, ONE_BY_ONE_PNG_BUF);
+      await fs.promises.writeFile(secretCfgJson, '{"accessToken":"super_secret_token"}', "utf8");
+      await fs.promises.writeFile(secretCfgPng, ONE_BY_ONE_PNG_BUF);
       await fs.promises.writeFile(outsideSecretFile, ONE_BY_ONE_PNG_BUF);
 
-      // 1. Reading from tempDir & os.tmpdir() succeeds (both direct path & file:// URL)
+      // 1. File inside configured tempDir succeeds (both direct path & file:// URL)
       const m1 = await onebot.resolveMediaSource(allowedInTemp, { tempDir: tmpDir });
       assert.strictEqual(m1.fileSize, ONE_BY_ONE_PNG_BUF.length);
       assert.strictEqual(m1.isTempFile, false);
+      assert.strictEqual(m1.localPath, await fs.promises.realpath(allowedInTemp));
 
-      const m2 = await onebot.resolveMediaSource(pathToFileURL(allowedInOsTmp).toString(), {
+      const m1Url = await onebot.resolveMediaSource(pathToFileURL(allowedInTemp).toString(), {
         tempDir: tmpDir,
       });
-      assert.strictEqual(m2.fileSize, ONE_BY_ONE_PNG_BUF.length);
+      assert.strictEqual(m1Url.fileSize, ONE_BY_ONE_PNG_BUF.length);
 
-      // 2. Reading outside whitelist is rejected
+      // 2. Unrelated os.tmpdir() sibling directory outside tempDir is strictly REJECTED
       await assert.rejects(
-        () => onebot.resolveMediaSource(outsideSecretFile, { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_LFI_BLOCKED" || /outside allowed directories/i.test(err.message))
+        () => onebot.resolveMediaSource(disallowedInOsTmp, { tempDir: tmpDir }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+      await assert.rejects(
+        () =>
+          onebot.resolveMediaSource(pathToFileURL(disallowedInOsTmp).toString(), {
+            tempDir: tmpDir,
+          }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
       );
 
-      // 3. Symlink/junction inside whitelisted tempDir pointing outside whitelist is rejected via realpath
+      // 3. Arbitrary outside directory is rejected
+      await assert.rejects(
+        () => onebot.resolveMediaSource(outsideSecretFile, { tempDir: tmpDir }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+
+      // 4. Symlink / junction inside tempDir pointing to outside file is rejected via canonical realpath
       const symlinkDir = path.join(tmpDir, "escaped_dir_link");
       await fs.promises.symlink(
         outsideDir,
@@ -368,90 +553,338 @@ async function runMediaSecurityTests() {
       );
       await assert.rejects(
         () => onebot.resolveMediaSource(path.join(symlinkDir, "outside_secret.png"), { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_LFI_BLOCKED" || /outside allowed directories/i.test(err.message))
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
       );
 
-      // Also test direct file symlink if supported by host OS privileges
+      // Direct file symlink (skip gracefully on Windows if EPERM without Developer Mode)
       const symlinkFile = path.join(tmpDir, "escaped_file_link.png");
       let fileSymlinkCreated = false;
       try {
-        await fs.promises.symlink(outsideSecretFile, symlinkFile, "file");
+        fs.symlinkSync(outsideSecretFile, symlinkFile, "file");
         fileSymlinkCreated = true;
-      } catch (_) {}
+      } catch (symErr) {
+        if (!symErr || (symErr.code !== "EPERM" && symErr.code !== "ENOSYS")) {
+          throw symErr;
+        }
+      }
       if (fileSymlinkCreated) {
         await assert.rejects(
           () => onebot.resolveMediaSource(symlinkFile, { tempDir: tmpDir }),
-          (err) => err && (err.code === "ERR_LFI_BLOCKED" || /outside allowed directories/i.test(err.message))
+          (err) => err && err.code === "ERR_LFI_BLOCKED"
         );
       }
 
-      // 4. Reading ROSMONTIS_CONFIG_DIR/onebot.json is strictly blocked even though parent is os.tmpdir()
+      // 5. ROSMONTIS_CONFIG_DIR files remain blocked even when allowArbitraryLocalFiles: true
       await assert.rejects(
-        () => onebot.resolveMediaSource(secretCfgFile, { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_LFI_BLOCKED" || /restricted local path/i.test(err.message))
+        () => onebot.resolveMediaSource(secretCfgJson, { tempDir: tmpDir }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+      await assert.rejects(
+        () =>
+          onebot.resolveMediaSource(secretCfgJson, {
+            tempDir: tmpDir,
+            allowArbitraryLocalFiles: true,
+          }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+      await assert.rejects(
+        () =>
+          onebot.resolveMediaSource(secretCfgPng, {
+            tempDir: tmpDir,
+            allowArbitraryLocalFiles: true,
+          }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
       );
 
-      // 5. Reading /etc/passwd is strictly blocked
+      // Symlink/junction pointing into ROSMONTIS_CONFIG_DIR is also blocked under allowArbitraryLocalFiles: true
+      const cfgLinkDir = path.join(outsideDir, "cfg_junction");
+      await fs.promises.symlink(
+        cfgDir,
+        cfgLinkDir,
+        process.platform === "win32" ? "junction" : "dir"
+      );
+      await assert.rejects(
+        () =>
+          onebot.resolveMediaSource(path.join(cfgLinkDir, "cfg_asset.png"), {
+            tempDir: tmpDir,
+            allowArbitraryLocalFiles: true,
+          }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+
+      // Only explicit allowSensitiveConfigFiles: true alongside allowArbitraryLocalFiles: true permits it
+      const allowedCfgAsset = await onebot.resolveMediaSource(secretCfgPng, {
+        tempDir: tmpDir,
+        allowArbitraryLocalFiles: true,
+        allowSensitiveConfigFiles: true,
+      });
+      assert.strictEqual(allowedCfgAsset.fileSize, ONE_BY_ONE_PNG_BUF.length);
+
+      // 6. System /etc/passwd is strictly blocked
       await assert.rejects(
         () => onebot.resolveMediaSource("/etc/passwd", { tempDir: tmpDir }),
-        (err) => err && (err.code === "ERR_LFI_BLOCKED" || /restricted local path/i.test(err.message))
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
       );
     } finally {
-      if (savedCfgEnv === undefined) delete process.env.ROSMONTIS_CONFIG_DIR;
-      else process.env.ROSMONTIS_CONFIG_DIR = savedCfgEnv;
+      restoreEnv();
       await fs.promises.rm(tmpDir, { recursive: true, force: true });
-      await fs.promises.rm(osTmpSubDir, { recursive: true, force: true });
+      await fs.promises.rm(osTmpSiblingDir, { recursive: true, force: true });
       await fs.promises.rm(cfgDir, { recursive: true, force: true });
       await fs.promises.rm(outsideDir, { recursive: true, force: true });
     }
   });
 
-  await check("20x Promise.all concurrent resolveMediaSource writes (identical + distinct base64://) complete intact without race corruption", async () => {
-    const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_concurrency_test_"));
+  await check("Narrow QQ NT RichMedia cache paths are allowed while sibling QQ DBs, Cookies, .ldb, and bridge config JSONs are blocked", async () => {
+    const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_qq_tmp_"));
+    const fakeHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_fake_home_"));
+
+    const restoreEnv = saveEnvVars([
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "ROSMONTIS_ALLOWED_FILE_DIRS",
+      "ONEBOT_ALLOWED_FILE_DIRS",
+      "XIAO_BRIDGE_ALLOWED_FILE_DIRS",
+    ]);
+    process.env.HOME = fakeHome;
+    delete process.env.XDG_CONFIG_HOME;
+    delete process.env.ROSMONTIS_ALLOWED_FILE_DIRS;
+    delete process.env.ONEBOT_ALLOWED_FILE_DIRS;
+    delete process.env.XIAO_BRIDGE_ALLOWED_FILE_DIRS;
+
     try {
-      const payloads = [];
-      // 10 identical PNG payloads racing on the exact same target filename
-      for (let i = 0; i < 10; i++) {
-        payloads.push(ONE_BY_ONE_PNG_BUF);
-      }
-      // 10 distinct payloads with PNG header + unique trailing chunks
-      for (let i = 0; i < 10; i++) {
-        payloads.push(Buffer.concat([ONE_BY_ONE_PNG_BUF, Buffer.from(`unique-tail-${i}-${"x".repeat(256)}`)]));
+      const qqRoot = path.join(fakeHome, ".config", "QQ");
+      const allowedMediaPaths = [
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Pic", "2026-11", "Ori", "test.png"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Video", "2026-11", "clip.mp4"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "File", "doc.pdf"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Ptt", "voice.amr"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Emoji", "sticker.png"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "MarketFace", "mface.png"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Thumb", "thumb.png"),
+      ];
+
+      for (const p of allowedMediaPaths) {
+        await fs.promises.mkdir(path.dirname(p), { recursive: true });
+        await fs.promises.writeFile(p, ONE_BY_ONE_PNG_BUF);
+        const resolved = await onebot.resolveMediaSource(p, { tempDir: tmpDir });
+        assert.strictEqual(resolved.fileSize, ONE_BY_ONE_PNG_BUF.length);
+        assert.strictEqual(resolved.isTempFile, false);
       }
 
-      const results = await Promise.all(
-        payloads.map((buf) =>
-          onebot.resolveMediaSource(`base64://${buf.toString("base64")}`, {
-            tempDir: tmpDir,
-          })
-        )
+      // Sensitive QQ DBs, Cookies, LevelDB .ldb, non-media QQ dirs, and config JSON filenames must be blocked
+      const blockedPaths = [
+        path.join(qqRoot, "nt_qq_abc123", "nt_db", "nt_msg.db"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_db", "nt_msg.db-wal"),
+        path.join(qqRoot, "Cookies"),
+        path.join(qqRoot, "Local Storage", "leveldb", "000005.ldb"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Log", "client.log"),
+        path.join(qqRoot, "nt_qq_abc123", "profile_root.png"),
+        path.join(qqRoot, "rosmontis.json"),
+        path.join(qqRoot, "onebot.json"),
+        path.join(qqRoot, "xiao_bridge.json"),
+        // Even inside whitelisted tempDir or Pic cache, sensitive filenames/extensions are blocked!
+        path.join(tmpDir, "rosmontis.json"),
+        path.join(tmpDir, "onebot.json"),
+        path.join(tmpDir, "xiao_bridge.json"),
+        path.join(tmpDir, "session_tokens.ldb"),
+        path.join(qqRoot, "nt_qq_abc123", "nt_data", "Pic", "2026-11", "sneaky.ldb"),
+      ];
+
+      for (const bp of blockedPaths) {
+        await fs.promises.mkdir(path.dirname(bp), { recursive: true });
+        await fs.promises.writeFile(bp, ONE_BY_ONE_PNG_BUF);
+        await assert.rejects(
+          () => onebot.resolveMediaSource(bp, { tempDir: tmpDir }),
+          (err) => err && err.code === "ERR_LFI_BLOCKED",
+          `Expected ERR_LFI_BLOCKED for sensitive or non-whitelisted path: ${bp}`
+        );
+      }
+    } finally {
+      restoreEnv();
+      await fs.promises.rm(tmpDir, { recursive: true, force: true });
+      await fs.promises.rm(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await check("ROSMONTIS_ALLOWED_FILE_DIRS & XIAO_BRIDGE_ALLOWED_FILE_DIRS parse multi-directory lists across platforms", async () => {
+    const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_allowlist_tmp_"));
+    const dirA = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_allow_a_"));
+    const dirB = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_allow_b_"));
+    const dirC = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_allow_c_"));
+    const dirD = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_allow_d_"));
+    const dirUnlisted = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_unlisted_"));
+
+    const restoreEnv = saveEnvVars([
+      "ROSMONTIS_ALLOWED_FILE_DIRS",
+      "ONEBOT_ALLOWED_FILE_DIRS",
+      "XIAO_BRIDGE_ALLOWED_FILE_DIRS",
+    ]);
+
+    try {
+      const fileA = path.join(dirA, "a.png");
+      const fileB = path.join(dirB, "b.png");
+      const fileC = path.join(dirC, "c.png");
+      const fileD = path.join(dirD, "d.png");
+      const fileUnlisted = path.join(dirUnlisted, "unlisted.png");
+      const sensitiveInAllowed = path.join(dirA, "rosmontis.json");
+
+      for (const f of [fileA, fileB, fileC, fileD, fileUnlisted, sensitiveInAllowed]) {
+        await fs.promises.writeFile(f, ONE_BY_ONE_PNG_BUF);
+      }
+
+      // path.delimiter (; on Windows, : on POSIX) in ROSMONTIS_ALLOWED_FILE_DIRS, comma in ONEBOT_ALLOWED_FILE_DIRS, and colon in XIAO_BRIDGE_ALLOWED_FILE_DIRS
+      process.env.ROSMONTIS_ALLOWED_FILE_DIRS = `${dirA}${path.delimiter}${dirB}`;
+      process.env.ONEBOT_ALLOWED_FILE_DIRS = `${dirB}, ${dirC}`;
+      process.env.XIAO_BRIDGE_ALLOWED_FILE_DIRS = `${dirC}:${dirD}`;
+
+      for (const allowedFile of [fileA, fileB, fileC, fileD]) {
+        const res = await onebot.resolveMediaSource(allowedFile, { tempDir: tmpDir });
+        assert.strictEqual(res.fileSize, ONE_BY_ONE_PNG_BUF.length);
+      }
+
+      // Unlisted sibling directory remains blocked
+      await assert.rejects(
+        () => onebot.resolveMediaSource(fileUnlisted, { tempDir: tmpDir }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
       );
 
-      assert.strictEqual(results.length, 20);
+      // Sensitive config/credential filenames inside an allowed directory remain blocked
+      await assert.rejects(
+        () => onebot.resolveMediaSource(sensitiveInAllowed, { tempDir: tmpDir }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+
+      // options.allowedFileDirs (comma-separated string or array) also grants scoped access
+      const viaOpts = await onebot.resolveMediaSource(fileUnlisted, {
+        tempDir: tmpDir,
+        allowedFileDirs: `${dirUnlisted} , ${dirA}`,
+      });
+      assert.strictEqual(viaOpts.fileSize, ONE_BY_ONE_PNG_BUF.length);
+
+      const viaOptsArray = await onebot.resolveMediaSource(fileUnlisted, {
+        tempDir: tmpDir,
+        allowedFileDirs: [`${dirUnlisted};${dirA}`, dirB],
+      });
+      assert.strictEqual(viaOptsArray.fileSize, ONE_BY_ONE_PNG_BUF.length);
+    } finally {
+      restoreEnv();
+      await fs.promises.rm(tmpDir, { recursive: true, force: true });
+      await fs.promises.rm(dirA, { recursive: true, force: true });
+      await fs.promises.rm(dirB, { recursive: true, force: true });
+      await fs.promises.rm(dirC, { recursive: true, force: true });
+      await fs.promises.rm(dirD, { recursive: true, force: true });
+      await fs.promises.rm(dirUnlisted, { recursive: true, force: true });
+    }
+  });
+
+  await check("Concurrent Promise.all HTTP streaming downloads & base64:// writes (identical + distinct) complete without ENOENT or race corruption", async () => {
+    const httpTmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_http_conc_"));
+    const b64TmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_b64_conc_"));
+
+    const distinctPayloads = Array.from({ length: 10 }, (_, i) =>
+      Buffer.concat([ONE_BY_ONE_PNG_BUF, Buffer.from(`http-stream-tail-${i}-${"z".repeat(512)}`)])
+    );
+
+    const srv = http.createServer((req, res) => {
+      if (req.url === "/shared.png") {
+        res.writeHead(200, { "Content-Type": "image/png" });
+        res.write(ONE_BY_ONE_PNG_BUF.subarray(0, 32));
+        setTimeout(() => res.end(ONE_BY_ONE_PNG_BUF.subarray(32)), 5);
+        return;
+      }
+      const match = /^\/distinct\/(\d+)\.png$/.exec(req.url || "");
+      if (match) {
+        const idx = Number(match[1]);
+        const buf = distinctPayloads[idx];
+        if (buf) {
+          res.writeHead(200, {
+            "Content-Type": "image/png",
+            "Content-Length": String(buf.length),
+          });
+          res.end(buf);
+          return;
+        }
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = srv.address().port;
+
+    try {
+      // 1. 20 concurrent HTTP streaming downloads (10 identical URLs + 10 distinct URLs, mixing resolveMediaSource & downloadMediaStreamToTempDir)
+      const httpTasks = [];
+      const expectedHttpBuffers = [];
+      for (let i = 0; i < 10; i++) {
+        expectedHttpBuffers.push(ONE_BY_ONE_PNG_BUF);
+        const url = `http://127.0.0.1:${port}/shared.png`;
+        httpTasks.push(
+          i % 2 === 0
+            ? onebot.resolveMediaSource(url, { tempDir: httpTmpDir, allowPrivateMediaUrls: true })
+            : onebot.downloadMediaStreamToTempDir(url, httpTmpDir, { allowPrivateMediaUrls: true })
+        );
+      }
+      for (let i = 0; i < 10; i++) {
+        expectedHttpBuffers.push(distinctPayloads[i]);
+        const url = `http://127.0.0.1:${port}/distinct/${i}.png`;
+        httpTasks.push(
+          i % 2 === 0
+            ? onebot.resolveMediaSource(url, { tempDir: httpTmpDir, allowPrivateMediaUrls: true })
+            : onebot.downloadMediaStreamToTempDir(url, httpTmpDir, { allowPrivateMediaUrls: true })
+        );
+      }
+
+      const httpResults = await Promise.all(httpTasks);
+      assert.strictEqual(httpResults.length, 20);
       for (let i = 0; i < 20; i++) {
-        const expectedBuf = payloads[i];
+        const expectedBuf = expectedHttpBuffers[i];
         const expectedMd5 = crypto.createHash("md5").update(expectedBuf).digest("hex");
-        const media = results[i];
+        const media = httpResults[i];
         assert.strictEqual(media.md5HexStr, expectedMd5);
         assert.strictEqual(media.fileSize, expectedBuf.length);
 
         const diskBytes = await fs.promises.readFile(media.localPath);
-        const diskMd5 = crypto.createHash("md5").update(diskBytes).digest("hex");
         assert.strictEqual(diskBytes.length, expectedBuf.length);
-        assert.strictEqual(diskMd5, expectedMd5);
         assert.ok(diskBytes.equals(expectedBuf));
       }
 
-      const remainingNames = await fs.promises.readdir(tmpDir);
+      const httpRemaining = await fs.promises.readdir(httpTmpDir);
       assert.strictEqual(
-        remainingNames.filter((n) => n.endsWith(".part")).length,
+        httpRemaining.filter((n) => n.endsWith(".part")).length,
         0,
-        "No temporary .part files may remain after concurrent writes"
+        "Zero temporary .part files may remain after concurrent HTTP stream downloads"
       );
-      // 1 shared file + 10 distinct files = 11 unique files
-      assert.strictEqual(remainingNames.length, 11);
+      assert.strictEqual(httpRemaining.length, 11, "Expected 1 shared + 10 distinct = 11 files");
+
+      // 2. 20 concurrent base64:// writes (10 identical + 10 distinct)
+      const b64Payloads = [
+        ...Array.from({ length: 10 }, () => ONE_BY_ONE_PNG_BUF),
+        ...distinctPayloads,
+      ];
+      const b64Results = await Promise.all(
+        b64Payloads.map((buf) =>
+          onebot.resolveMediaSource(`base64://${buf.toString("base64")}`, {
+            tempDir: b64TmpDir,
+          })
+        )
+      );
+      assert.strictEqual(b64Results.length, 20);
+      for (let i = 0; i < 20; i++) {
+        const expectedBuf = b64Payloads[i];
+        const expectedMd5 = crypto.createHash("md5").update(expectedBuf).digest("hex");
+        assert.strictEqual(b64Results[i].md5HexStr, expectedMd5);
+        const diskBytes = await fs.promises.readFile(b64Results[i].localPath);
+        assert.ok(diskBytes.equals(expectedBuf));
+      }
+
+      const b64Remaining = await fs.promises.readdir(b64TmpDir);
+      assert.strictEqual(b64Remaining.filter((n) => n.endsWith(".part")).length, 0);
+      assert.strictEqual(b64Remaining.length, 11);
     } finally {
-      await fs.promises.rm(tmpDir, { recursive: true, force: true });
+      await new Promise((resolve) => srv.close(resolve));
+      await fs.promises.rm(httpTmpDir, { recursive: true, force: true });
+      await fs.promises.rm(b64TmpDir, { recursive: true, force: true });
     }
   });
 
