@@ -90,11 +90,27 @@ fi
 export DISPLAY="${DISPLAY:-:99}"
 DISPLAY_NUM="${DISPLAY#:}"
 DISPLAY_NUM="${DISPLAY_NUM%%.*}"
-rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" || true
 
 if ! pgrep -x Xvfb >/dev/null 2>&1; then
+  rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" || true
   Xvfb "${DISPLAY}" -screen 0 "${ROSMONTIS_SCREEN:-1280x800x24}" -ac +extension GLX +render -noreset >/dev/null 2>&1 &
-  sleep 1
+  XVFB_PID=$!
+  XVFB_READY=0
+  for ((i = 0; i < 50; i++)); do
+    if [[ -S "/tmp/.X11-unix/X${DISPLAY_NUM}" ]]; then
+      XVFB_READY=1
+      break
+    fi
+    if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
+      echo "[rosmontis] ERROR: Xvfb (PID ${XVFB_PID}) exited prematurely before ${DISPLAY} socket became ready." >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  if [[ "${XVFB_READY}" -ne 1 ]]; then
+    echo "[rosmontis] ERROR: Timed out after 5s waiting for Xvfb socket /tmp/.X11-unix/X${DISPLAY_NUM}." >&2
+    exit 1
+  fi
 fi
 
 if command -v fluxbox >/dev/null 2>&1 && ! pgrep -x fluxbox >/dev/null 2>&1; then

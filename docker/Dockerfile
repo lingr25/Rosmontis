@@ -3,6 +3,8 @@ FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 # Optional override URL; when empty, automatically resolves & signs the latest official Tencent Linux QQ .deb for the build architecture
 ARG QQ_DEB_URL=""
+# Optional SHA-256 checksum for /tmp/linuxqq.deb; verified when non-empty
+ARG QQ_DEB_SHA256=""
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -36,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     novnc \
     procps \
+    tini \
     websockify \
     x11vnc \
     xdg-utils \
@@ -60,6 +63,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          ;; \
      esac \
   && curl -fsSL "${RESOLVED_QQ_URL}" -o /tmp/linuxqq.deb \
+  && if [ -n "${QQ_DEB_SHA256}" ]; then \
+       echo "${QQ_DEB_SHA256}  /tmp/linuxqq.deb" | sha256sum -c -; \
+     fi \
   && apt-get install -y --no-install-recommends /tmp/linuxqq.deb \
   && rm -f /tmp/linuxqq.deb \
   && rm -rf /var/lib/apt/lists/*
@@ -74,4 +80,7 @@ RUN chmod +x /opt/rosmontis/scripts/*.sh
 WORKDIR /app
 EXPOSE 3000 3001 6081
 
-ENTRYPOINT ["bash", "/opt/rosmontis/scripts/entrypoint.sh"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD bash -c 'PORT="${ROSMONTIS_HTTP_PORT:-${ONEBOT_HTTP_PORT:-${XIAO_BRIDGE_HTTP_PORT:-3000}}}"; CODE="$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:${PORT}/health" || true)"; [ "${CODE}" = "200" ] || [ "${CODE}" = "401" ] || pgrep -f "${QQ_BIN:-/opt/QQ/qq}" >/dev/null'
+
+ENTRYPOINT ["/usr/bin/tini", "--", "bash", "/opt/rosmontis/scripts/entrypoint.sh"]
