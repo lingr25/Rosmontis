@@ -24,9 +24,6 @@
  */
 
 const http = require("http");
-const https = require("https");
-const net = require("net");
-const tls = require("tls");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -35,6 +32,7 @@ const { EventEmitter } = require("events");
 const {
   MessageIdStore,
   UinUidStore,
+  segmentsToCqCode,
   normalizeOneBotMessage,
   getNtqqVersionMetadata,
   buildNtqqUserAgent,
@@ -49,678 +47,61 @@ const {
   formatMetaEvent,
 } = require("./bridge_onebot");
 
-const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const {
+  WS_GUID,
+  encodeWsFrame,
+  Rfc6455Connection,
+  connectReverseWebSocket,
+} = require("./core/ws_rfc6455");
 
-// ============================================================================
-// 1. Zero-Dependency RFC 6455 WebSocket Frame Codec & Connection
-// ============================================================================
+const {
+  DEFAULT_MAX_HTTP_BODY_BYTES,
+  DEFAULT_MAX_WS_PAYLOAD_BYTES,
+  sanitizeHeaderValue,
+  verifyAccessTokenConstantTime,
+  checkRequestAuth,
+  checkOriginHeader,
+  enforceProtectedModeOnServers,
+  readHttpJsonBody,
+} = require("./core/transport_security");
 
-function encodeWsFrame(opcode, payloadBuffer, mask = false) {
-  const buf = Buffer.isBuffer(payloadBuffer)
-    ? payloadBuffer
-    : Buffer.from(String(payloadBuffer || ""), "utf8");
-  const len = buf.length;
-  let headerLen = 2;
-  if (len >= 126 && len <= 0xffff) {
-    headerLen = 4;
-  } else if (len > 0xffff) {
-    headerLen = 10;
-  }
-  const maskLen = mask ? 4 : 0;
-  const frame = Buffer.allocUnsafe(headerLen + maskLen + len);
-  frame[0] = 0x80 | (opcode & 0x0f); // FIN=1
+const { loadBridgeConfig } = require("./core/config");
 
-  const maskBit = mask ? 0x80 : 0x00;
-  if (len < 126) {
-    frame[1] = maskBit | len;
-  } else if (len <= 0xffff) {
-    frame[1] = maskBit | 126;
-    frame.writeUInt16BE(len, 2);
-  } else {
-    frame[1] = maskBit | 127;
-    frame.writeBigUInt64BE(BigInt(len), 2);
-  }
+const {
+  computeBkn,
+  cookieObjToString,
+  httpsGetCookies,
+  httpRequestText,
+  parseJsonpOrJson,
+} = require("./core/web_http");
 
-  if (mask) {
-    const maskKey = crypto.randomBytes(4);
-    maskKey.copy(frame, headerLen);
-    for (let i = 0; i < len; i++) {
-      frame[headerLen + 4 + i] = buf[i] ^ maskKey[i & 3];
-    }
-  } else {
-    buf.copy(frame, headerLen);
-  }
-  return frame;
-}
+const { CausalSessionScheduler } = require("./core/session_scheduler");
 
-class Rfc6455Connection extends EventEmitter {
-  constructor(socket, { isClient = false } = {}) {
-    super();
-    this.socket = socket;
-    this.isClient = Boolean(isClient);
-    this.closed = false;
-    this._buffer = Buffer.alloc(0);
-    this._fragments = [];
-    this._fragmentOpcode = 0;
+const {
+  WEB_CREDENTIAL_ACTIONS,
+  isWebCredentialApiEnabled,
+  assertWebCredentialApiEnabled,
+  fetchClientKey,
+  getCookiesObject,
+  dispatchWebCredentialOrQzoneAction,
+} = require("./core/qzone_actions");
 
-    socket.on("data", (chunk) => this._onData(chunk));
-    socket.on("close", () => {
-      if (!this.closed) {
-        this.closed = true;
-        this.emit("close");
-      }
-    });
-    socket.on("error", (err) => {
-      if (this.listenerCount("error") > 0) {
-        this.emit("error", err);
-      }
-      if (!this.closed) {
-        this.closed = true;
-        this.emit("close");
-      }
-    });
-  }
+const WEB_HTTP_HELPERS = Object.freeze({
+  computeBkn,
+  cookieObjToString,
+  httpsGetCookies,
+  httpRequestText,
+  parseJsonpOrJson,
+});
 
-  _onData(chunk) {
-    this._buffer = this._buffer.length === 0 ? chunk : Buffer.concat([this._buffer, chunk]);
-    while (this._buffer.length >= 2) {
-      const b0 = this._buffer[0];
-      const b1 = this._buffer[1];
-      const fin = (b0 & 0x80) !== 0;
-      const opcode = b0 & 0x0f;
-      const masked = (b1 & 0x80) !== 0;
-      let payloadLen = b1 & 0x7f;
-      let offset = 2;
-
-      if (payloadLen === 126) {
-        if (this._buffer.length < 4) return;
-        payloadLen = this._buffer.readUInt16BE(2);
-        offset = 4;
-      } else if (payloadLen === 127) {
-        if (this._buffer.length < 10) return;
-        const bigLen = this._buffer.readBigUInt64BE(2);
-        if (bigLen > BigInt(64 * 1024 * 1024)) {
-          this.close();
-          return;
-        }
-        payloadLen = Number(bigLen);
-        offset = 10;
-      }
-
-      const maskOffset = offset;
-      if (masked) offset += 4;
-      if (this._buffer.length < offset + payloadLen) return;
-
-      const payload = Buffer.from(this._buffer.subarray(offset, offset + payloadLen));
-      if (masked) {
-        const maskKey = this._buffer.subarray(maskOffset, maskOffset + 4);
-        for (let i = 0; i < payload.length; i++) {
-          payload[i] ^= maskKey[i & 3];
-        }
-      }
-      this._buffer = this._buffer.subarray(offset + payloadLen);
-
-      if (opcode === 0x8) {
-        // CLOSE
-        this.close();
-        return;
-      }
-      if (opcode === 0x9) {
-        // PING -> PONG
-        this._sendRawFrame(0x0a, payload);
-        continue;
-      }
-      if (opcode === 0x0a) {
-        // PONG
-        this.emit("pong", payload);
-        continue;
-      }
-      if (opcode === 0x0) {
-        // Continuation
-        this._fragments.push(payload);
-        if (fin) {
-          const full = Buffer.concat(this._fragments);
-          const origOp = this._fragmentOpcode;
-          this._fragments = [];
-          this._fragmentOpcode = 0;
-          this._emitPayload(origOp, full);
-        }
-        continue;
-      }
-      if (!fin) {
-        this._fragmentOpcode = opcode;
-        this._fragments = [payload];
-      } else {
-        this._emitPayload(opcode, payload);
-      }
-    }
-  }
-
-  _emitPayload(opcode, buf) {
-    if (opcode === 0x1) {
-      this.emit("message", buf.toString("utf8"));
-    } else if (opcode === 0x2) {
-      this.emit("binary", buf);
-    }
-  }
-
-  _sendRawFrame(opcode, payload) {
-    if (this.closed || !this.socket || this.socket.destroyed) return false;
-    try {
-      const frame = encodeWsFrame(opcode, payload, this.isClient);
-      this.socket.write(frame);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  sendText(text) {
-    return this._sendRawFrame(0x1, Buffer.from(String(text), "utf8"));
-  }
-
-  sendJson(obj) {
-    return this.sendText(JSON.stringify(obj));
-  }
-
-  ping() {
-    return this._sendRawFrame(0x9, Buffer.from("ping"));
-  }
-
-  close() {
-    if (this.closed) return;
-    this.closed = true;
-    try {
-      this._sendRawFrame(0x8, Buffer.alloc(0));
-      this.socket.end();
-    } catch (_) {}
-    this.emit("close");
-  }
-}
-
-function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClose) {
-  let parsed;
-  try {
-    parsed = new URL(urlStr);
-  } catch (err) {
-    if (onClose) onClose(err);
-    return null;
-  }
-  const isSecure = parsed.protocol === "wss:" || parsed.protocol === "https:";
-  const port = Number(parsed.port) || (isSecure ? 443 : 80);
-  const host = parsed.hostname || "127.0.0.1";
-  const pathWithQuery = (parsed.pathname || "/") + (parsed.search || "");
-  const secKey = crypto.randomBytes(16).toString("base64");
-  const expectedAccept = crypto
-    .createHash("sha1")
-    .update(secKey + WS_GUID)
-    .digest("base64");
-
-  const connectOpts = { host, port, servername: host };
-  const socket = isSecure ? tls.connect(connectOpts) : net.connect(connectOpts);
-  let upgraded = false;
-  let headerBuf = Buffer.alloc(0);
-  let wsConn = null;
-
-  socket.setTimeout(15000, () => {
-    if (!upgraded) {
-      socket.destroy(new Error("WebSocket upgrade timeout"));
-    }
-  });
-
-  socket.on("connect", () => {
-    const reqLines = [
-      `GET ${pathWithQuery} HTTP/1.1`,
-      `Host: ${host}:${port}`,
-      `Upgrade: websocket`,
-      `Connection: Upgrade`,
-      `Sec-WebSocket-Key: ${secKey}`,
-      `Sec-WebSocket-Version: 13`,
-    ];
-    for (const [k, v] of Object.entries(headers)) {
-      if (v !== undefined && v !== null && v !== "") {
-        reqLines.push(`${k}: ${v}`);
-      }
-    }
-    reqLines.push("", "");
-    socket.write(reqLines.join("\r\n"));
-  });
-
-  let closeNotified = false;
-  const notifyCloseOnce = (err) => {
-    if (closeNotified) return;
-    closeNotified = true;
-    if (onClose) onClose(err);
-  };
-
-  const onSocketData = (chunk) => {
-    if (upgraded) return;
-    headerBuf = Buffer.concat([headerBuf, chunk]);
-    const sepIdx = headerBuf.indexOf("\r\n\r\n");
-    if (sepIdx === -1) return;
-
-    const headerStr = headerBuf.subarray(0, sepIdx).toString("utf8");
-    const rest = headerBuf.subarray(sepIdx + 4);
-    const lines = headerStr.split("\r\n");
-    const statusLine = lines[0] || "";
-    if (!statusLine.includes("101")) {
-      socket.destroy(new Error(`Unexpected WS upgrade status: ${statusLine}`));
-      return;
-    }
-    const respHeaders = {};
-    for (let i = 1; i < lines.length; i++) {
-      const idx = lines[i].indexOf(":");
-      if (idx > 0) {
-        respHeaders[lines[i].slice(0, idx).trim().toLowerCase()] = lines[i].slice(idx + 1).trim();
-      }
-    }
-    if (respHeaders["sec-websocket-accept"] !== expectedAccept) {
-      socket.destroy(new Error("Invalid Sec-WebSocket-Accept header"));
-      return;
-    }
-
-    upgraded = true;
-    socket.setTimeout(0);
-    socket.removeListener("data", onSocketData);
-
-    wsConn = new Rfc6455Connection(socket, { isClient: true });
-    wsConn.on("message", (msg) => {
-      if (onMessage) onMessage(msg, wsConn);
-    });
-    wsConn.on("close", () => {
-      notifyCloseOnce(null);
-    });
-    wsConn.on("error", () => {});
-
-    if (onOpen) onOpen(wsConn);
-    if (rest.length > 0) {
-      wsConn._onData(rest);
-    }
-  };
-
-  socket.on("data", onSocketData);
-  socket.on("error", (err) => {
-    if (!upgraded) {
-      notifyCloseOnce(err);
-    }
-  });
-  socket.on("close", () => {
-    if (!upgraded) {
-      notifyCloseOnce(new Error("Socket closed before upgrade"));
-    }
-  });
-
-  return {
-    close() {
-      if (wsConn) wsConn.close();
-      else socket.destroy();
-    },
-  };
+function safeJsJson(val) {
+  const raw = JSON.stringify(val);
+  if (typeof raw !== "string") return "undefined";
+  return raw.replace(/[<>&\u2028\u2029]/g, (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
 }
 
 // ============================================================================
-// 2. Configuration Loader (`rosmontis*.json` / `onebot*.json` + Environment Variables)
-// ============================================================================
-
-function filterEnabledEntries(list) {
-  if (!Array.isArray(list)) return [];
-  return list.filter(
-    (item) => item && typeof item === "object" && item.enable !== false && item.enabled !== false
-  );
-}
-
-function loadBridgeConfig(customConfigDir) {
-  const envSelfUin = String(
-    process.env.ROSMONTIS_SELF_ID ||
-      process.env.ONEBOT_SELF_ID ||
-      process.env.XIAO_BRIDGE_SELF_ID ||
-      ""
-  ).trim();
-  const defaultConfig = {
-    selfUin: envSelfUin,
-    selfNickname:
-      process.env.ROSMONTIS_SELF_NICKNAME ||
-      process.env.ONEBOT_SELF_NICKNAME ||
-      process.env.XIAO_BRIDGE_SELF_NICKNAME ||
-      "Rosmontis",
-    httpServers: [],
-    wsServers: [],
-    wsClients: [],
-    heartbeatIntervalMs: Number(
-      process.env.ROSMONTIS_HEARTBEAT_MS ||
-        process.env.ONEBOT_HEARTBEAT_MS ||
-        process.env.XIAO_BRIDGE_HEARTBEAT_MS ||
-        5000
-    ),
-  };
-
-  const searchDirs = customConfigDir
-    ? [customConfigDir]
-    : [
-        process.env.ROSMONTIS_CONFIG_DIR,
-        process.env.ONEBOT_CONFIG_DIR,
-        process.env.XIAO_BRIDGE_CONFIG_DIR,
-        "/etc/rosmontis",
-        "/app/data/config",
-        "/app/config",
-        "/opt/QQ/config",
-        path.resolve(process.cwd(), "config"),
-      ].filter(Boolean);
-
-  let loadedFromFile = false;
-  let hasExplicitHttpServersKey = false;
-  let hasExplicitWsServersKey = false;
-  let hasExplicitWsClientsKey = false;
-
-  for (const dir of searchDirs) {
-    try {
-      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
-      const cfgPattern = /^(?:rosmontis|onebot|xiao_bridge)(?:_([a-zA-Z0-9_-]+))?\.json$/;
-      const files = fs
-        .readdirSync(dir)
-        .filter((f) => cfgPattern.test(f) && !f.endsWith(".example.json"));
-      if (files.length === 0) continue;
-
-      const parsedEntries = [];
-      for (const file of files) {
-        try {
-          const fullPath = path.join(dir, file);
-          const m = cfgPattern.exec(file);
-          const suffix = m && m[1] ? m[1] : "";
-          const uin = /^\d+$/.test(suffix) ? suffix : "";
-          const raw = JSON.parse(fs.readFileSync(fullPath, "utf8"));
-          const stat = fs.statSync(fullPath);
-          const nets = raw?.networks || {};
-          const enabledWsClients = filterEnabledEntries(nets.wsClients);
-          const hasWsClients = enabledWsClients.length > 0;
-          parsedEntries.push({
-            file,
-            uin,
-            raw,
-            nets,
-            hasWsClients,
-            mtimeMs: Number(stat?.mtimeMs || 0),
-          });
-        } catch (_) {}
-      }
-      if (parsedEntries.length === 0) continue;
-
-      // Prefer explicit env selfUin if set; otherwise prefer configs with active wsClients, then most recent mtime
-      parsedEntries.sort((a, b) => {
-        if (envSelfUin) {
-          if (a.uin === envSelfUin && b.uin !== envSelfUin) return -1;
-          if (b.uin === envSelfUin && a.uin !== envSelfUin) return 1;
-        }
-        if (a.hasWsClients !== b.hasWsClients) {
-          return a.hasWsClients ? -1 : 1;
-        }
-        if (Boolean(a.uin) !== Boolean(b.uin)) {
-          return a.uin ? -1 : 1;
-        }
-        if (b.mtimeMs !== a.mtimeMs) {
-          return b.mtimeMs - a.mtimeMs;
-        }
-        return a.file.localeCompare(b.file);
-      });
-
-      const bestEntry = parsedEntries[0];
-      if (bestEntry) {
-        const { uin, raw, nets } = bestEntry;
-        if (!defaultConfig.selfUin && uin) {
-          defaultConfig.selfUin = uin;
-        }
-        for (const optKey of [
-          "humanSimulation",
-          "aioIdleExitMs",
-          "focusIdleBlurMs",
-          "sendEchoTimeoutMs",
-          "richMediaEchoTimeoutMs",
-          "dedupeWindowMs",
-          "autoQuickLogin",
-          "keepMapHook",
-          "quietLogs",
-          "maxMediaBytes",
-          "allowPrivateMediaUrls",
-          "allowPrivateUrls",
-          "allowArbitraryLocalFiles",
-          "allowedFileDirs",
-        ]) {
-          if (raw && raw[optKey] !== undefined) {
-            defaultConfig[optKey] = raw[optKey];
-          }
-        }
-        hasExplicitHttpServersKey = Array.isArray(nets.httpServers);
-        hasExplicitWsServersKey = Array.isArray(nets.wsServers);
-        hasExplicitWsClientsKey = Array.isArray(nets.wsClients);
-        defaultConfig.httpServers.push(...filterEnabledEntries(nets.httpServers));
-        defaultConfig.wsServers.push(...filterEnabledEntries(nets.wsServers));
-        defaultConfig.wsClients.push(...filterEnabledEntries(nets.wsClients));
-        loadedFromFile = true;
-      }
-      if (loadedFromFile) break;
-    } catch (_) {}
-  }
-
-  const envHttpPort = Number(
-    process.env.ROSMONTIS_HTTP_PORT ||
-      process.env.ONEBOT_HTTP_PORT ||
-      process.env.XIAO_BRIDGE_HTTP_PORT ||
-      0
-  );
-  const envWsPort = Number(
-    process.env.ROSMONTIS_WS_PORT ||
-      process.env.ONEBOT_WS_PORT ||
-      process.env.XIAO_BRIDGE_WS_PORT ||
-      0
-  );
-  const envRevWsUrl =
-    process.env.ROSMONTIS_REVERSE_WS_URL ||
-    process.env.ONEBOT_REVERSE_WS_URL ||
-    process.env.XIAO_BRIDGE_REVERSE_WS_URL ||
-    "";
-  const envToken = String(
-    process.env.ROSMONTIS_ACCESS_TOKEN ||
-      process.env.ONEBOT_ACCESS_TOKEN ||
-      process.env.XIAO_BRIDGE_ACCESS_TOKEN ||
-      ""
-  ).trim();
-  const listenHost =
-    process.env.ROSMONTIS_HOST ||
-    process.env.ONEBOT_HOST ||
-    process.env.XIAO_BRIDGE_HOST ||
-    "0.0.0.0";
-
-  if (defaultConfig.httpServers.length === 0 && (!loadedFromFile || !hasExplicitHttpServersKey || envHttpPort > 0)) {
-    defaultConfig.httpServers.push({
-      name: "http-default",
-      host: listenHost,
-      port: envHttpPort || 3000,
-      accessToken: envToken,
-      messageFormat: "array",
-      reportSelfMessage: false,
-    });
-  } else if (envHttpPort > 0 && defaultConfig.httpServers.length > 0) {
-    defaultConfig.httpServers[0].port = envHttpPort;
-  }
-
-  if (defaultConfig.wsServers.length === 0 && (!loadedFromFile || !hasExplicitWsServersKey || envWsPort > 0)) {
-    defaultConfig.wsServers.push({
-      name: "ws-default",
-      host: listenHost,
-      port: envWsPort || 3001,
-      accessToken: envToken,
-      messageFormat: "array",
-      reportSelfMessage: false,
-    });
-  } else if (envWsPort > 0 && defaultConfig.wsServers.length > 0) {
-    defaultConfig.wsServers[0].port = envWsPort;
-  }
-
-  if (envRevWsUrl) {
-    defaultConfig.wsClients = [
-      {
-        name: "wsclient-env",
-        url: envRevWsUrl,
-        accessToken: envToken,
-        messageFormat: "array",
-        reportSelfMessage: false,
-        reconnectIntervalMs: 5000,
-      },
-    ];
-  }
-
-  if (envToken) {
-    for (const s of defaultConfig.httpServers) s.accessToken = envToken;
-    for (const s of defaultConfig.wsServers) s.accessToken = envToken;
-    for (const c of defaultConfig.wsClients) c.accessToken = envToken;
-  }
-
-  return defaultConfig;
-}
-
-// ============================================================================
-// 3. Web / Cookie / QZone / Group Notice Helpers
-// ============================================================================
-
-function computeBkn(skey) {
-  const str = String(skey || "");
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash += (hash << 5) + str.charCodeAt(i);
-  }
-  return hash & 2147483647;
-}
-
-function cookieObjToString(cookieObj) {
-  if (!cookieObj || typeof cookieObj !== "object") return "";
-  return Object.entries(cookieObj)
-    .filter(([k, v]) => k && v !== undefined && v !== null && v !== "")
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-}
-
-function httpsGetCookies(urlStr, depth = 0) {
-  return new Promise((resolve) => {
-    const cookies = {};
-    let settled = false;
-    const done = (extra) => {
-      if (settled) return;
-      settled = true;
-      resolve(extra ? { ...cookies, ...extra } : cookies);
-    };
-    let parsed;
-    try {
-      parsed = new URL(urlStr);
-    } catch (_) {
-      return done();
-    }
-    const mod = parsed.protocol === "https:" ? https : http;
-    const req = mod.get(urlStr, { timeout: 8000 }, (res) => {
-      const setCookie = res.headers["set-cookie"];
-      if (Array.isArray(setCookie)) {
-        for (const item of setCookie) {
-          const kv = String(item).split(";")[0]?.split("=");
-          if (kv && kv[0] && kv[1]) {
-            cookies[kv[0].trim()] = kv.slice(1).join("=").trim();
-          }
-        }
-      }
-      res.on("data", () => {});
-      res.on("end", () => {
-        const loc = res.headers.location;
-        if ((res.statusCode === 301 || res.statusCode === 302) && loc && depth < 5) {
-          const nextUrl = new URL(loc, urlStr).toString();
-          httpsGetCookies(nextUrl, depth + 1)
-            .then((rc) => done(rc))
-            .catch(() => done());
-        } else {
-          done();
-        }
-      });
-    });
-    req.on("timeout", () => {
-      req.destroy();
-      done();
-    });
-    req.on("error", () => done());
-  });
-}
-
-function httpRequestText(urlStr, method = "GET", body = "", headers = {}, redirectsLeft = 4) {
-  return new Promise((resolve, reject) => {
-    let parsed;
-    try {
-      parsed = new URL(urlStr);
-    } catch (e) {
-      return reject(e);
-    }
-    const mod = parsed.protocol === "https:" ? https : http;
-    const reqHeaders = {
-      "User-Agent": buildNtqqUserAgent(),
-      ...headers,
-    };
-    const bodyBuf =
-      body && (method === "POST" || method === "PUT")
-        ? Buffer.isBuffer(body)
-          ? body
-          : Buffer.from(typeof body === "string" ? body : JSON.stringify(body), "utf8")
-        : null;
-    if (bodyBuf && !reqHeaders["Content-Length"] && !reqHeaders["content-length"]) {
-      reqHeaders["Content-Length"] = bodyBuf.length;
-    }
-    const req = mod.request(
-      {
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method,
-        headers: reqHeaders,
-        timeout: 12000,
-      },
-      (res) => {
-        if (
-          res.statusCode &&
-          [301, 302, 303, 307, 308].includes(res.statusCode) &&
-          res.headers.location &&
-          redirectsLeft > 0
-        ) {
-          res.resume();
-          const nextUrl = new URL(res.headers.location, urlStr).toString();
-          return httpRequestText(nextUrl, method, body, headers, redirectsLeft - 1).then(
-            resolve,
-            reject
-          );
-        }
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error(`HTTP timeout: ${urlStr}`)));
-    req.on("error", reject);
-    if (bodyBuf) req.write(bodyBuf);
-    req.end();
-  });
-}
-
-function parseJsonpOrJson(text) {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return {};
-  try {
-    return JSON.parse(trimmed);
-  } catch (_) {}
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    try {
-      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
-    } catch (_) {}
-  }
-  return {};
-}
-
-// ============================================================================
-// 4. Main Bridge Controller Class (`NtqqOneBotBridge`)
+// 1. Main Bridge Controller Class (`NtqqOneBotBridge`)
 // ============================================================================
 
 const SERVICE_GETTER_MAP = {
@@ -900,9 +281,17 @@ class NtqqOneBotBridge extends EventEmitter {
     this._activeAioPeerKey = "";
     this._windowFocused = false;
     this._aioMutex = Promise.resolve();
+    this._sessionScheduler = new CausalSessionScheduler({
+      getActivePeerKey: () => this._activeAioPeerKey,
+      switchCooldownMs: this.config.aioSwitchCooldownMs ?? 800,
+      enforceHardCooldownOnExplicit: Boolean(this.config.enforceSwitchCooldownOnSend),
+    });
     this._aioInteractionSeq = 0;
     this._aioIdleTimer = null;
     this._focusBlurTimer = null;
+    this._ipcAuthToken = crypto.randomBytes(32).toString("hex");
+    this._pendingRendererCmds = new Map();
+    this._ipcCmdAckInstalled = false;
     this._logThrottle = new Map(); // key -> last log timestamp
     this.invokeStats = {
       tier1: 0,
@@ -920,7 +309,12 @@ class NtqqOneBotBridge extends EventEmitter {
     this._wsServers = [];
     this._wsServerClients = new Set();
     this._reverseWsClients = [];
+    this._wsClientHandles = this._reverseWsClients;
     this._heartbeatTimer = null;
+  }
+
+  _safeJsJson(val) {
+    return safeJsJson(val);
   }
 
   _setBoundedMap(map, key, value, maxEntries = 2000) {
@@ -937,9 +331,11 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   _scheduleTempCleanup(cleanupCallbacks = [], immediate = false) {
-    if (!Array.isArray(cleanupCallbacks) || cleanupCallbacks.length === 0) return;
+    const callbacks =
+      typeof cleanupCallbacks === "function" ? [cleanupCallbacks] : cleanupCallbacks;
+    if (!Array.isArray(callbacks) || callbacks.length === 0) return;
     if (immediate || this.config.cleanupTempImmediately) {
-      for (const fn of cleanupCallbacks) {
+      for (const fn of callbacks) {
         try {
           if (typeof fn === "function") fn();
         } catch (_) {}
@@ -947,7 +343,7 @@ class NtqqOneBotBridge extends EventEmitter {
       return;
     }
     const maxRing = Math.max(8, Number(this.config.maxTempCleanupRing || 64));
-    for (const fn of cleanupCallbacks) {
+    for (const fn of callbacks) {
       if (typeof fn !== "function") continue;
       let called = false;
       const runOnce = () => {
@@ -964,6 +360,24 @@ class NtqqOneBotBridge extends EventEmitter {
         const oldest = this._tempCleanupRing.shift();
         if (typeof oldest === "function") oldest();
       }
+    }
+  }
+
+  _scheduleMediaCleanup(media) {
+    if (!media) return;
+    if (typeof media.cleanup === "function") {
+      this._scheduleTempCleanup(media.cleanup);
+      return;
+    }
+    if (media.isTempFile && media.localPath) {
+      const tempPath = media.localPath;
+      this._scheduleTempCleanup(() => {
+        try {
+          if (fs.existsSync(tempPath)) {
+            fs.unlinkSync(tempPath);
+          }
+        } catch (_) {}
+      });
     }
   }
 
@@ -997,12 +411,32 @@ class NtqqOneBotBridge extends EventEmitter {
     return false;
   }
 
+  _formatEventForEndpoint(eventObj, messageFormat) {
+    if (
+      messageFormat === "string" &&
+      eventObj &&
+      (eventObj.post_type === "message" || eventObj.post_type === "message_sent")
+    ) {
+      return {
+        ...eventObj,
+        message:
+          typeof eventObj.raw_message === "string"
+            ? eventObj.raw_message
+            : Array.isArray(eventObj.message)
+            ? segmentsToCqCode(eventObj.message)
+            : String(eventObj.message ?? ""),
+      };
+    }
+    return eventObj;
+  }
+
   broadcastOneBotEvent(event) {
     if (!event || typeof event !== "object") return;
     if (!event.self_id && this.selfUin) {
       event.self_id = Number(this.selfUin);
     }
-    this.emit("onebot_event", event);
+    const defaultFormat = this.config.messageFormat || "array";
+    this.emit("onebot_event", this._formatEventForEndpoint(event, defaultFormat));
 
     // Do not broadcast self-sent messages unless reportSelfMessage is true
     for (const client of this._wsServerClients) {
@@ -1013,7 +447,8 @@ class NtqqOneBotBridge extends EventEmitter {
       if (event.post_type === "message_sent" && !client.reportSelfMessage) {
         continue;
       }
-      client.sendJson(event);
+      const targetFormat = client._messageFormat || defaultFormat;
+      client.sendJson(this._formatEventForEndpoint(event, targetFormat));
     }
 
     for (const rev of this._reverseWsClients) {
@@ -1021,7 +456,8 @@ class NtqqOneBotBridge extends EventEmitter {
       if (event.post_type === "message_sent" && !rev.cfg?.reportSelfMessage) {
         continue;
       }
-      rev.conn.sendJson(event);
+      const targetFormat = rev.messageFormat || rev.cfg?.messageFormat || defaultFormat;
+      rev.conn.sendJson(this._formatEventForEndpoint(event, targetFormat));
     }
   }
 
@@ -1560,6 +996,118 @@ class NtqqOneBotBridge extends EventEmitter {
   // Electron Main-Process & Renderer Window Integration
   // --------------------------------------------------------------------------
 
+  _isTrustedRendererUrl(url) {
+    if (url === undefined || url === null) return true;
+    const trimmed = String(url).trim().toLowerCase();
+    if (trimmed === "") return true;
+    if (
+      trimmed.startsWith("http:") ||
+      trimmed.startsWith("https:") ||
+      trimmed.startsWith("devtools:") ||
+      trimmed.startsWith("chrome-extension:") ||
+      trimmed.startsWith("data:") ||
+      trimmed.startsWith("blob:") ||
+      trimmed.startsWith("javascript:") ||
+      trimmed.startsWith("about:")
+    ) {
+      return false;
+    }
+    if (
+      trimmed.startsWith("app:") ||
+      trimmed.startsWith("file:") ||
+      trimmed.startsWith("qq:") ||
+      trimmed.startsWith("ntqq:") ||
+      trimmed.startsWith("local-resource:")
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  _isTrustedIpcEvent(event, payload) {
+    if (!event || !event.sender) {
+      if (payload && typeof payload === "object" && payload.__ipcToken !== undefined) {
+        return verifyAccessTokenConstantTime(String(payload.__ipcToken || ""), this._ipcAuthToken);
+      }
+      return true;
+    }
+    const sender = event.sender;
+    if (!this._knownWebContents.has(sender) || !this._isWebContentsAlive(sender)) {
+      return false;
+    }
+    if (typeof sender.getURL === "function") {
+      let senderUrl = "";
+      try {
+        senderUrl = sender.getURL();
+      } catch (_) {
+        return false;
+      }
+      if (!this._isTrustedRendererUrl(senderUrl)) {
+        return false;
+      }
+    }
+    if (event.senderFrame && sender.mainFrame && event.senderFrame !== sender.mainFrame) {
+      return false;
+    }
+    if (sender.__rosmontisIpcTokenInjected) {
+      const provided =
+        payload && typeof payload === "object" && typeof payload.__ipcToken === "string"
+          ? payload.__ipcToken
+          : "";
+      if (!verifyAccessTokenConstantTime(provided, this._ipcAuthToken)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  _handleRendererCmdAck(_event, ack) {
+    if (!this._isTrustedIpcEvent(_event, ack)) return;
+    if (!ack || typeof ack !== "object" || !ack.reqId) return;
+    const reqId = String(ack.reqId);
+    const pending = this._pendingRendererCmds.get(reqId);
+    if (!pending) return;
+    if (pending.webContents && _event && _event.sender && _event.sender !== pending.webContents) {
+      return;
+    }
+    this._pendingRendererCmds.delete(reqId);
+    if (pending.timer) clearTimeout(pending.timer);
+
+    if (ack.ok) {
+      let val = ack.result !== undefined ? ack.result : ack.data;
+      if (typeof ack.resultSerialized === "string") {
+        try {
+          val = JSON.parse(ack.resultSerialized);
+        } catch (_) {
+          val = ack.resultSerialized;
+        }
+      }
+      pending.resolve(this._reviveBridgePayload(val));
+    } else {
+      const errMsg = String(ack.error?.message || ack.error || "Renderer bridge command failed");
+      const err = new Error(errMsg);
+      if (ack.error?.code) {
+        err.code = String(ack.error.code);
+      }
+      if (err.code === BRIDGE_UNAVAILABLE_TAG || errMsg.includes(BRIDGE_UNAVAILABLE_TAG)) {
+        err.rosmontisUnavailable = true;
+      }
+      pending.reject(err);
+    }
+  }
+
+  _rejectPendingRendererCmds(webContents = null, reason = "Renderer command channel closed") {
+    for (const [reqId, pending] of Array.from(this._pendingRendererCmds.entries())) {
+      if (!webContents || pending.webContents === webContents) {
+        this._pendingRendererCmds.delete(reqId);
+        if (pending.timer) clearTimeout(pending.timer);
+        try {
+          pending.reject(makeBridgeUnavailableError(reason));
+        } catch (_) {}
+      }
+    }
+  }
+
   installElectronHooks(electronModule) {
     let electron = electronModule;
     if (!electron) {
@@ -1575,13 +1123,30 @@ class NtqqOneBotBridge extends EventEmitter {
     if (ipcMain) {
       try {
         ipcMain.on("__ROSMONTIS_BRIDGE_EVENT__", (_event, payload) => {
+          if (!this._isTrustedIpcEvent(_event, payload)) return;
           this._handleRendererForwardedEvent(payload);
         });
         if (typeof ipcMain.handle === "function") {
           ipcMain.handle("__ROSMONTIS_BRIDGE_EVENT__", (_event, payload) => {
+            if (!this._isTrustedIpcEvent(_event, payload)) return { ok: false };
             this._handleRendererForwardedEvent(payload);
             return { ok: true };
           });
+        }
+        ipcMain.on("__ROSMONTIS_BRIDGE_CMD_ACK__", (_event, ack) => {
+          this._handleRendererCmdAck(_event, ack);
+        });
+        if (typeof ipcMain.handle === "function") {
+          ipcMain.handle("__ROSMONTIS_BRIDGE_CMD_ACK__", (_event, ack) => {
+            this._handleRendererCmdAck(_event, ack);
+            return { ok: true };
+          });
+        }
+        this._ipcCmdAckInstalled = true;
+        for (const wc of this._knownWebContents) {
+          if (wc && wc.__rosmontisIpcTokenInjected && typeof wc.send === "function") {
+            wc.__rosmontisCmdChannelReady = true;
+          }
         }
       } catch (_) {}
     }
@@ -1608,6 +1173,14 @@ class NtqqOneBotBridge extends EventEmitter {
     return true;
   }
 
+  _canInvokeRenderer(wc) {
+    if (!this._isWebContentsAlive(wc)) return false;
+    if (this._ipcCmdAckInstalled && wc.__rosmontisCmdChannelReady && typeof wc.send === "function") {
+      return true;
+    }
+    return typeof wc.executeJavaScript === "function";
+  }
+
   _isMainChatUrl(url) {
     const u = String(url || "").trim().toLowerCase();
     return Boolean(u && (u.includes("main") || (u.includes("index.html") && !u.includes("login"))));
@@ -1621,7 +1194,7 @@ class NtqqOneBotBridge extends EventEmitter {
         url = String(webContents.getURL() || "").trim().toLowerCase();
       }
     } catch (_) {}
-    if (url.startsWith("devtools://") || url.startsWith("chrome-extension://")) {
+    if (!this._isTrustedRendererUrl(url)) {
       return false;
     }
     if (!this._isWebContentsAlive(this.activeWebContents)) {
@@ -1669,6 +1242,8 @@ class NtqqOneBotBridge extends EventEmitter {
       this.activeWebContents = webContents;
     }
     const onDestroyed = () => {
+      webContents.__rosmontisCmdChannelReady = false;
+      this._rejectPendingRendererCmds(webContents, "renderer webContents destroyed");
       this._knownWebContents.delete(webContents);
       if (this.activeWebContents === webContents) {
         this.activeWebContents = null;
@@ -1688,21 +1263,29 @@ class NtqqOneBotBridge extends EventEmitter {
 
     let pageInjected = false;
     let injectPending = false;
+    let injectGen = 0;
     const resetPageInjected = () => {
+      injectGen += 1;
       pageInjected = false;
       injectPending = false;
+      webContents.__rosmontisCmdChannelReady = false;
+      webContents.__rosmontisIpcTokenInjected = false;
+      this._rejectPendingRendererCmds(webContents, "renderer navigated");
     };
 
     const injectScript = () => {
       try {
         if (!this._isWebContentsAlive(webContents)) return;
-        let url = "";
+        let rawUrl = "";
         try {
           if (typeof webContents.getURL === "function") {
-            url = String(webContents.getURL() || "").trim().toLowerCase();
+            rawUrl = String(webContents.getURL() || "");
           }
-        } catch (_) {}
-        if (url.startsWith("devtools://") || url.startsWith("chrome-extension://")) return;
+        } catch (_) {
+          return;
+        }
+        if (!this._isTrustedRendererUrl(rawUrl)) return;
+        const url = rawUrl.trim().toLowerCase();
         if (this._isMainChatUrl(url)) {
           this.online = true;
         }
@@ -1723,22 +1306,41 @@ class NtqqOneBotBridge extends EventEmitter {
         }
         const code = getRendererBridgeSource();
         if (!code) return;
-        const wid = Number(webContents.id || 1);
-        const syncPatchJson = JSON.stringify({
+        const rawWid = Number(webContents.id || 1);
+        const widJson = this._safeJsJson(Number.isFinite(rawWid) && rawWid > 0 ? rawWid : 1);
+        const ipcAuthTokenJson = this._safeJsJson(this._ipcAuthToken);
+        const syncPatchJson = this._safeJsJson({
           activeAioPeer: this._activeAioPeer,
           activeAioPeerKey: this._activeAioPeerKey,
           focused: this._windowFocused,
         });
-        const script = `(function(){ if (window.__ROSMONTIS_RENDERER_BRIDGE__) { window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(${wid}); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(${syncPatchJson}); return true; } window.__ROSMONTIS_WINDOW_ID__ = ${wid}; ${code}\n if (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: ${wid}, autoRegisterListeners: true }); if (b && typeof b.syncSessionState === "function") b.syncSessionState(${syncPatchJson}); } return true; })();`;
+        const script = `(function(){ var wid = ${widJson}; var ipcAuthToken = ${ipcAuthTokenJson}; var syncPatch = ${syncPatchJson}; if (window.__ROSMONTIS_RENDERER_BRIDGE__) { if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken(ipcAuthToken); window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(wid); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(syncPatch); return true; } window.__ROSMONTIS_WINDOW_ID__ = wid; ${code}\n if (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: wid, autoRegisterListeners: true, ipcAuthToken: ipcAuthToken }); if (b && typeof b.setIpcAuthToken === "function") b.setIpcAuthToken(ipcAuthToken); if (b && typeof b.syncSessionState === "function") b.syncSessionState(syncPatch); } return true; })();`;
+        const genAtStart = injectGen;
         injectPending = true;
         Promise.resolve(webContents.executeJavaScript(script, true))
           .then(() => {
+            if (genAtStart !== injectGen || !this._isWebContentsAlive(webContents)) {
+              return;
+            }
+            if (typeof webContents.getURL === "function") {
+              try {
+                if (!this._isTrustedRendererUrl(webContents.getURL())) return;
+              } catch (_) {
+                return;
+              }
+            }
             injectPending = false;
             pageInjected = true;
+            webContents.__rosmontisIpcTokenInjected = true;
+            if (typeof webContents.send === "function" && this._ipcCmdAckInstalled) {
+              webContents.__rosmontisCmdChannelReady = true;
+            }
             maybeTriggerQuickLogin();
           })
           .catch(() => {
-            injectPending = false;
+            if (genAtStart === injectGen) {
+              injectPending = false;
+            }
           });
       } catch (_) {
         injectPending = false;
@@ -1824,7 +1426,13 @@ class NtqqOneBotBridge extends EventEmitter {
     }
 
     const wc = webContents || this.activeWebContents;
-    if (!methodUsed && wc && this._isWebContentsAlive(wc) && typeof wc.executeJavaScript === "function") {
+    if (
+      !methodUsed &&
+      wc &&
+      this._isWebContentsAlive(wc) &&
+      typeof wc.executeJavaScript === "function" &&
+      (typeof wc.getURL !== "function" || this._isTrustedRendererUrl(wc.getURL()))
+    ) {
       try {
         const clicked = await wc.executeJavaScript(
           `(function(){
@@ -1898,7 +1506,7 @@ class NtqqOneBotBridge extends EventEmitter {
   // --------------------------------------------------------------------------
 
   _serializeBridgePayload(value) {
-    return JSON.stringify(value, (_key, val) => {
+    const raw = JSON.stringify(value, (_key, val) => {
       if (val instanceof Map) {
         return { __rosmontisMap__: Array.from(val.entries()) };
       }
@@ -1907,6 +1515,105 @@ class NtqqOneBotBridge extends EventEmitter {
       }
       return val;
     });
+    if (typeof raw !== "string") return "undefined";
+    return raw.replace(/[<>&\u2028\u2029]/g, (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+  }
+
+  async _invokeRendererCommand(type, cmdPayload = {}, timeoutMs = 15000) {
+    const wc = this.activeWebContents;
+    if (!this._isWebContentsAlive(wc)) {
+      throw makeBridgeUnavailableError("no live renderer webContents");
+    }
+    if (typeof wc.getURL === "function") {
+      let senderUrl = "";
+      try {
+        senderUrl = wc.getURL();
+      } catch (_) {
+        throw makeBridgeUnavailableError("failed to inspect renderer URL");
+      }
+      if (!this._isTrustedRendererUrl(senderUrl)) {
+        throw makeBridgeUnavailableError("active renderer URL is untrusted");
+      }
+    }
+
+    // Primary structured IPC channel (zero executeJavaScript per command)
+    if (
+      this._ipcCmdAckInstalled &&
+      wc.__rosmontisCmdChannelReady &&
+      typeof wc.send === "function"
+    ) {
+      const reqId = crypto.randomUUID();
+      const envelope = {
+        reqId,
+        __ipcToken: this._ipcAuthToken,
+        type,
+        ...cmdPayload,
+        timeoutMs,
+      };
+      return await new Promise((resolve, reject) => {
+        const effectiveTimeout = Math.max(100, Number(timeoutMs) || 15000);
+        const timer = setTimeout(() => {
+          this._pendingRendererCmds.delete(reqId);
+          reject(new Error(`Renderer IPC command timeout (${effectiveTimeout}ms): ${type}`));
+        }, effectiveTimeout);
+        if (typeof timer.unref === "function") timer.unref();
+
+        this._pendingRendererCmds.set(reqId, {
+          reqId,
+          type,
+          webContents: wc,
+          timer,
+          resolve,
+          reject,
+        });
+
+        try {
+          wc.send("__ROSMONTIS_BRIDGE_CMD__", envelope);
+        } catch (err) {
+          clearTimeout(timer);
+          this._pendingRendererCmds.delete(reqId);
+          reject(makeBridgeUnavailableError(`webContents.send failed: ${err?.message || err}`));
+        }
+      });
+    }
+
+    // Fallback for synthetic unit-test mocks that only provide executeJavaScript
+    if (typeof wc.executeJavaScript === "function") {
+      let js = "";
+      if (type === "invokeNt") {
+        const cmdJson = this._safeJsJson(cmdPayload.cmd);
+        const argsJson =
+          typeof cmdPayload.argsSerialized === "string"
+            ? cmdPayload.argsSerialized
+            : this._serializeBridgePayload(cmdPayload.args ?? [null, null]);
+        const notReady = this._safeJsJson(`${BRIDGE_UNAVAILABLE_TAG}: Renderer bridge not ready`);
+        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized(${cmdJson}, ${argsJson}) : (window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi(${cmdJson}, ${argsJson}) : Promise.reject(new Error(${notReady}))`;
+      } else if (type === "simulateSession") {
+        const optsJson = this._safeJsJson(cmdPayload.opts || {});
+        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow(${optsJson}) : null`;
+      } else if (type === "leaveSession") {
+        const optsJson = this._safeJsJson(cmdPayload.opts || {});
+        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.leaveHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.leaveHumanSessionFlow(${optsJson}) : null`;
+      } else if (type === "syncSession") {
+        const patchJson = this._safeJsJson(cmdPayload.patch || {});
+        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState) ? window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(${patchJson}) : null`;
+      } else if (type === "resetSession") {
+        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.resetSessionState) ? window.__ROSMONTIS_RENDERER_BRIDGE__.resetSessionState() : null`;
+      } else {
+        throw new Error(`Unsupported renderer command type: ${type}`);
+      }
+      const rawRes = await wc.executeJavaScript(js, true);
+      if (typeof rawRes === "string" && type === "invokeNt") {
+        try {
+          return this._reviveBridgePayload(JSON.parse(rawRes));
+        } catch (_) {
+          return rawRes;
+        }
+      }
+      return this._reviveBridgePayload(rawRes);
+    }
+
+    throw makeBridgeUnavailableError("no live renderer command transport");
   }
 
   _recordInvokeTier(cmd, tier, prevErrors) {
@@ -1966,7 +1673,7 @@ class NtqqOneBotBridge extends EventEmitter {
       return false;
     };
 
-    // Tier 1: Execute via Renderer `window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized`
+    // Tier 1: Execute via Renderer structured IPC (`__ROSMONTIS_BRIDGE_CMD__`) or safe fallback
     if (typeof this.rendererExecute === "function") {
       try {
         const res = await this.rendererExecute(cmd, [payload, null]);
@@ -1975,23 +1682,16 @@ class NtqqOneBotBridge extends EventEmitter {
       } catch (e) {
         if (stopAfterDispatchedFailure(e)) throw e;
       }
-    } else if (this._isWebContentsAlive(this.activeWebContents) && typeof this.activeWebContents.executeJavaScript === "function") {
+    } else if (this._canInvokeRenderer(this.activeWebContents)) {
       try {
-        const cmdJson = JSON.stringify(cmd);
-        const argsJson = this._serializeBridgePayload([payload, null]);
-        const notReady = JSON.stringify(`${BRIDGE_UNAVAILABLE_TAG}: Renderer bridge not ready`);
-        const js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized(${cmdJson}, ${argsJson}) : (window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi(${cmdJson}, ${argsJson}) : Promise.reject(new Error(${notReady}))`;
-        const rawRes = await this.activeWebContents.executeJavaScript(js, true);
-        if (rawRes !== undefined || sideEffect) {
+        const argsSerialized = this._serializeBridgePayload([payload, null]);
+        const res = await this._invokeRendererCommand("invokeNt", {
+          cmd,
+          argsSerialized,
+        });
+        if (res !== undefined || sideEffect) {
           this._recordInvokeTier(cmd, 1, errors);
-          if (typeof rawRes === "string") {
-            try {
-              return this._reviveBridgePayload(JSON.parse(rawRes));
-            } catch (_) {
-              return rawRes;
-            }
-          }
-          return this._reviveBridgePayload(rawRes);
+          return res;
         }
       } catch (e) {
         if (stopAfterDispatchedFailure(e)) throw e;
@@ -2077,14 +1777,9 @@ class NtqqOneBotBridge extends EventEmitter {
     throw unavailable;
   }
 
-  _withAioLock(fn) {
-    const run = () => Promise.resolve().then(fn);
-    const task = this._aioMutex.then(run, run);
-    this._aioMutex = task.then(
-      () => {},
-      () => {}
-    );
-    return task;
+  _withAioLock(fn, options = {}) {
+    const opts = options && typeof options === "object" ? options : {};
+    return this._sessionScheduler.runExclusive(opts.peerKey || "", fn, opts);
   }
 
   _clearIdleTimers() {
@@ -2101,22 +1796,14 @@ class NtqqOneBotBridge extends EventEmitter {
   _resetHumanSessionState({ resetRenderer = false } = {}) {
     this._aioInteractionSeq += 1;
     this._clearIdleTimers();
+    this._sessionScheduler.dispose();
     this._activeAioPeer = null;
     this._activeAioPeerKey = "";
     this._windowFocused = false;
     this._recentReadByPeer.clear();
     this._recentTypingByPeer.clear();
-    if (
-      resetRenderer &&
-      this._isWebContentsAlive(this.activeWebContents) &&
-      typeof this.activeWebContents.executeJavaScript === "function"
-    ) {
-      Promise.resolve(
-        this.activeWebContents.executeJavaScript(
-          "window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.resetSessionState && window.__ROSMONTIS_RENDERER_BRIDGE__.resetSessionState()",
-          true
-        )
-      ).catch(() => {});
+    if (resetRenderer && this._canInvokeRenderer(this.activeWebContents)) {
+      this._invokeRendererCommand("resetSession", {}, 5000).catch(() => {});
     }
   }
 
@@ -2188,14 +1875,9 @@ class NtqqOneBotBridge extends EventEmitter {
       } catch (_) {}
     }
 
-    if (
-      this._isWebContentsAlive(this.activeWebContents) &&
-      typeof this.activeWebContents.executeJavaScript === "function"
-    ) {
+    if (this._canInvokeRenderer(this.activeWebContents)) {
       try {
-        const optsJson = JSON.stringify(leaveOpts);
-        const js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.leaveHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.leaveHumanSessionFlow(${optsJson}) : null`;
-        const res = await this.activeWebContents.executeJavaScript(js, true);
+        const res = await this._invokeRendererCommand("leaveSession", { opts: leaveOpts }, 8000);
         if (res && typeof res === "object" && ("exitedAio" in res || "blurredWindow" in res)) {
           if (shouldExitAio) {
             this._activeAioPeer = null;
@@ -2236,7 +1918,7 @@ class NtqqOneBotBridge extends EventEmitter {
     return this._withAioLock(() => this._leaveSessionUnlocked(opts));
   }
 
-  async _activateSessionUnlocked(opts) {
+  async _activateSessionUnlocked(opts = {}) {
     const peer = {
       chatType: Number(opts?.chatType || 1),
       peerUid: String(opts?.peerUid || ""),
@@ -2245,6 +1927,22 @@ class NtqqOneBotBridge extends EventEmitter {
     if (!peer.peerUid) return null;
 
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId}`;
+    const prevPeerKey = this._activeAioPeerKey;
+    const switchDecision = this._sessionScheduler.shouldAllowSwitch(peerKey, {
+      advisory: Boolean(opts?.advisory),
+    });
+    if (!switchDecision.allowed) {
+      return {
+        skippedByCooldown: true,
+        activeAioPeer: this._activeAioPeer,
+        activeAioPeerKey: this._activeAioPeerKey,
+        focused: this._windowFocused,
+      };
+    }
+    if (switchDecision.waitMs > 0) {
+      await this._sessionScheduler.sleepUnref(switchDecision.waitMs);
+    }
+
     const now = Date.now();
     const dedupeMs = Number(opts?.dedupeWindowMs ?? this.config?.dedupeWindowMs ?? 5000);
     const effEventType = Number(opts?.eventType ?? 1);
@@ -2253,6 +1951,14 @@ class NtqqOneBotBridge extends EventEmitter {
     const shouldSendTyping =
       Boolean(opts?.sendTyping && peer.chatType === 1) &&
       (effEventType !== 1 || now - (this._recentTypingByPeer.get(peerKey) || 0) >= dedupeMs);
+    const delaySpec =
+      opts?.readToTypingDelayMs !== undefined
+        ? opts.readToTypingDelayMs
+        : this.config.humanReadToTypingDelayMs;
+    const readToTypingDelayMs =
+      shouldMarkRead && shouldSendTyping
+        ? this._sessionScheduler.computeDelayMs(delaySpec, 0)
+        : 0;
 
     const effectiveOpts = {
       ...opts,
@@ -2261,6 +1967,7 @@ class NtqqOneBotBridge extends EventEmitter {
       guildId: peer.guildId,
       markRead: shouldMarkRead,
       sendTyping: shouldSendTyping,
+      readToTypingDelayMs,
       eventType: effEventType,
       dedupeWindowMs: dedupeMs,
       bypassDedupe: true,
@@ -2276,6 +1983,9 @@ class NtqqOneBotBridge extends EventEmitter {
           this._windowFocused = res.focused !== undefined ? Boolean(res.focused) : true;
           this._activeAioPeer = peer;
           this._activeAioPeerKey = peerKey;
+          if (prevPeerKey !== this._activeAioPeerKey) {
+            this._sessionScheduler.recordSwitch(this._activeAioPeerKey);
+          }
           if (shouldMarkRead && res.markRead !== false) {
             this._setBoundedMap(this._recentReadByPeer, peerKey, Date.now());
           }
@@ -2288,18 +1998,20 @@ class NtqqOneBotBridge extends EventEmitter {
       } catch (_) {}
     }
 
-    if (
-      this._isWebContentsAlive(this.activeWebContents) &&
-      typeof this.activeWebContents.executeJavaScript === "function"
-    ) {
+    if (this._canInvokeRenderer(this.activeWebContents)) {
       try {
-        const optsJson = JSON.stringify(effectiveOpts);
-        const js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow(${optsJson}) : null`;
-        const res = await this.activeWebContents.executeJavaScript(js, true);
+        const res = await this._invokeRendererCommand(
+          "simulateSession",
+          { opts: effectiveOpts },
+          10000
+        );
         if (res && typeof res === "object" && ("enterOrExitAio" in res || "alreadyInAio" in res)) {
           this._windowFocused = res.focused !== undefined ? Boolean(res.focused) : true;
           this._activeAioPeer = peer;
           this._activeAioPeerKey = peerKey;
+          if (prevPeerKey !== this._activeAioPeerKey) {
+            this._sessionScheduler.recordSwitch(this._activeAioPeerKey);
+          }
           if (shouldMarkRead && res.markRead !== false) {
             this._setBoundedMap(this._recentReadByPeer, peerKey, Date.now());
           }
@@ -2346,6 +2058,9 @@ class NtqqOneBotBridge extends EventEmitter {
       } catch (_) {}
       this._activeAioPeer = peer;
       this._activeAioPeerKey = peerKey;
+      if (prevPeerKey !== this._activeAioPeerKey) {
+        this._sessionScheduler.recordSwitch(this._activeAioPeerKey);
+      }
     }
 
     let didMarkRead = false;
@@ -2357,6 +2072,9 @@ class NtqqOneBotBridge extends EventEmitter {
         didMarkRead = true;
         this._setBoundedMap(this._recentReadByPeer, peerKey, Date.now());
       } catch (_) {}
+    }
+    if (shouldMarkRead && shouldSendTyping && readToTypingDelayMs > 0) {
+      await this._sessionScheduler.sleepUnref(readToTypingDelayMs);
     }
     if (shouldSendTyping) {
       try {
@@ -2382,8 +2100,14 @@ class NtqqOneBotBridge extends EventEmitter {
     };
   }
 
-  async simulateHumanSession(opts) {
-    return this._withAioLock(() => this._activateSessionUnlocked(opts));
+  async simulateHumanSession(opts = {}) {
+    const peerKey = opts?.peerUid
+      ? `${Number(opts.chatType || 1)}:${String(opts.peerUid)}:${String(opts.guildId || "")}`
+      : "";
+    return this._withAioLock(() => this._activateSessionUnlocked(opts), {
+      peerKey,
+      advisory: Boolean(opts?.advisory),
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -2916,6 +2640,40 @@ class NtqqOneBotBridge extends EventEmitter {
     if (uploadNotice) {
       this.broadcastOneBotEvent(uploadNotice);
     }
+
+    const autoReadAndType =
+      this.config.autoReadAndTypeOnPrivateRecv === true ||
+      process.env.ROSMONTIS_AUTO_READ_AND_TYPE_ON_PRIVATE_RECV === "1" ||
+      process.env.ONEBOT_AUTO_READ_AND_TYPE_ON_PRIVATE_RECV === "1" ||
+      process.env.XIAO_BRIDGE_AUTO_READ_AND_TYPE_ON_PRIVATE_RECV === "1";
+    const isSelfSender =
+      (Boolean(this.selfUin) && String(ntMsg.senderUin || "") === String(this.selfUin)) ||
+      (Boolean(this.selfUid) && String(ntMsg.senderUid || "") === String(this.selfUid));
+    if (
+      this.config.humanSimulation !== false &&
+      autoReadAndType &&
+      Number(ntMsg.chatType) === 1 &&
+      ntMsg.peerUid &&
+      Number(ntMsg.msgType) !== 5 &&
+      !isSelfSender
+    ) {
+      const peerUid = String(ntMsg.peerUid);
+      const peerKey = `1:${peerUid}:`;
+      this._sessionScheduler.schedulePrivateRecvReaction(
+        peerKey,
+        this.config.autoReadReactionDelayMs ?? [500, 1800],
+        () =>
+          this.simulateHumanSession({
+            chatType: 1,
+            peerUid,
+            guildId: "",
+            markRead: true,
+            sendTyping: true,
+            eventType: 1,
+            advisory: true,
+          }).catch(() => {})
+      );
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -3270,6 +3028,9 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
+    const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
+    this._sessionScheduler.cancelPeerReaction(peerKey);
+
     // Phase 1 (unlocked): concurrent heavy I/O (HTTP media download, EXIF normalize, @UIN->UID)
     const { elements, sideEffects, cleanupCallbacks } = await oneBotSegmentsToNtElements(message, {
       autoEscape,
@@ -3283,51 +3044,55 @@ class NtqqOneBotBridge extends EventEmitter {
 
     try {
       // Phase 2 (AIO-mutex serialized): activate target AIO + dispatch sendMsg IPC, then release immediately
-      const { echoWaiter, sendRes } = await this._withAioLock(async () => {
-        if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
-          await this._activateSessionUnlocked({
-            chatType: peer.chatType,
-            peerUid: peer.peerUid,
-            guildId: peer.guildId || "",
-            markRead: true,
-            sendTyping: peer.chatType === 1,
-          });
-        }
-
-        for (const effect of sideEffects) {
-          if (effect.type === "poke") {
-            await this._sendPokeInternal(
-              peer.chatType === 2 ? Number(peer.peerUid) : undefined,
-              effect.qq || (peer.chatType === 1 ? Number(this.uinUidStore.getUinSync(peer.peerUid)) : 0)
-            );
-          }
-        }
-
-        if (elements.length === 0) {
-          return { echoWaiter: null, sendRes: null };
-        }
-
-        const waiter = this._registerSendEchoWaiter(peer, elements);
-        try {
-          const res = await this.invokeNt(
-            "nodeIKernelMsgService/sendMsg",
-            {
-              msgId: "0",
-              peer,
-              msgElements: elements,
-              msgAttributeInfos: new Map(),
-            },
-            ["0", peer, elements, new Map()]
-          );
+      const { echoWaiter, sendRes } = await this._withAioLock(
+        async () => {
+          this._sessionScheduler.cancelPeerReaction(peerKey);
           if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
-            this._touchAioActivity();
+            await this._activateSessionUnlocked({
+              chatType: peer.chatType,
+              peerUid: peer.peerUid,
+              guildId: peer.guildId || "",
+              markRead: true,
+              sendTyping: false,
+            });
           }
-          return { echoWaiter: waiter, sendRes: res };
-        } catch (err) {
-          waiter.cancel();
-          throw err;
-        }
-      });
+
+          for (const effect of sideEffects) {
+            if (effect.type === "poke") {
+              await this._sendPokeInternal(
+                peer.chatType === 2 ? Number(peer.peerUid) : undefined,
+                effect.qq || (peer.chatType === 1 ? Number(this.uinUidStore.getUinSync(peer.peerUid)) : 0)
+              );
+            }
+          }
+
+          if (elements.length === 0) {
+            return { echoWaiter: null, sendRes: null };
+          }
+
+          const waiter = this._registerSendEchoWaiter(peer, elements);
+          try {
+            const res = await this.invokeNt(
+              "nodeIKernelMsgService/sendMsg",
+              {
+                msgId: "0",
+                peer,
+                msgElements: elements,
+                msgAttributeInfos: new Map(),
+              },
+              ["0", peer, elements, new Map()]
+            );
+            if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
+              this._touchAioActivity();
+            }
+            return { echoWaiter: waiter, sendRes: res };
+          } catch (err) {
+            waiter.cancel();
+            throw err;
+          }
+        },
+        { peerKey }
+      );
 
       if (!echoWaiter) {
         return { message_id: this.messageIdStore.register("", peer, "0") };
@@ -3461,69 +3226,25 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   async _fetchClientKey() {
-    const res = await this.invokeNt("nodeIKernelTicketService/forceFetchClientKey", {}, []);
-    return {
-      clientKey: String(res?.clientKey || ""),
-      expireTime: String(res?.expireTime || "7200"),
-      keyIndex: String(res?.keyIndex || "19"),
-      url: String(res?.url || ""),
-    };
+    assertWebCredentialApiEnabled(this.config, "get_clientkey");
+    return await fetchClientKey(this);
   }
 
   async _getCookiesObject(domain = "qun.qq.com") {
-    const uin = this.selfUin || "0";
-    const uinCookie = `o${String(uin).padStart(10, "0")}`;
-    const cookies = {
-      uin: uinCookie,
-      p_uin: uinCookie,
-    };
-
-    for (const psCmd of [
-      "nodeIKernelTipOffService/getPskey",
-      "nodeIKernelTicketService/getPskey",
-    ]) {
-      if (cookies.p_skey) break;
-      try {
-        const psRes = await this.invokeNt(
-          psCmd,
-          { domainList: [domain], isForNewPCQQ: true },
-          [[domain], true]
-        );
-        const map = psRes?.domainPskeyMap || psRes;
-        const pskey =
-          map instanceof Map ? map.get(domain) : map && typeof map === "object" ? map[domain] : "";
-        if (pskey) cookies.p_skey = String(pskey);
-      } catch (_) {}
-    }
-
-    if (!cookies.p_skey && this.config.allowPtloginJump !== false) {
-      try {
-        const ck = await this._fetchClientKey();
-        if (ck.clientKey) {
-          const jumpUrl =
-            `https://ssl.ptlogin2.qq.com/jump?ptlang=1033&clientuin=${uin}` +
-            `&clientkey=${encodeURIComponent(ck.clientKey)}` +
-            `&u1=${encodeURIComponent(`https://${domain}/${uin}/infocenter`)}` +
-            `&keyindex=${encodeURIComponent(ck.keyIndex || "19")}`;
-          const fetched = await httpsGetCookies(jumpUrl);
-          Object.assign(cookies, fetched);
-        }
-      } catch (_) {}
-    }
-
-    return cookies;
+    assertWebCredentialApiEnabled(this.config, "get_cookies");
+    return await getCookiesObject(this, domain, WEB_HTTP_HELPERS);
   }
 
   // --------------------------------------------------------------------------
   // OneBot v11 Action Dispatcher (65+ Actions)
   // --------------------------------------------------------------------------
 
-  async handleOneBotAction(action, params = {}, echo = undefined) {
+  async handleOneBotAction(action, params = {}, echo = undefined, context = {}) {
     const act = String(action || "").replace(/^\/+/, "").trim();
     const p = params && typeof params === "object" ? params : {};
 
     try {
-      const data = await this._dispatchAction(act, p);
+      const data = await this._dispatchAction(act, p, context);
       return {
         status: "ok",
         retcode: 0,
@@ -3534,9 +3255,12 @@ class NtqqOneBotBridge extends EventEmitter {
       };
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
+      const retcode = Number(
+        err?.retcode || (err?.code === "ERR_WEB_CREDENTIAL_API_DISABLED" ? 1403 : 1400)
+      );
       return {
         status: "failed",
-        retcode: Number(err?.retcode || 1400),
+        retcode,
         data: null,
         message: msg,
         wording: msg,
@@ -3545,7 +3269,7 @@ class NtqqOneBotBridge extends EventEmitter {
     }
   }
 
-  async _dispatchAction(action, p) {
+  async _dispatchAction(action, p, context = {}) {
     switch (action) {
       // ---- 1. Info & Status ----
       case "get_login_info": {
@@ -3655,9 +3379,9 @@ class NtqqOneBotBridge extends EventEmitter {
       case "send_msg": {
         const isGroup = p.message_type === "group" || (p.group_id && p.message_type !== "private");
         if (isGroup) {
-          return await this._dispatchAction("send_group_msg", p);
+          return await this._dispatchAction("send_group_msg", p, context);
         }
-        return await this._dispatchAction("send_private_msg", p);
+        return await this._dispatchAction("send_private_msg", p, context);
       }
 
       case "delete_msg": {
@@ -3674,6 +3398,22 @@ class NtqqOneBotBridge extends EventEmitter {
       }
 
       case "get_msg": {
+        const reqMsgFormat =
+          context?.messageFormat || p?.message_format || this.config.messageFormat || "array";
+        const formatMsgPayload = (copy) => {
+          if (reqMsgFormat === "string") {
+            copy.message =
+              typeof copy.raw_message === "string" &&
+              (copy.raw_message.length > 0 || !Array.isArray(copy.message) || copy.message.length === 0)
+                ? copy.raw_message
+                : Array.isArray(copy.message)
+                ? segmentsToCqCode(copy.message)
+                : String(copy.message ?? "");
+          } else if (typeof copy.message === "string") {
+            copy.message = normalizeOneBotMessage(copy.message);
+          }
+          return copy;
+        };
         const entry =
           this.messageIdStore.getByShortId(p.message_id) ||
           this.messageIdStore.getByMsgId(p.message_id);
@@ -3684,9 +3424,10 @@ class NtqqOneBotBridge extends EventEmitter {
             uinUidStore: this.uinUidStore,
             messageIdStore: this.messageIdStore,
             reportSelfMessage: true,
+            messageFormat: reqMsgFormat,
           });
           if (refreshed) {
-            const copy = { ...refreshed };
+            const copy = formatMsgPayload({ ...refreshed });
             delete copy.post_type;
             delete copy.self_id;
             copy.real_id = entry.msgId;
@@ -3694,7 +3435,7 @@ class NtqqOneBotBridge extends EventEmitter {
           }
         }
         if (entry && entry.oneBotEvent) {
-          const copy = { ...entry.oneBotEvent };
+          const copy = formatMsgPayload({ ...entry.oneBotEvent });
           delete copy.post_type;
           delete copy.self_id;
           copy.real_id = entry.msgId;
@@ -3713,9 +3454,10 @@ class NtqqOneBotBridge extends EventEmitter {
               selfId: this.selfUin,
               uinUidStore: this.uinUidStore,
               messageIdStore: this.messageIdStore,
+              messageFormat: reqMsgFormat,
             });
             if (formatted) {
-              const copy = { ...formatted };
+              const copy = formatMsgPayload({ ...formatted });
               delete copy.post_type;
               delete copy.self_id;
               copy.real_id = rawMsg.msgId;
@@ -3724,7 +3466,7 @@ class NtqqOneBotBridge extends EventEmitter {
           }
         }
         if (entry) {
-          return {
+          return formatMsgPayload({
             time: Number(entry.msgTime || Math.floor(Date.now() / 1000)),
             message_type: entry.peer?.chatType === 2 ? "group" : "private",
             message_id: entry.shortId,
@@ -3738,7 +3480,7 @@ class NtqqOneBotBridge extends EventEmitter {
             raw_message: "",
             font: 14,
             ...(entry.peer?.chatType === 2 ? { group_id: Number(entry.peer.peerUid || 0) } : {}),
-          };
+          });
         }
         throw new Error("message not found");
       }
@@ -3967,6 +3709,8 @@ class NtqqOneBotBridge extends EventEmitter {
           );
           rawList = Array.isArray(res?.msgList) ? res.msgList : [];
         }
+        const reqMsgFormat =
+          context?.messageFormat || p?.message_format || this.config.messageFormat || "array";
         const messages = [];
         for (const m of rawList) {
           await this._hydrateNtMsgMedia(m);
@@ -3975,8 +3719,9 @@ class NtqqOneBotBridge extends EventEmitter {
             uinUidStore: this.uinUidStore,
             messageIdStore: this.messageIdStore,
             reportSelfMessage: true,
+            messageFormat: reqMsgFormat,
           });
-          if (ev) messages.push(ev);
+          if (ev) messages.push(this._formatEventForEndpoint(ev, reqMsgFormat));
         }
         return { messages };
       }
@@ -4007,6 +3752,8 @@ class NtqqOneBotBridge extends EventEmitter {
           }
         }
         if (peer && peer.peerUid) {
+          const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
+          this._sessionScheduler.cancelPeerReaction(peerKey);
           await this.simulateHumanSession({
             chatType: peer.chatType,
             peerUid: peer.peerUid,
@@ -4026,12 +3773,14 @@ class NtqqOneBotBridge extends EventEmitter {
         const userId = p.user_id;
         if (!userId) throw new Error("user_id is required");
         const peer = await this._resolvePeerForUser(userId);
+        const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
+        this._sessionScheduler.cancelPeerReaction(peerKey);
         const eventType = Number(p.event_type ?? 1);
         await this.simulateHumanSession({
           chatType: peer.chatType,
           peerUid: peer.peerUid,
           guildId: peer.guildId || "",
-          markRead: false,
+          markRead: true,
           sendTyping: true,
           eventType,
         });
@@ -4945,7 +4694,7 @@ class NtqqOneBotBridge extends EventEmitter {
 
       case "get_essence_msg_list": {
         const groupId = String(p.group_id || "");
-        if (this.config.allowExternalHttp !== false) {
+        if (isWebCredentialApiEnabled(this.config) && this.config.allowExternalHttp !== false) {
           try {
             const cookies = await this._getCookiesObject("qun.qq.com");
             const bkn = computeBkn(cookies.p_skey || cookies.skey);
@@ -4998,32 +4747,34 @@ class NtqqOneBotBridge extends EventEmitter {
       case "_send_group_notice": {
         const groupCode = String(p.group_id || "");
         const content = String(p.content || "");
-        try {
-          const cookies = await this._getCookiesObject("qun.qq.com");
-          if (cookies.skey || cookies.p_skey) {
-            const bodyBkn = computeBkn(cookies.skey || cookies.p_skey);
-            const urlBkn = computeBkn(cookies.p_skey || cookies.skey);
-            const body = new URLSearchParams({
-              qid: groupCode,
-              bkn: String(bodyBkn),
-              text: content,
-              pinned: String(p.pinned ?? 0),
-              type: String(p.type ?? 1),
-              settings: JSON.stringify({
-                is_show_edit_card: 1,
-                tip_window_type: 1,
-                confirm_required: Number(p.confirm_required ?? 1),
-              }),
-            }).toString();
-            const url = `https://web.qun.qq.com/cgi-bin/announce/add_qun_notice?bkn=${urlBkn}`;
-            const text = await httpRequestText(url, "POST", body, {
-              Cookie: cookieObjToString(cookies),
-              "Content-Type": "application/x-www-form-urlencoded",
-            });
-            const json = parseJsonpOrJson(text);
-            if (json && json.ec === 0) return {};
-          }
-        } catch (_) {}
+        if (isWebCredentialApiEnabled(this.config) && this.config.allowExternalHttp !== false) {
+          try {
+            const cookies = await this._getCookiesObject("qun.qq.com");
+            if (cookies.skey || cookies.p_skey) {
+              const bodyBkn = computeBkn(cookies.skey || cookies.p_skey);
+              const urlBkn = computeBkn(cookies.p_skey || cookies.skey);
+              const body = new URLSearchParams({
+                qid: groupCode,
+                bkn: String(bodyBkn),
+                text: content,
+                pinned: String(p.pinned ?? 0),
+                type: String(p.type ?? 1),
+                settings: JSON.stringify({
+                  is_show_edit_card: 1,
+                  tip_window_type: 1,
+                  confirm_required: Number(p.confirm_required ?? 1),
+                }),
+              }).toString();
+              const url = `https://web.qun.qq.com/cgi-bin/announce/add_qun_notice?bkn=${urlBkn}`;
+              const text = await httpRequestText(url, "POST", body, {
+                Cookie: cookieObjToString(cookies),
+                "Content-Type": "application/x-www-form-urlencoded",
+              });
+              const json = parseJsonpOrJson(text);
+              if (json && json.ec === 0) return {};
+            }
+          } catch (_) {}
+        }
         await this.invokeNt("nodeIKernelGroupService/publishGroupBulletin", {
           groupCode,
           pskey: "",
@@ -5048,7 +4799,7 @@ class NtqqOneBotBridge extends EventEmitter {
             return res.feeds;
           }
         } catch (_) {}
-        if (this.config.allowExternalHttp !== false) {
+        if (isWebCredentialApiEnabled(this.config) && this.config.allowExternalHttp !== false) {
           try {
             const cookies = await this._getCookiesObject("qun.qq.com");
             if (cookies.skey || cookies.p_skey) {
@@ -5346,14 +5097,23 @@ class NtqqOneBotBridge extends EventEmitter {
       case "ocr_image":
       case ".ocr_image": {
         const imgSrc = String(p.image || "");
-        const media = await resolveMediaSource(imgSrc, this._mediaSecurityOptions());
-        const res = await this.invokeNt("nodeIKernelMiscService/ocr", {
-          path: media.localPath,
-        });
-        return {
-          texts: Array.isArray(res?.texts) ? res.texts : [],
-          language: String(res?.language || "zh"),
-        };
+        let media = null;
+        try {
+          media = await resolveMediaSource(imgSrc, this._mediaSecurityOptions());
+          const res = await this.invokeNt("nodeIKernelMiscService/ocr", {
+            path: media.localPath,
+          });
+          return {
+            texts: Array.isArray(res?.texts) ? res.texts : [],
+            language: String(res?.language || "zh"),
+          };
+        } finally {
+          if (media && typeof media.cleanup === "function") {
+            this._scheduleTempCleanup(media.cleanup);
+          } else if (media) {
+            this._scheduleMediaCleanup(media);
+          }
+        }
       }
 
       case "translate_en2zh": {
@@ -5452,13 +5212,22 @@ class NtqqOneBotBridge extends EventEmitter {
       }
 
       case "set_qq_avatar": {
-        const media = await resolveMediaSource(p.file, this._mediaSecurityOptions());
-        await this.invokeNt(
-          "nodeIKernelProfileService/setHeader",
-          { path: media.localPath },
-          [media.localPath]
-        );
-        return {};
+        let media = null;
+        try {
+          media = await resolveMediaSource(p.file, this._mediaSecurityOptions());
+          await this.invokeNt(
+            "nodeIKernelProfileService/setHeader",
+            { path: media.localPath },
+            [media.localPath]
+          );
+          return {};
+        } finally {
+          if (media && typeof media.cleanup === "function") {
+            this._scheduleTempCleanup(media.cleanup);
+          } else if (media) {
+            this._scheduleMediaCleanup(media);
+          }
+        }
       }
 
       case "fetch_custom_face": {
@@ -5519,224 +5288,19 @@ class NtqqOneBotBridge extends EventEmitter {
           : [];
       }
 
-      // ---- 10. Credentials, ClientKey, Cookies, QZone ----
+      // ---- 10. Credentials, ClientKey, Cookies, QZone (Opt-in via enableWebCredentialApi) ----
       case "get_clientkey":
-        return await this._fetchClientKey();
-
-      case "get_cookies": {
-        const cookies = await this._getCookiesObject(p.domain || "qun.qq.com");
-        return { cookies: cookieObjToString(cookies) };
-      }
-
-      case "get_csrf_token": {
-        const cookies = await this._getCookiesObject(p.domain || "qun.qq.com");
-        const token = computeBkn(cookies.p_skey || cookies.skey);
-        return { token };
-      }
-
-      case "get_credentials": {
-        const cookies = await this._getCookiesObject(p.domain || "qun.qq.com");
-        const token = computeBkn(cookies.p_skey || cookies.skey);
-        return {
-          cookies: cookieObjToString(cookies),
-          token,
-          csrf_token: token,
-        };
-      }
-
-      case "get_qzone_msg_list": {
-        const cookies = await this._getCookiesObject("qzone.qq.com");
-        const bkn = computeBkn(cookies.p_skey || cookies.skey);
-        const targetUin = String(p.target_uin || this.selfUin || "");
-        const pos = Number(p.pos || 0);
-        const num = Number(p.num || 10);
-        const url =
-          `https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_msglist_v6?` +
-          new URLSearchParams({
-            uin: targetUin,
-            ftype: "0",
-            sort: "0",
-            pos: String(pos),
-            num: String(num),
-            replynum: "100",
-            g_tk: String(bkn),
-            callback: "_preloadCallback",
-            code_version: "1",
-            format: "jsonp",
-            need_private_comment: "1",
-          }).toString();
-        const text = await httpRequestText(url, "GET", "", {
-          Cookie: cookieObjToString(cookies),
-        });
-        const data = parseJsonpOrJson(text);
-        const list = Array.isArray(data.msglist) ? data.msglist : [];
-        return {
-          total: Number(data.total ?? list.length),
-          msglist: list.map((e) => ({
-            tid: String(e.tid || ""),
-            content: String(e.content || ""),
-            time: Number(e.created_time || 0),
-            comment_num: Number(e.cmtnum || 0),
-            is_private: Number(e.secret || 0) !== 0,
-            images: Array.isArray(e.pic)
-              ? e.pic.map((pic) => pic.url2 || pic.url3 || pic.url1 || "").filter(Boolean)
-              : [],
-          })),
-        };
-      }
-
-      case "get_qzone_feeds": {
-        const cookies = await this._getCookiesObject("qzone.qq.com");
-        const bkn = computeBkn(cookies.p_skey || cookies.skey);
-        const url =
-          `https://h5.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more?` +
-          new URLSearchParams({
-            uin: String(this.selfUin || ""),
-            scope: "0",
-            view: "1",
-            filter: "all",
-            flag: "1",
-            applist: "all",
-            pagenum: String(p.page_num || 1),
-            count: String(p.count || 10),
-            g_tk: String(bkn),
-            callback: "_preloadCallback",
-            format: "jsonp",
-            useutf8: "1",
-            outputhtmlfeed: "1",
-          }).toString();
-        const text = await httpRequestText(url, "GET", "", {
-          Cookie: cookieObjToString(cookies),
-        });
-        const data = parseJsonpOrJson(text);
-        const rawFeeds = Array.isArray(data.data?.data) ? data.data.data : [];
-        return {
-          feeds: rawFeeds.filter(Boolean).map((f) => ({
-            uin: Number(f.uin || 0),
-            nickname: String(f.nickname || ""),
-            time: Number(f.abstime || 0),
-            appid: Number(f.appid || 0),
-            key: String(f.key || f.feedskey || ""),
-            html: String(f.html || ""),
-          })),
-          has_more: Number(data.data?.hasmore || 0) !== 0,
-        };
-      }
-
-      case "send_qzone_msg": {
-        const cookies = await this._getCookiesObject("qzone.qq.com");
-        const bkn = computeBkn(cookies.p_skey || cookies.skey);
-        const hostUin = String(this.selfUin || "");
-        const url = `https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6?g_tk=${bkn}`;
-        const body = new URLSearchParams({
-          syn_tweet_verson: "1",
-          paramstr: "1",
-          con: String(p.content || ""),
-          feedversion: "1",
-          ver: "1",
-          ugc_right: String(p.ugc_right || 1),
-          to_sign: "0",
-          who: "1",
-          hostuin: hostUin,
-          code_version: "1",
-          format: "json",
-          qzreferrer: `https://user.qzone.qq.com/${hostUin}`,
-        }).toString();
-        const text = await httpRequestText(url, "POST", body, {
-          Cookie: cookieObjToString(cookies),
-          "Content-Type": "application/x-www-form-urlencoded",
-        });
-        const data = parseJsonpOrJson(text);
-        return {
-          tid: String(data.t1_tid || data.tid || `qz_${Date.now()}`),
-          time: Number(data.t1_time || data.now || Math.floor(Date.now() / 1000)),
-        };
-      }
-
-      case "delete_qzone_msg": {
-        const cookies = await this._getCookiesObject("qzone.qq.com");
-        const bkn = computeBkn(cookies.p_skey || cookies.skey);
-        const hostUin = String(this.selfUin || "");
-        const url = `https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6?g_tk=${bkn}`;
-        const body = new URLSearchParams({
-          hostuin: hostUin,
-          tid: String(p.tid || ""),
-          t1_source: "1",
-          code_version: "1",
-          format: "fs",
-          qzreferrer: `https://user.qzone.qq.com/${hostUin}`,
-        }).toString();
-        await httpRequestText(url, "POST", body, {
-          Cookie: cookieObjToString(cookies),
-          "Content-Type": "application/x-www-form-urlencoded",
-        });
-        return {};
-      }
-
+      case "get_cookies":
+      case "get_csrf_token":
+      case "get_credentials":
+      case "get_qzone_msg_list":
+      case "get_qzone_feeds":
+      case "send_qzone_msg":
+      case "delete_qzone_msg":
       case "like_qzone":
-      case "unlike_qzone": {
-        const like = action === "like_qzone";
-        const cookies = await this._getCookiesObject("qzone.qq.com");
-        const bkn = computeBkn(cookies.p_skey || cookies.skey);
-        const opUin = String(this.selfUin || "");
-        const targetUin = String(p.target_uin || opUin);
-        const tid = String(p.tid || "");
-        const unikey = `http://user.qzone.qq.com/${targetUin}/mood/${tid}`;
-        const url = `https://h5.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/${
-          like ? "internal_dolike_app" : "internal_unlike_app"
-        }?g_tk=${bkn}`;
-        const body = new URLSearchParams({
-          qzreferrer: `https://user.qzone.qq.com/${opUin}`,
-          opuin: opUin,
-          unikey,
-          curkey: unikey,
-          appid: "311",
-          typeid: "0",
-          abstime: String(p.abstime || 0),
-          fid: tid,
-          from: "1",
-          active: "0",
-          fupdate: "1",
-          format: "json",
-        }).toString();
-        await httpRequestText(url, "POST", body, {
-          Cookie: cookieObjToString(cookies),
-          "Content-Type": "application/x-www-form-urlencoded",
-        });
-        return {};
-      }
-
-      case "comment_qzone": {
-        const cookies = await this._getCookiesObject("qzone.qq.com");
-        const bkn = computeBkn(cookies.p_skey || cookies.skey);
-        const selfUin = String(this.selfUin || "");
-        const hostUin = String(p.target_uin || selfUin);
-        const tid = String(p.tid || "");
-        const url = `https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds?g_tk=${bkn}`;
-        const body = new URLSearchParams({
-          qzreferrer: `https://user.qzone.qq.com/${selfUin}`,
-          inCharset: "utf-8",
-          outCharset: "utf-8",
-          hostUin,
-          format: "json",
-          ref: "feeds",
-          topicId: `${hostUin}_${tid}__1`,
-          feedsType: "100",
-          private: "0",
-          paramstr: "1",
-          uin: selfUin,
-          content: String(p.content || ""),
-          plat: "qzone",
-          source: "ic",
-          platformid: "52",
-        }).toString();
-        const text = await httpRequestText(url, "POST", body, {
-          Cookie: cookieObjToString(cookies),
-          "Content-Type": "application/x-www-form-urlencoded",
-        });
-        const data = parseJsonpOrJson(text);
-        return { comment_id: String(data.commentid || data.commentId || "") };
-      }
+      case "unlike_qzone":
+      case "comment_qzone":
+        return await dispatchWebCredentialOrQzoneAction(this, action, p, WEB_HTTP_HELPERS);
 
       case "get_rkey":
       case "nc_get_rkey": {
@@ -5796,35 +5360,63 @@ class NtqqOneBotBridge extends EventEmitter {
   // Built-in Zero-Dependency HTTP Server, WS Server, and Reverse WS Client
   // --------------------------------------------------------------------------
 
-  _checkAuth(req, expectedToken) {
-    if (!expectedToken) return true;
-    const auth = String(req.headers["authorization"] || "");
-    if (auth === `Bearer ${expectedToken}` || auth === `Token ${expectedToken}` || auth === expectedToken) {
-      return true;
-    }
-    try {
-      const u = new URL(req.url || "/", "http://127.0.0.1");
-      if (u.searchParams.get("access_token") === expectedToken) {
-        return true;
-      }
-    } catch (_) {}
-    return false;
+  _checkAuth(req, expectedToken, parsedUrl = null) {
+    return checkRequestAuth(req, expectedToken, {
+      allowQueryToken: this.config.allowQueryAccessToken !== false,
+      parsedUrl,
+    });
   }
 
   async startServers() {
+    enforceProtectedModeOnServers(
+      [...(this.config.httpServers || []), ...(this.config.wsServers || [])],
+      this.config,
+      (msg) => {
+        try {
+          process.stderr.write("[rosmontis] SECURITY WARNING: " + msg + "\n");
+        } catch (_) {}
+      }
+    );
+
     // 1. Start HTTP Server(s)
-    for (const httpCfg of this.config.httpServers) {
+    for (const httpCfg of this.config.httpServers || []) {
+      const endpointMsgFormat = httpCfg.messageFormat || this.config.messageFormat || "array";
       await new Promise((resolve) => {
-        const srv = http.createServer((req, res) => {
-          if (!this._checkAuth(req, httpCfg.accessToken)) {
-            res.writeHead(401, { "Content-Type": "application/json" });
+        const srv = http.createServer(async (req, res) => {
+          req.on("error", () => {});
+          res.on("error", () => {});
+
+          const originRes = checkOriginHeader(req, {
+            allowedOrigins: httpCfg.allowedOrigins || this.config.allowedOrigins || [],
+          });
+          if (!originRes.allowed) {
+            res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+            res.end(
+              JSON.stringify({
+                status: "failed",
+                retcode: 1403,
+                message: "Forbidden: Origin not allowed",
+              })
+            );
+            return;
+          }
+
+          let u;
+          try {
+            u = new URL(req.url || "/", "http://127.0.0.1");
+          } catch (_) {
+            u = new URL("/", "http://127.0.0.1");
+          }
+
+          if (!this._checkAuth(req, httpCfg.accessToken, u)) {
+            res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
             res.end(JSON.stringify({ status: "failed", retcode: 1403, message: "Unauthorized" }));
             return;
           }
-          const u = new URL(req.url || "/", "http://127.0.0.1");
+
           const actionName = u.pathname.replace(/^\/+/, "");
           if (req.method === "GET" && (actionName === "health" || actionName === "")) {
-            res.writeHead(200, { "Content-Type": "application/json" });
+            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
             res.end(
               JSON.stringify({
                 status: "ok",
@@ -5835,53 +5427,54 @@ class NtqqOneBotBridge extends EventEmitter {
             );
             return;
           }
-          const chunks = [];
-          req.on("error", () => {});
-          res.on("error", () => {});
-          req.on("data", (c) => chunks.push(c));
-          req.on("end", async () => {
-            try {
-              let params = {};
-              try {
-                const rawStr = Buffer.concat(chunks).toString("utf8").trim();
-                if (rawStr) {
-                  const parsed = JSON.parse(rawStr);
-                  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                    params = parsed;
-                  }
-                }
-              } catch (_) {}
-              for (const [k, v] of u.searchParams.entries()) {
-                if (!(k in params)) params[k] = v;
-              }
-              const act = actionName || String(params.action || "");
-              const actParams =
-                params.params !== undefined
-                  ? params.params && typeof params.params === "object" && !Array.isArray(params.params)
-                    ? params.params
-                    : {}
-                  : params;
-              const reply = await this.handleOneBotAction(act, actParams, params.echo);
-              if (!res.writableEnded) {
-                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-                res.end(JSON.stringify(reply));
-              }
-            } catch (err) {
-              if (!res.writableEnded) {
-                const msg = err && err.message ? err.message : String(err);
-                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+
+          try {
+            const params = await readHttpJsonBody(req, {
+              maxBodyBytes: this.config.maxHttpBodyBytes || DEFAULT_MAX_HTTP_BODY_BYTES,
+            });
+            for (const [k, v] of u.searchParams.entries()) {
+              if (!(k in params)) params[k] = v;
+            }
+            const act = actionName || String(params.action || "");
+            const actParams =
+              params.params !== undefined
+                ? params.params && typeof params.params === "object" && !Array.isArray(params.params)
+                  ? params.params
+                  : {}
+                : params;
+            const reply = await this.handleOneBotAction(act, actParams, params.echo, {
+              messageFormat: endpointMsgFormat,
+            });
+            if (!res.writableEnded) {
+              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+              res.end(JSON.stringify(reply));
+            }
+          } catch (err) {
+            if (!res.writableEnded) {
+              if (err && (err.statusCode === 413 || err.code === "ERR_HTTP_BODY_TOO_LARGE")) {
+                res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" });
                 res.end(
                   JSON.stringify({
                     status: "failed",
-                    retcode: 1400,
-                    data: null,
-                    message: msg,
-                    wording: msg,
+                    retcode: 1413,
+                    message: err.message,
                   })
                 );
+                return;
               }
+              const msg = err && err.message ? err.message : String(err);
+              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+              res.end(
+                JSON.stringify({
+                  status: "failed",
+                  retcode: 1400,
+                  data: null,
+                  message: msg,
+                  wording: msg,
+                })
+              );
             }
-          });
+          }
         });
         srv.on("error", () => resolve());
         srv.listen(Number(httpCfg.port ?? 3000), httpCfg.host || "0.0.0.0", () => {
@@ -5892,7 +5485,8 @@ class NtqqOneBotBridge extends EventEmitter {
     }
 
     // 2. Start Forward WebSocket Server(s)
-    for (const wsCfg of this.config.wsServers) {
+    for (const wsCfg of this.config.wsServers || []) {
+      const endpointMsgFormat = wsCfg.messageFormat || this.config.messageFormat || "array";
       await new Promise((resolve) => {
         const srv = http.createServer((_req, res) => {
           res.writeHead(426);
@@ -5900,20 +5494,38 @@ class NtqqOneBotBridge extends EventEmitter {
         });
         srv.on("upgrade", (req, socket, head) => {
           socket.on("error", () => {});
-          if (!this._checkAuth(req, wsCfg.accessToken)) {
-            socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+
+          const originRes = checkOriginHeader(req, {
+            allowedOrigins: wsCfg.allowedOrigins || this.config.allowedOrigins || [],
+          });
+          if (!originRes.allowed) {
+            socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
             socket.destroy();
             return;
           }
-          const secKey = req.headers["sec-websocket-key"];
+
+          let u = null;
+          try {
+            u = new URL(req.url || "/", "http://127.0.0.1");
+          } catch (_) {}
+
+          if (!this._checkAuth(req, wsCfg.accessToken, u)) {
+            socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+            socket.destroy();
+            return;
+          }
+          const rawSecKey = req.headers["sec-websocket-key"];
+          const secKey = sanitizeHeaderValue(rawSecKey);
           if (!secKey) {
             socket.destroy();
             return;
           }
-          const accept = crypto
-            .createHash("sha1")
-            .update(secKey + WS_GUID)
-            .digest("base64");
+          const accept = sanitizeHeaderValue(
+            crypto
+              .createHash("sha1")
+              .update(secKey + WS_GUID)
+              .digest("base64")
+          );
           socket.write(
             [
               "HTTP/1.1 101 Switching Protocols",
@@ -5924,8 +5536,13 @@ class NtqqOneBotBridge extends EventEmitter {
               "",
             ].join("\r\n")
           );
-          const conn = new Rfc6455Connection(socket, { isClient: false });
+          const conn = new Rfc6455Connection(socket, {
+            isClient: false,
+            maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
+            allowUnmaskedClientFrames: Boolean(this.config.allowUnmaskedClientFrames),
+          });
           conn.reportSelfMessage = Boolean(wsCfg.reportSelfMessage);
+          conn._messageFormat = endpointMsgFormat;
           this._wsServerClients.add(conn);
 
           conn.on("error", () => {
@@ -5953,7 +5570,8 @@ class NtqqOneBotBridge extends EventEmitter {
                 const reply = await this.handleOneBotAction(
                   payload.action,
                   actParams,
-                  payload.echo
+                  payload.echo,
+                  { messageFormat: conn._messageFormat || "array" }
                 );
                 conn.sendJson(reply);
               }
@@ -5972,7 +5590,7 @@ class NtqqOneBotBridge extends EventEmitter {
     }
 
     // 3. Start Reverse WebSocket Client(s)
-    for (const clientCfg of this.config.wsClients) {
+    for (const clientCfg of this.config.wsClients || []) {
       if (!clientCfg.url) continue;
       this._startReverseWsLoop(clientCfg);
     }
@@ -5998,6 +5616,7 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   _startReverseWsLoop(clientCfg) {
+    const endpointMsgFormat = clientCfg.messageFormat || this.config.messageFormat || "array";
     const entry = {
       cfg: clientCfg,
       conn: null,
@@ -6007,6 +5626,7 @@ class NtqqOneBotBridge extends EventEmitter {
       handle: null,
       connectedSelfId: "0",
       immediateReconnectOnce: false,
+      messageFormat: endpointMsgFormat,
     };
     this._reverseWsClients.push(entry);
 
@@ -6017,14 +5637,14 @@ class NtqqOneBotBridge extends EventEmitter {
         entry.timer = null;
       }
       entry.connecting = true;
-      const currentSelfId = String(this.selfUin || "0");
+      const currentSelfId = sanitizeHeaderValue(String(this.selfUin || "0"));
       const headers = {
         "X-Self-ID": currentSelfId,
-        "X-Client-Role": clientCfg.role || "Universal",
+        "X-Client-Role": sanitizeHeaderValue(clientCfg.role || "Universal"),
         "User-Agent": "OneBot/11 Rosmontis/1.0.0",
       };
       if (clientCfg.accessToken) {
-        headers["Authorization"] = `Bearer ${clientCfg.accessToken}`;
+        headers["Authorization"] = `Bearer ${sanitizeHeaderValue(clientCfg.accessToken)}`;
       }
       entry.handle = connectReverseWebSocket(
         clientCfg.url,
@@ -6033,6 +5653,7 @@ class NtqqOneBotBridge extends EventEmitter {
           entry.connecting = false;
           entry.conn = conn;
           entry.connectedSelfId = currentSelfId;
+          conn._messageFormat = entry.messageFormat;
           conn.sendJson(
             formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
           );
@@ -6048,7 +5669,8 @@ class NtqqOneBotBridge extends EventEmitter {
               const reply = await this.handleOneBotAction(
                 payload.action,
                 actParams,
-                payload.echo
+                payload.echo,
+                { messageFormat: entry.messageFormat || "array" }
               );
               conn.sendJson(reply);
             }
@@ -6070,6 +5692,9 @@ class NtqqOneBotBridge extends EventEmitter {
             entry.timer = setTimeout(connectOnce, delay);
             if (typeof entry.timer.unref === "function") entry.timer.unref();
           }
+        },
+        {
+          maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
         }
       );
     };
@@ -6080,6 +5705,8 @@ class NtqqOneBotBridge extends EventEmitter {
   async stopServers() {
     this._aioInteractionSeq += 1;
     this._clearIdleTimers();
+    this._sessionScheduler.dispose();
+    this._rejectPendingRendererCmds(null, "bridge servers stopped");
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
@@ -6091,6 +5718,7 @@ class NtqqOneBotBridge extends EventEmitter {
       if (rev.handle) rev.handle.close();
     }
     this._reverseWsClients = [];
+    this._wsClientHandles = this._reverseWsClients;
     for (const client of this._wsServerClients) {
       client.close();
     }

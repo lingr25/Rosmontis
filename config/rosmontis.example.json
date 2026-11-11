@@ -1,15 +1,21 @@
 {
   "humanSimulation": true,
+  "autoReadAndTypeOnPrivateRecv": false,
+  "autoReadReactionDelayMs": [500, 1800],
+  "aioSwitchCooldownMs": 800,
+  "humanReadToTypingDelayMs": 0,
   "aioIdleExitMs": 45000,
   "focusIdleBlurMs": 300000,
   "sendEchoTimeoutMs": 3000,
   "richMediaEchoTimeoutMs": 15000,
+  "enableWebCredentialApi": false,
+  "allowedOrigins": [],
   "networks": {
     "httpServers": [
       {
         "enable": true,
         "name": "http-main",
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 3000,
         "accessToken": "",
         "messageFormat": "array",
@@ -20,7 +26,7 @@
       {
         "enable": true,
         "name": "ws-main",
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 3001,
         "accessToken": "",
         "messageFormat": "array",
