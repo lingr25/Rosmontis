@@ -7,7 +7,7 @@ set -euo pipefail
 # Boots official Linux QQ (`/opt/QQ/qq`) with Rosmontis pure-JS Renderer/Main
 # OneBot v11 bridge and ZERO native C++ `.so` / `LD_PRELOAD` / `ptrace` hooks:
 # - Persistent `/etc/machine-id` -> `/app/data/config/machine-id`
-# - System D-Bus, Xvfb (:99), Fluxbox WM, optional x11vnc + noVNC (:6081)
+# - System D-Bus, non-root Xvfb (:99), Fluxbox WM, optional x11vnc + noVNC (:6081)
 # - Drop-in compatibility when mounted into legacy headless QQ containers
 # ==============================================================================
 
@@ -28,7 +28,12 @@ if [[ -d /app/runtime/native ]]; then
 fi
 
 # 3. Install Rosmontis pure-JS bridge into /opt/QQ/resources/app/app_launcher/
-bash "${SCRIPT_DIR}/install_bridge.sh"
+QQ_APP_TARGET="${QQ_APP_DIR:-/opt/QQ/resources/app}"
+if [[ -w "${QQ_APP_TARGET}" ]] || [[ ! -f "${QQ_APP_TARGET}/app_launcher/bridge_main.js" ]]; then
+  bash "${SCRIPT_DIR}/install_bridge.sh"
+else
+  echo "[rosmontis] Using pre-installed Rosmontis bridge in ${QQ_APP_TARGET}/app_launcher"
+fi
 
 # 4. Legacy container migration path: if /root/start.sh + /etc/supervisord.conf exist,
 #    strip any third-party native injector program and delegate cleanly.
@@ -86,14 +91,92 @@ if [[ ! -e /var/run/dbus/system_bus_socket ]] && [[ ! -e /run/dbus/system_bus_so
   dbus-daemon --system --fork 2>/dev/null || true
 fi
 
-# Start Xvfb and Fluxbox WM
+# Prepare non-root target user & runtime directories BEFORE starting X11/VNC services
+TARGET_UID="${QQ_UID:-1000}"
+TARGET_GID="${QQ_GID:-1000}"
+if [[ ! "${TARGET_UID}" =~ ^[0-9]+$ ]]; then
+  echo "[rosmontis] ERROR: Invalid QQ_UID '${TARGET_UID}' (must be numeric)" >&2
+  exit 1
+fi
+if [[ ! "${TARGET_GID}" =~ ^[0-9]+$ ]]; then
+  echo "[rosmontis] ERROR: Invalid QQ_GID '${TARGET_GID}' (must be numeric)" >&2
+  exit 1
+fi
+
+if [[ -d /app ]]; then
+  USER_HOME="/app"
+else
+  USER_HOME="$(getent passwd "${TARGET_UID}" | cut -d: -f6 || true)"
+  USER_HOME="${USER_HOME:-/tmp}"
+fi
+
+export HOME="${USER_HOME}"
+export XDG_CONFIG_HOME="${HOME}/.config"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-${TARGET_UID}}"
+export ROSMONTIS_TEMP_DIR="${ROSMONTIS_TEMP_DIR:-/tmp/rosmontis_tmp}"
+export ROSMONTIS_CONFIG_DIR="${ROSMONTIS_CONFIG_DIR:-${DATA_DIR}/config}"
+
+mkdir -p \
+  "${HOME}/.config/QQ" \
+  "${HOME}/.fluxbox" \
+  "${HOME}/.local/share" \
+  "${XDG_RUNTIME_DIR}" \
+  "${ROSMONTIS_TEMP_DIR}" \
+  "${ROSMONTIS_CONFIG_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name 'mojo.*.*.sock' -delete 2>/dev/null || true
+
+if [[ "$(id -u)" == "0" ]]; then
+  chown -R "${TARGET_UID}:${TARGET_GID}" \
+    "${HOME}/.config" \
+    "${HOME}/.fluxbox" \
+    "${HOME}/.local" \
+    "${DATA_DIR}" \
+    "${XDG_RUNTIME_DIR}" \
+    "${ROSMONTIS_TEMP_DIR}" \
+    "${ROSMONTIS_CONFIG_DIR}" 2>/dev/null || true
+  if [[ -d /app ]]; then
+    chown "${TARGET_UID}:${TARGET_GID}" /app 2>/dev/null || true
+  fi
+fi
+
+# Helper: run command as ${TARGET_UID}:${TARGET_GID} without shell injection
+run_as_target_user() {
+  if [[ "$(id -u)" == "0" ]]; then
+    if command -v gosu >/dev/null 2>&1; then
+      gosu "${TARGET_UID}:${TARGET_GID}" env -u LD_PRELOAD HOME="${HOME}" "$@"
+    elif command -v setpriv >/dev/null 2>&1; then
+      if getent passwd "${TARGET_UID}" >/dev/null 2>&1; then
+        setpriv --reuid="${TARGET_UID}" --regid="${TARGET_GID}" --init-groups env -u LD_PRELOAD HOME="${HOME}" "$@"
+      else
+        setpriv --reuid="${TARGET_UID}" --regid="${TARGET_GID}" --clear-groups env -u LD_PRELOAD HOME="${HOME}" "$@"
+      fi
+    else
+      local target_user
+      target_user="$(getent passwd "${TARGET_UID}" | cut -d: -f1 || true)"
+      target_user="${target_user:-ubuntu}"
+      su -s /bin/bash "${target_user}" -- -c 'export HOME="$1"; unset LD_PRELOAD; shift; exec "$@"' _ "${HOME}" "$@"
+    fi
+  else
+    env -u LD_PRELOAD HOME="${HOME}" "$@"
+  fi
+}
+
+# Start Xvfb and Fluxbox WM as non-root (${TARGET_UID}:${TARGET_GID})
 export DISPLAY="${DISPLAY:-:99}"
 DISPLAY_NUM="${DISPLAY#:}"
 DISPLAY_NUM="${DISPLAY_NUM%%.*}"
+if [[ ! "${DISPLAY_NUM}" =~ ^[0-9]+$ ]]; then
+  echo "[rosmontis] ERROR: Invalid DISPLAY '${DISPLAY}'" >&2
+  exit 1
+fi
+
+mkdir -p /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix 2>/dev/null || true
 
 if ! pgrep -x Xvfb >/dev/null 2>&1; then
   rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" || true
-  Xvfb "${DISPLAY}" -screen 0 "${ROSMONTIS_SCREEN:-1280x800x24}" -ac +extension GLX +render -noreset >/dev/null 2>&1 &
+  run_as_target_user Xvfb "${DISPLAY}" -screen 0 "${ROSMONTIS_SCREEN:-1280x800x24}" -ac +extension GLX +render -noreset >/dev/null 2>&1 &
   XVFB_PID=$!
   XVFB_READY=0
   for ((i = 0; i < 50; i++)); do
@@ -114,40 +197,52 @@ if ! pgrep -x Xvfb >/dev/null 2>&1; then
 fi
 
 if command -v fluxbox >/dev/null 2>&1 && ! pgrep -x fluxbox >/dev/null 2>&1; then
-  fluxbox >/dev/null 2>&1 &
+  run_as_target_user fluxbox >/dev/null 2>&1 &
 fi
 
 # Optional x11vnc + noVNC (:6081) for visual QR login / debugging
+rm -f /tmp/.vnc/passwd 2>/dev/null || true
 if [[ -n "${VNC_PASSWD:-}" ]] && command -v x11vnc >/dev/null 2>&1; then
-  mkdir -p /tmp/.vnc
-  x11vnc -storepasswd "${VNC_PASSWD}" /tmp/.vnc/passwd >/dev/null 2>&1 || true
-  x11vnc -display "${DISPLAY}" -rfbauth /tmp/.vnc/passwd -rfbport 5900 -forever -shared >/dev/null 2>&1 &
-  if command -v websockify >/dev/null 2>&1 && [[ -d /usr/share/novnc ]]; then
-    websockify --web=/usr/share/novnc "${NOVNC_PORT:-6081}" 127.0.0.1:5900 >/dev/null 2>&1 &
-    echo "[rosmontis] noVNC desktop available on port ${NOVNC_PORT:-6081}"
+  VNC_DIR="${XDG_RUNTIME_DIR}/vnc"
+  VNC_PASSWD_FILE="${VNC_DIR}/passwd"
+  mkdir -p "${VNC_DIR}"
+  chmod 700 "${VNC_DIR}"
+  if [[ "$(id -u)" == "0" ]]; then
+    chown -R "${TARGET_UID}:${TARGET_GID}" "${VNC_DIR}"
+  fi
+  (
+    umask 077
+    run_as_target_user x11vnc -storepasswd "${VNC_PASSWD}" "${VNC_PASSWD_FILE}" >/dev/null 2>&1
+  ) || true
+  unset VNC_PASSWD
+
+  if [[ -s "${VNC_PASSWD_FILE}" ]]; then
+    chmod 600 "${VNC_PASSWD_FILE}"
+    if [[ "$(id -u)" == "0" ]]; then
+      chown "${TARGET_UID}:${TARGET_GID}" "${VNC_PASSWD_FILE}"
+    fi
+
+    X11VNC_BIND_ARGS=("-localhost")
+    if [[ "${ROSMONTIS_EXPOSE_RAW_VNC:-0}" == "1" ]]; then
+      if [[ -n "${VNC_BIND_HOST:-}" ]]; then
+        X11VNC_BIND_ARGS=("-listen" "${VNC_BIND_HOST}")
+      else
+        X11VNC_BIND_ARGS=()
+      fi
+    elif [[ -n "${VNC_BIND_HOST:-}" ]] && [[ "${VNC_BIND_HOST}" != "127.0.0.1" ]] && [[ "${VNC_BIND_HOST}" != "localhost" ]]; then
+      X11VNC_BIND_ARGS=("-listen" "${VNC_BIND_HOST}")
+    fi
+
+    run_as_target_user x11vnc -display "${DISPLAY}" -rfbauth "${VNC_PASSWD_FILE}" -rfbport 5900 "${X11VNC_BIND_ARGS[@]}" -forever -shared >/dev/null 2>&1 &
+    if command -v websockify >/dev/null 2>&1 && [[ -d /usr/share/novnc ]]; then
+      run_as_target_user websockify --web=/usr/share/novnc "${NOVNC_PORT:-6081}" 127.0.0.1:5900 >/dev/null 2>&1 &
+      echo "[rosmontis] noVNC desktop available on port ${NOVNC_PORT:-6081}"
+    fi
+  else
+    echo "[rosmontis] WARNING: Failed to initialize VNC password file; skipping x11vnc." >&2
   fi
 fi
-
-TARGET_UID="${QQ_UID:-1000}"
-TARGET_GID="${QQ_GID:-1000}"
-if [[ -d /app ]]; then
-  USER_HOME="/app"
-else
-  USER_HOME="$(getent passwd "${TARGET_UID}" | cut -d: -f6 || echo /tmp)"
-fi
-
-export HOME="${USER_HOME}"
-export XDG_CONFIG_HOME="${HOME}/.config"
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-${TARGET_UID}}"
-export ROSMONTIS_TEMP_DIR="${ROSMONTIS_TEMP_DIR:-/tmp/rosmontis_tmp}"
-export ROSMONTIS_CONFIG_DIR="${ROSMONTIS_CONFIG_DIR:-${DATA_DIR}/config}"
-
-mkdir -p "${HOME}/.config/QQ" "${HOME}/.local/share" "${XDG_RUNTIME_DIR}" "${ROSMONTIS_TEMP_DIR}"
-find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name 'mojo.*.*.sock' -delete 2>/dev/null || true
-
-if [[ "$(id -u)" == "0" ]]; then
-  chown -R "${TARGET_UID}:${TARGET_GID}" "${HOME}/.config" "${HOME}/.local" "${DATA_DIR}" "${XDG_RUNTIME_DIR}" "${ROSMONTIS_TEMP_DIR}" 2>/dev/null || true
-fi
+unset VNC_PASSWD || true
 
 QQ_BIN="${QQ_BIN:-/opt/QQ/qq}"
 QQ_ARGS=(
@@ -162,12 +257,17 @@ echo "[rosmontis] Starting official ${QQ_BIN} under UID:GID ${TARGET_UID}:${TARG
 
 if [[ "$(id -u)" == "0" ]]; then
   if command -v gosu >/dev/null 2>&1; then
-    exec env -u LD_PRELOAD HOME="${HOME}" gosu "${TARGET_UID}:${TARGET_GID}" "${QQ_BIN}" "${QQ_ARGS[@]}" "$@"
+    exec gosu "${TARGET_UID}:${TARGET_GID}" env -u LD_PRELOAD HOME="${HOME}" "${QQ_BIN}" "${QQ_ARGS[@]}" "$@"
   elif command -v setpriv >/dev/null 2>&1; then
-    exec env -u LD_PRELOAD HOME="${HOME}" setpriv --reuid="${TARGET_UID}" --regid="${TARGET_GID}" --init-groups "${QQ_BIN}" "${QQ_ARGS[@]}" "$@"
+    if getent passwd "${TARGET_UID}" >/dev/null 2>&1; then
+      exec setpriv --reuid="${TARGET_UID}" --regid="${TARGET_GID}" --init-groups env -u LD_PRELOAD HOME="${HOME}" "${QQ_BIN}" "${QQ_ARGS[@]}" "$@"
+    else
+      exec setpriv --reuid="${TARGET_UID}" --regid="${TARGET_GID}" --clear-groups env -u LD_PRELOAD HOME="${HOME}" "${QQ_BIN}" "${QQ_ARGS[@]}" "$@"
+    fi
   else
-    TARGET_USER="$(getent passwd "${TARGET_UID}" | cut -d: -f1 || echo ubuntu)"
-    exec su -s /bin/bash "${TARGET_USER}" -c "export HOME='${HOME}'; unset LD_PRELOAD; exec '${QQ_BIN}' ${QQ_ARGS[*]} $*"
+    TARGET_USER="$(getent passwd "${TARGET_UID}" | cut -d: -f1 || true)"
+    TARGET_USER="${TARGET_USER:-ubuntu}"
+    exec su -s /bin/bash "${TARGET_USER}" -- -c 'export HOME="$1"; unset LD_PRELOAD; shift; exec "$@"' _ "${HOME}" "${QQ_BIN}" "${QQ_ARGS[@]}" "$@"
   fi
 else
   unset LD_PRELOAD

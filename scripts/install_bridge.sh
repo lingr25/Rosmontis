@@ -4,8 +4,9 @@ set -euo pipefail
 # ==============================================================================
 # Rosmontis Pure-JS Bridge Installer (`scripts/install_bridge.sh`)
 #
-# Installs `bridge_onebot.js`, `bridge_renderer.js`, `bridge_main.js`, and
-# `app_launcher_index.js` into `/opt/QQ/resources/app/app_launcher/`, updates
+# Installs `bridge_onebot.js`, `bridge_renderer.js`, `bridge_main.js`,
+# `core/*.js`, and `app_launcher_index.js` into
+# `/opt/QQ/resources/app/app_launcher/`, updates
 # `/opt/QQ/resources/app/package.json` `"main"` -> `"./app_launcher/index.js"`,
 # and verifies that no C++ `.so` memory hook (`LD_PRELOAD`) is active.
 #
@@ -35,6 +36,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     "${LAUNCHER_DIR}/bridge_onebot.js" \
     "${LAUNCHER_DIR}/bridge_renderer.js" \
     "${LAUNCHER_DIR}/bridge_main.js"
+  rm -rf "${LAUNCHER_DIR}/core"
   echo "[rosmontis] Uninstalled cleanly."
   exit 0
 fi
@@ -57,6 +59,7 @@ fi
 
 # 2. Ensure target launcher directory exists
 mkdir -p "${LAUNCHER_DIR}"
+chmod 755 "${LAUNCHER_DIR}"
 
 # 3. Backup original launcher index.js and package.json once
 if [[ -f "${LAUNCHER_DIR}/index.js" ]] && [[ ! -f "${LAUNCHER_DIR}/index.orig.js" ]]; then
@@ -71,7 +74,7 @@ if [[ -f "${PACKAGE_JSON}" ]] && [[ ! -f "${QQ_APP_DIR}/package.orig.json" ]]; t
   echo "[rosmontis] Backed up original package.json -> package.orig.json"
 fi
 
-# 4. Copy pure-JS bridge files into app_launcher/
+# 4. Copy pure-JS bridge files and core/*.js helper modules into app_launcher/
 cp -f "${SRC_DIR}/bridge_onebot.js" "${LAUNCHER_DIR}/bridge_onebot.js"
 cp -f "${SRC_DIR}/bridge_renderer.js" "${LAUNCHER_DIR}/bridge_renderer.js"
 cp -f "${SRC_DIR}/bridge_main.js" "${LAUNCHER_DIR}/bridge_main.js"
@@ -82,6 +85,19 @@ chmod 644 \
   "${LAUNCHER_DIR}/bridge_renderer.js" \
   "${LAUNCHER_DIR}/bridge_main.js" \
   "${LAUNCHER_DIR}/index.js"
+
+if [[ -d "${SRC_DIR}/core" ]]; then
+  rm -rf "${LAUNCHER_DIR}/core"
+  mkdir -p "${LAUNCHER_DIR}/core"
+  chmod 755 "${LAUNCHER_DIR}/core"
+  shopt -s nullglob
+  CORE_JS_FILES=("${SRC_DIR}/core/"*.js)
+  shopt -u nullglob
+  if (( ${#CORE_JS_FILES[@]} > 0 )); then
+    cp -f "${CORE_JS_FILES[@]}" "${LAUNCHER_DIR}/core/"
+    chmod 644 "${LAUNCHER_DIR}/core/"*.js
+  fi
+fi
 
 # 5. Update /opt/QQ/resources/app/package.json "main" -> "./app_launcher/index.js" in-place
 #    preserving version, buildVersion, appid, and all existing fields.
@@ -116,6 +132,8 @@ with open(p, "w", encoding="utf-8") as f:
 else
   cp -f "${SRC_DIR}/package_patch.json" "${PACKAGE_JSON}"
 fi
+
+chmod 644 "${PACKAGE_JSON}"
 
 # 6. Verify installation
 if ! grep -q '"./app_launcher/index.js"' "${PACKAGE_JSON}"; then
