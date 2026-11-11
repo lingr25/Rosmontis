@@ -1999,6 +1999,331 @@ async function runTests() {
     await bridge.stopServers();
   });
 
+  console.log("=== 13. Testing Token Env Guard, Echo Element Isolation, Poke Replay Guard, HTTP Null Body & Forward WS Error Safety ===");
+
+  await check("Empty env token preserves config token; sendEcho isolates element types/md5; poke honors replay guard; HTTP null body & Forward WS socket errors never crash", async () => {
+    const os = require("os");
+
+    // 13a. Empty ROSMONTIS_ACCESS_TOKEN / ONEBOT_ACCESS_TOKEN must not clobber config file accessToken
+    const tmpCfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "rosmontis_tok_test_"));
+    const prevRosTok = process.env.ROSMONTIS_ACCESS_TOKEN;
+    const prevObTok = process.env.ONEBOT_ACCESS_TOKEN;
+    try {
+      fs.writeFileSync(
+        path.join(tmpCfgDir, "rosmontis.json"),
+        JSON.stringify({
+          networks: {
+            httpServers: [{ enable: true, host: "127.0.0.1", port: 3000, accessToken: "cfg-secret-token" }],
+            wsServers: [{ enable: true, host: "127.0.0.1", port: 3001, accessToken: "cfg-secret-token" }],
+            wsClients: [{ enable: true, url: "ws://127.0.0.1:8080/ws", accessToken: "cfg-secret-token" }],
+          },
+        }),
+        "utf8"
+      );
+      process.env.ROSMONTIS_ACCESS_TOKEN = "";
+      process.env.ONEBOT_ACCESS_TOKEN = "";
+      const loadedEmptyEnv = mainMod.loadBridgeConfig(tmpCfgDir);
+      assert.strictEqual(loadedEmptyEnv.httpServers[0].accessToken, "cfg-secret-token");
+      assert.strictEqual(loadedEmptyEnv.wsServers[0].accessToken, "cfg-secret-token");
+      assert.strictEqual(loadedEmptyEnv.wsClients[0].accessToken, "cfg-secret-token");
+
+      process.env.ROSMONTIS_ACCESS_TOKEN = "env-override-token";
+      const loadedOverride = mainMod.loadBridgeConfig(tmpCfgDir);
+      assert.strictEqual(loadedOverride.httpServers[0].accessToken, "env-override-token");
+      assert.strictEqual(loadedOverride.wsServers[0].accessToken, "env-override-token");
+      assert.strictEqual(loadedOverride.wsClients[0].accessToken, "env-override-token");
+    } finally {
+      if (prevRosTok === undefined) delete process.env.ROSMONTIS_ACCESS_TOKEN;
+      else process.env.ROSMONTIS_ACCESS_TOKEN = prevRosTok;
+      if (prevObTok === undefined) delete process.env.ONEBOT_ACCESS_TOKEN;
+      else process.env.ONEBOT_ACCESS_TOKEN = prevObTok;
+      fs.rmSync(tmpCfgDir, { recursive: true, force: true });
+    }
+
+    // 13b. Outbound sendEcho rejects cross-type echoes (image/poke vs text) and matches concurrent images by md5
+    {
+      let echoBridge = null;
+      echoBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_self",
+        online: true,
+        config: {
+          httpServers: [],
+          wsServers: [],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+          sendEchoTimeoutMs: 120,
+        },
+        rendererExecute: async (cmd, args) => {
+          const payload = args[0];
+          if (cmd === "nodeIKernelMsgService/copyFileWithDelExifInfo") {
+            return { errorMsg: "skip" };
+          }
+          if (cmd === "nodeIKernelMsgService/getRichMediaFilePathForGuild") {
+            return { path: "" };
+          }
+          if (cmd === "nodeIKernelMsgService/sendMsg") {
+            const firstEl = payload.msgElements[0];
+            if (firstEl && firstEl.elementType === 1) {
+              // Foreign image & poke echoes arrive first; neither may hijack our text waiter
+              await echoBridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+                {
+                  msgRecord: {
+                    msgId: "7700000000000000901",
+                    msgSeq: "91",
+                    chatType: 1,
+                    peerUid: "u_friend",
+                    senderUid: "u_self",
+                    senderUin: "100010001",
+                    elements: [{ elementType: 2, picElement: { md5HexStr: "deadbeef", fileName: "other.png" } }],
+                  },
+                },
+              ]);
+              await echoBridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+                {
+                  msgRecord: {
+                    msgId: "7700000000000000902",
+                    msgSeq: "92",
+                    chatType: 1,
+                    peerUid: "u_friend",
+                    senderUid: "u_self",
+                    senderUin: "100010001",
+                    elements: [],
+                  },
+                },
+              ]);
+              setTimeout(() => {
+                echoBridge
+                  ._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+                    {
+                      msgRecord: {
+                        msgId: "7700000000000000101",
+                        msgSeq: "101",
+                        chatType: 1,
+                        peerUid: "u_friend",
+                        senderUid: "u_self",
+                        senderUin: "100010001",
+                        elements: payload.msgElements,
+                      },
+                    },
+                  ])
+                  .catch(() => {});
+              }, 15);
+            }
+            return { result: 0, errMsg: "" };
+          }
+          throw new Error(`unexpected cmd ${cmd}`);
+        },
+      });
+      echoBridge.uinUidStore.record("100020002", "u_friend");
+      const textRes = await echoBridge.handleOneBotAction("send_private_msg", {
+        user_id: 100020002,
+        message: "纯文本消息",
+      });
+      assert.strictEqual(textRes.data.real_id, "7700000000000000101");
+
+      // Direct waiter out-of-order correlation for two distinct images
+      const peer = { chatType: 1, peerUid: "u_friend" };
+      const wImgA = echoBridge._registerSendEchoWaiter(peer, [
+        { elementType: 2, picElement: { md5HexStr: "aaaa1111", fileName: "a.png", picSubType: 0 } },
+      ]);
+      const wImgB = echoBridge._registerSendEchoWaiter(peer, [
+        { elementType: 2, picElement: { md5HexStr: "bbbb2222", fileName: "b.png", picSubType: 0 } },
+      ]);
+      // Foreign text echo must match neither image waiter
+      assert.strictEqual(
+        echoBridge._matchSendEcho({
+          msgId: "7700000000000000903",
+          msgSeq: "93",
+          chatType: 1,
+          peerUid: "u_friend",
+          elements: [{ elementType: 1, textElement: { content: "干扰文本", atType: 0 } }],
+        }),
+        false
+      );
+      // Image B arrives before Image A
+      assert.strictEqual(
+        echoBridge._matchSendEcho({
+          msgId: "7700000000000000202",
+          msgSeq: "202",
+          chatType: 1,
+          peerUid: "u_friend",
+          elements: [{ elementType: 2, picElement: { md5HexStr: "BBBB2222", fileName: "b.png", picSubType: 0 } }],
+        }),
+        true
+      );
+      assert.strictEqual(
+        echoBridge._matchSendEcho({
+          msgId: "7700000000000000201",
+          msgSeq: "201",
+          chatType: 1,
+          peerUid: "u_friend",
+          elements: [{ elementType: 2, picElement: { md5HexStr: "aaaa1111", fileName: "a.png", picSubType: 0 } }],
+        }),
+        true
+      );
+      assert.strictEqual((await wImgA.wait(50)).msgId, "7700000000000000201");
+      assert.strictEqual((await wImgB.wait(50)).msgId, "7700000000000000202");
+    }
+
+    // 13c. _sendPokeInternal must NOT replay via sendPoke / sendMsg when sendNudge was already dispatched
+    {
+      const pokeCmds = [];
+      const dispatchedFailBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_self",
+        online: true,
+        config: { httpServers: [], wsServers: [], wsClients: [], heartbeatIntervalMs: 0, humanSimulation: false },
+        rendererExecute: async (cmd) => {
+          pokeCmds.push(cmd);
+          throw new Error("invokeNtApi timeout (15000ms): nodeIKernelMsgService/sendNudge");
+        },
+      });
+      dispatchedFailBridge.uinUidStore.record("100020002", "u_friend");
+      const pokeFailResp = await dispatchedFailBridge.handleOneBotAction("send_poke", {
+        group_id: 654321,
+        user_id: 100020002,
+      });
+      assert.strictEqual(pokeFailResp.status, "failed");
+      assert.deepStrictEqual(pokeCmds, ["nodeIKernelMsgService/sendNudge"]);
+
+      // When sendNudge & sendPoke are genuinely unavailable, fallback to sendMsg poke faceElement still works
+      const fallbackCmds = [];
+      const fallbackBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_self",
+        online: true,
+        config: { httpServers: [], wsServers: [], wsClients: [], heartbeatIntervalMs: 0, humanSimulation: false },
+        rendererExecute: async (cmd) => {
+          fallbackCmds.push(cmd);
+          if (cmd === "nodeIKernelMsgService/sendNudge" || cmd === "nodeIKernelMsgService/sendPoke") {
+            throw new Error("ROSMONTIS_BRIDGE_UNAVAILABLE: handler missing");
+          }
+          return { result: 0, errMsg: "" };
+        },
+      });
+      fallbackBridge.uinUidStore.record("100020002", "u_friend");
+      const pokeOkResp = await fallbackBridge.handleOneBotAction("send_poke", {
+        group_id: 654321,
+        user_id: 100020002,
+      });
+      assert.strictEqual(pokeOkResp.status, "ok");
+      assert.deepStrictEqual(fallbackCmds, [
+        "nodeIKernelMsgService/sendNudge",
+        "nodeIKernelMsgService/sendPoke",
+        "nodeIKernelMsgService/sendMsg",
+      ]);
+    }
+
+    // 13d & 13e. HTTP null/non-object JSON body and Forward WS abrupt socket errors must never throw unhandled errors
+    {
+      let unhandled = null;
+      const onUnhandled = (err) => {
+        unhandled = err;
+      };
+      process.on("unhandledRejection", onUnhandled);
+      process.on("uncaughtException", onUnhandled);
+
+      const netBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_self",
+        online: true,
+        config: {
+          httpServers: [{ host: "127.0.0.1", port: 0, accessToken: "" }],
+          wsServers: [{ host: "127.0.0.1", port: 0, accessToken: "" }],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+        },
+      });
+      await netBridge.startServers();
+      try {
+        const httpPort = netBridge._httpServers[0].address().port;
+        const wsPort = netBridge._wsServers[0].address().port;
+
+        const postRaw = (urlPath, rawBody) =>
+          new Promise((resolve, reject) => {
+            const req = http.request(
+              {
+                hostname: "127.0.0.1",
+                port: httpPort,
+                path: urlPath,
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+              },
+              (res) => {
+                const bufs = [];
+                res.on("data", (c) => bufs.push(c));
+                res.on("end", () =>
+                  resolve({ statusCode: res.statusCode, json: JSON.parse(Buffer.concat(bufs).toString("utf8")) })
+                );
+              }
+            );
+            req.on("error", reject);
+            req.end(rawBody);
+          });
+
+        const rNullAction = await postRaw("/get_status?foo=bar", "null");
+        assert.strictEqual(rNullAction.statusCode, 200);
+        assert.strictEqual(rNullAction.json.status, "ok");
+
+        const rNullRoot = await postRaw("/", "null");
+        assert.strictEqual(rNullRoot.statusCode, 200);
+        assert.strictEqual(rNullRoot.json.status, "failed");
+
+        const rPrim = await postRaw("/get_status", "123");
+        assert.strictEqual(rPrim.json.status, "ok");
+
+        const rArr = await postRaw("/get_status", "[1,2,3]");
+        assert.strictEqual(rArr.json.status, "ok");
+
+        const rNullNested = await postRaw("/", JSON.stringify({ action: "get_status", params: null }));
+        assert.strictEqual(rNullNested.json.status, "ok");
+
+        // Upgrade Forward WebSocket client and trigger socket error + TCP reset
+        const clientSock = net.connect(wsPort, "127.0.0.1");
+        await new Promise((resolve, reject) => {
+          const secKey = crypto.randomBytes(16).toString("base64");
+          let buf = "";
+          clientSock.on("connect", () => {
+            clientSock.write(
+              [
+                "GET / HTTP/1.1",
+                `Host: 127.0.0.1:${wsPort}`,
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                `Sec-WebSocket-Key: ${secKey}`,
+                "Sec-WebSocket-Version: 13",
+                "",
+                "",
+              ].join("\r\n")
+            );
+          });
+          clientSock.on("data", (chunk) => {
+            buf += chunk.toString("utf8");
+            if (buf.includes("101 Switching Protocols")) resolve();
+          });
+          clientSock.on("error", reject);
+        });
+
+        assert.strictEqual(netBridge._wsServerClients.size, 1);
+        const srvConn = Array.from(netBridge._wsServerClients)[0];
+        // Directly emit a socket error on the server-side upgraded socket (simulating ECONNRESET)
+        srvConn.socket.emit("error", Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }));
+        clientSock.destroy();
+        await new Promise((r) => setTimeout(r, 30));
+
+        assert.strictEqual(netBridge._wsServerClients.size, 0, "errored Forward WS client must be evicted");
+        assert.strictEqual(unhandled, null, `Unexpected unhandled error: ${unhandled}`);
+      } finally {
+        process.removeListener("unhandledRejection", onUnhandled);
+        process.removeListener("uncaughtException", onUnhandled);
+        await netBridge.stopServers();
+      }
+    }
+  });
+
   console.log(`\nALL ${passed} TEST SUITES PASSED SUCCESSFULLY!`);
 }
 

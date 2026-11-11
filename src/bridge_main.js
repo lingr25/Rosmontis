@@ -111,7 +111,13 @@ class Rfc6455Connection extends EventEmitter {
       }
     });
     socket.on("error", (err) => {
-      this.emit("error", err);
+      if (this.listenerCount("error") > 0) {
+        this.emit("error", err);
+      }
+      if (!this.closed) {
+        this.closed = true;
+        this.emit("close");
+      }
     });
   }
 
@@ -462,10 +468,9 @@ function loadBridgeConfig(customConfigDir) {
   const envHttpPort = Number(process.env.ROSMONTIS_HTTP_PORT || process.env.ONEBOT_HTTP_PORT || 0);
   const envWsPort = Number(process.env.ROSMONTIS_WS_PORT || process.env.ONEBOT_WS_PORT || 0);
   const envRevWsUrl = process.env.ROSMONTIS_REVERSE_WS_URL || process.env.ONEBOT_REVERSE_WS_URL || "";
-  const envToken =
-    process.env.ROSMONTIS_ACCESS_TOKEN !== undefined
-      ? process.env.ROSMONTIS_ACCESS_TOKEN
-      : process.env.ONEBOT_ACCESS_TOKEN;
+  const envToken = String(
+    process.env.ROSMONTIS_ACCESS_TOKEN || process.env.ONEBOT_ACCESS_TOKEN || ""
+  ).trim();
   const listenHost = process.env.ROSMONTIS_HOST || process.env.ONEBOT_HOST || "0.0.0.0";
 
   if (defaultConfig.httpServers.length === 0 && (!loadedFromFile || !hasExplicitHttpServersKey || envHttpPort > 0)) {
@@ -473,7 +478,7 @@ function loadBridgeConfig(customConfigDir) {
       name: "http-default",
       host: listenHost,
       port: envHttpPort || 3000,
-      accessToken: envToken !== undefined ? envToken : "",
+      accessToken: envToken,
       messageFormat: "array",
       reportSelfMessage: false,
     });
@@ -486,7 +491,7 @@ function loadBridgeConfig(customConfigDir) {
       name: "ws-default",
       host: listenHost,
       port: envWsPort || 3001,
-      accessToken: envToken !== undefined ? envToken : "",
+      accessToken: envToken,
       messageFormat: "array",
       reportSelfMessage: false,
     });
@@ -499,7 +504,7 @@ function loadBridgeConfig(customConfigDir) {
       {
         name: "wsclient-env",
         url: envRevWsUrl,
-        accessToken: envToken !== undefined ? envToken : "",
+        accessToken: envToken,
         messageFormat: "array",
         reportSelfMessage: false,
         reconnectIntervalMs: 5000,
@@ -507,7 +512,7 @@ function loadBridgeConfig(customConfigDir) {
     ];
   }
 
-  if (envToken !== undefined) {
+  if (envToken) {
     for (const s of defaultConfig.httpServers) s.accessToken = envToken;
     for (const s of defaultConfig.wsServers) s.accessToken = envToken;
     for (const c of defaultConfig.wsClients) c.accessToken = envToken;
@@ -2695,16 +2700,130 @@ class NtqqOneBotBridge extends EventEmitter {
   // --------------------------------------------------------------------------
 
   static _ntElementsSignature(elements) {
+    const parts = [];
     let text = "";
     if (Array.isArray(elements)) {
       for (const el of elements) {
         if (!el || typeof el !== "object") continue;
-        if (Number(el.elementType) === 1 && el.textElement && Number(el.textElement.atType || 0) === 0) {
-          text += String(el.textElement.content || "");
+        const type = Number(el.elementType || 0);
+        if (type === 1 && el.textElement) {
+          const atType = Number(el.textElement.atType || 0);
+          if (atType === 0) {
+            const chunk = String(el.textElement.content || "");
+            if (!chunk) continue;
+            text += chunk;
+            const prev = parts[parts.length - 1];
+            if (prev && prev.kind === "text") {
+              prev.text += chunk;
+            } else {
+              parts.push({ kind: "text", text: chunk });
+            }
+          } else {
+            parts.push({
+              kind: "at",
+              atType,
+              uid: String(el.textElement.atNtUid || ""),
+              uin: String(el.textElement.atUid || ""),
+            });
+          }
+        } else if (type === 2 && el.picElement) {
+          parts.push({
+            kind: "pic",
+            md5: String(el.picElement.md5HexStr || "").toLowerCase(),
+            subType: Number(el.picElement.picSubType || 0),
+            name: String(el.picElement.fileName || ""),
+          });
+        } else if (type === 3 && el.fileElement) {
+          parts.push({
+            kind: "file",
+            md5: String(el.fileElement.fileMd5 || "").toLowerCase(),
+            name: String(el.fileElement.fileName || ""),
+          });
+        } else if (type === 4 && el.pttElement) {
+          parts.push({
+            kind: "ptt",
+            md5: String(el.pttElement.md5HexStr || "").toLowerCase(),
+            name: String(el.pttElement.fileName || ""),
+          });
+        } else if (type === 5 && el.videoElement) {
+          parts.push({
+            kind: "video",
+            md5: String(el.videoElement.videoMd5 || "").toLowerCase(),
+            name: String(el.videoElement.fileName || ""),
+          });
+        } else if (type === 6 && el.faceElement) {
+          parts.push({
+            kind: "face",
+            faceType: Number(el.faceElement.faceType || 0),
+            faceIndex: Number(el.faceElement.faceIndex || 0),
+            pokeType: Number(el.faceElement.pokeType || 0),
+          });
+        } else if (type === 7 && el.replyElement) {
+          parts.push({
+            kind: "reply",
+            msgId: String(el.replyElement.replayMsgId || "0"),
+            msgSeq: String(el.replyElement.replayMsgSeq || "0"),
+          });
+        } else if (type === 10 && el.arkElement) {
+          parts.push({
+            kind: "ark",
+            data: String(el.arkElement.bytesData || ""),
+          });
+        } else if (type === 11 && el.marketFaceElement) {
+          parts.push({
+            kind: "mface",
+            emojiId: String(el.marketFaceElement.emojiId || ""),
+          });
+        } else if (type > 0) {
+          parts.push({ kind: `el:${type}` });
         }
       }
     }
-    return { text: text.trim() };
+    return { text: text.trim(), parts };
+  }
+
+  static _elementsSignatureMatch(expected, actual) {
+    const aList = expected?.parts;
+    const bList = actual?.parts;
+    if (!Array.isArray(aList) || !Array.isArray(bList)) return false;
+    if (aList.length === 0 || aList.length !== bList.length) return false;
+    for (let i = 0; i < aList.length; i++) {
+      const a = aList[i];
+      const b = bList[i];
+      if (!a || !b || a.kind !== b.kind) return false;
+      if (a.kind === "text") {
+        if (a.text.trim() !== b.text.trim()) return false;
+        if (!a.text.trim() && a.text !== b.text) return false;
+      } else if (a.kind === "at") {
+        if (a.atType !== b.atType) return false;
+        if (a.uid && b.uid) {
+          if (a.uid !== b.uid) return false;
+        } else if (a.uin && b.uin && a.uin !== b.uin) {
+          return false;
+        }
+      } else if (a.kind === "pic" || a.kind === "file" || a.kind === "ptt" || a.kind === "video") {
+        if (a.md5 && b.md5) {
+          if (a.md5 !== b.md5) return false;
+        } else if (a.name && b.name && a.name !== b.name) {
+          return false;
+        }
+      } else if (a.kind === "face") {
+        if (a.faceType !== b.faceType || a.faceIndex !== b.faceIndex || a.pokeType !== b.pokeType) {
+          return false;
+        }
+      } else if (a.kind === "reply") {
+        if (a.msgId !== "0" && b.msgId !== "0") {
+          if (a.msgId !== b.msgId) return false;
+        } else if (a.msgSeq !== "0" && b.msgSeq !== "0" && a.msgSeq !== b.msgSeq) {
+          return false;
+        }
+      } else if (a.kind === "ark") {
+        if (a.data !== b.data) return false;
+      } else if (a.kind === "mface") {
+        if (a.emojiId !== b.emojiId) return false;
+      }
+    }
+    return true;
   }
 
   _sendPeerKey(peer) {
@@ -2775,7 +2894,7 @@ class NtqqOneBotBridge extends EventEmitter {
     if (!queue || queue.length === 0) return false;
     const sig = NtqqOneBotBridge._ntElementsSignature(ntMsg.elements);
     const waiter = queue.find(
-      (w) => !w.done && !w.echo && !(w.sig.text && sig.text && w.sig.text !== sig.text)
+      (w) => !w.done && !w.echo && NtqqOneBotBridge._elementsSignatureMatch(w.sig, sig)
     );
     if (!waiter) return false;
     waiter.echo = {
@@ -2907,7 +3026,9 @@ class NtqqOneBotBridge extends EventEmitter {
         [peer, targetUid || String(targetUin)]
       );
       return;
-    } catch (_) {}
+    } catch (err) {
+      if (!isBridgeUnavailableError(err)) throw err;
+    }
 
     // 2. Fallback: legacy `sendPoke` if bridged by a custom adapter
     try {
@@ -2926,7 +3047,9 @@ class NtqqOneBotBridge extends EventEmitter {
         targetUid: targetUid || String(targetUin),
       });
       return;
-    } catch (_) {}
+    } catch (err) {
+      if (!isBridgeUnavailableError(err)) throw err;
+    }
 
     // 3. Final fallback: sendMsg poke faceElement
     if (targetUin > 0 && peer && peer.peerUid) {
@@ -2955,8 +3078,10 @@ class NtqqOneBotBridge extends EventEmitter {
           msgAttributeInfos: new Map(),
         },
         ["0", peer, pokeElements, new Map()]
-      ).catch(() => {});
+      );
+      return;
     }
+    throw makeBridgeUnavailableError("NTQQ service unavailable for sendNudge/sendPoke");
   }
 
   async _fetchClientKey() {
@@ -5335,21 +5460,51 @@ class NtqqOneBotBridge extends EventEmitter {
             return;
           }
           const chunks = [];
+          req.on("error", () => {});
+          res.on("error", () => {});
           req.on("data", (c) => chunks.push(c));
           req.on("end", async () => {
-            let params = {};
             try {
-              const rawStr = Buffer.concat(chunks).toString("utf8").trim();
-              if (rawStr) params = JSON.parse(rawStr);
-            } catch (_) {}
-            for (const [k, v] of u.searchParams.entries()) {
-              if (!(k in params)) params[k] = v;
+              let params = {};
+              try {
+                const rawStr = Buffer.concat(chunks).toString("utf8").trim();
+                if (rawStr) {
+                  const parsed = JSON.parse(rawStr);
+                  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    params = parsed;
+                  }
+                }
+              } catch (_) {}
+              for (const [k, v] of u.searchParams.entries()) {
+                if (!(k in params)) params[k] = v;
+              }
+              const act = actionName || String(params.action || "");
+              const actParams =
+                params.params !== undefined
+                  ? params.params && typeof params.params === "object" && !Array.isArray(params.params)
+                    ? params.params
+                    : {}
+                  : params;
+              const reply = await this.handleOneBotAction(act, actParams, params.echo);
+              if (!res.writableEnded) {
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+                res.end(JSON.stringify(reply));
+              }
+            } catch (err) {
+              if (!res.writableEnded) {
+                const msg = err && err.message ? err.message : String(err);
+                res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+                res.end(
+                  JSON.stringify({
+                    status: "failed",
+                    retcode: 1400,
+                    data: null,
+                    message: msg,
+                    wording: msg,
+                  })
+                );
+              }
             }
-            const act = actionName || String(params.action || "");
-            const actParams = params.params && typeof params.params === "object" ? params.params : params;
-            const reply = await this.handleOneBotAction(act, actParams, params.echo);
-            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-            res.end(JSON.stringify(reply));
           });
         });
         srv.on("error", () => resolve());
@@ -5368,6 +5523,7 @@ class NtqqOneBotBridge extends EventEmitter {
           res.end("Upgrade Required");
         });
         srv.on("upgrade", (req, socket, head) => {
+          socket.on("error", () => {});
           if (!this._checkAuth(req, wsCfg.accessToken)) {
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
             socket.destroy();
@@ -5396,6 +5552,16 @@ class NtqqOneBotBridge extends EventEmitter {
           conn.reportSelfMessage = Boolean(wsCfg.reportSelfMessage);
           this._wsServerClients.add(conn);
 
+          conn.on("error", () => {
+            this._wsServerClients.delete(conn);
+            try {
+              socket.destroy();
+            } catch (_) {}
+          });
+          conn.on("close", () => {
+            this._wsServerClients.delete(conn);
+          });
+
           conn.sendJson(
             formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
           );
@@ -5403,18 +5569,19 @@ class NtqqOneBotBridge extends EventEmitter {
           conn.on("message", async (text) => {
             try {
               const payload = JSON.parse(text);
-              if (payload && payload.action) {
+              if (payload && typeof payload === "object" && !Array.isArray(payload) && payload.action) {
+                const actParams =
+                  payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
+                    ? payload.params
+                    : {};
                 const reply = await this.handleOneBotAction(
                   payload.action,
-                  payload.params || {},
+                  actParams,
                   payload.echo
                 );
                 conn.sendJson(reply);
               }
             } catch (_) {}
-          });
-          conn.on("close", () => {
-            this._wsServerClients.delete(conn);
           });
           if (head && head.length > 0) {
             conn._onData(head);
@@ -5497,10 +5664,14 @@ class NtqqOneBotBridge extends EventEmitter {
         async (text, conn) => {
           try {
             const payload = JSON.parse(text);
-            if (payload && payload.action) {
+            if (payload && typeof payload === "object" && !Array.isArray(payload) && payload.action) {
+              const actParams =
+                payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
+                  ? payload.params
+                  : {};
               const reply = await this.handleOneBotAction(
                 payload.action,
-                payload.params || {},
+                actParams,
                 payload.echo
               );
               conn.sendJson(reply);
