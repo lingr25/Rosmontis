@@ -51,14 +51,15 @@
 
 ## 2. Rosmontis 核心架构
 
-Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目仅由 4 个零外部依赖的纯 JavaScript 模块组成：
+Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个入口模块与 `src/core/` 下的 7 个零外部依赖纯 JavaScript 子模块组成：
 
 | 模块 | 职责 |
 | :--- | :--- |
 | `src/app_launcher_index.js` | 纯 JS 引导包装器：在 `major.node` 启动前初始化 `bridge_main.js`，支持 `ROSMONTIS_DISABLE=1` 一键旁路 |
-| `src/bridge_renderer.js` | 渲染层桥接器：挂载 `window.__ROSMONTIS_RENDERER_BRIDGE__`，构造原生 `RM_IPCFROM_RENDERER{windowId}` 帧并驱动会话因果状态机 |
+| `src/bridge_renderer.js` | 渲染层受信任桥接器：闭包隔离 `__ipcToken` 鉴权，监听结构化 `__ROSMONTIS_BRIDGE_CMD__` 指令通道，构造原生 `RM_IPCFROM_RENDERER{windowId}` 帧并驱动会话因果状态机 |
 | `src/bridge_main.js` | 主进程协调器：无痕捕获运行时引用后自动归还原生原型链，实现 65+ OneBot v11 动作与 HTTP / 正向 WS / 反向 WS 服务 |
-| `src/bridge_onebot.js` | 协议核心库：零依赖 RFC 6455 WebSocket 帧编解码、CQ 码/消息段双向转换、LRU 消息短 ID 映射与 UIN/UID 双向索引 |
+| `src/bridge_onebot.js` | 协议编解码库：CQ 码/消息段双向转换、富媒体元素组装、LRU 消息短 ID 映射与 UIN/UID 双向索引 |
+| `src/core/*` | 零依赖核心子模块：`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`session_scheduler`（会话亲和互斥锁与切换冷却）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
 
 ### 2.1 渲染层官方 IPC 帧协议与 Map 跨进程还原
 
@@ -87,17 +88,16 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 **防重复发送保护（Side-Effect Replay Guard）**：
 对于 `sendMsg`、`recallMsg`、转发、戳一戳、表情回应、群管理等有外部副作用的命令（`SIDE_EFFECT_NT_METHODS`），只有当上一级**根本未派发**（如渲染窗口尚未就绪，携带 `ROSMONTIS_BRIDGE_UNAVAILABLE` 标记）时才允许回退到下一级；一旦某级已派发请求，任何超时或业务错误均直接返回调用方，**绝不在下一级重放**，彻底杜绝大图慢速上传时的重复刷屏。
 
-### 2.4 会话因果状态机与两阶段并发互斥（Human Session Simulation）
+### 2.4 会话因果状态机与会话亲和并发调度（CausalSessionScheduler）
 
-出站发消息采用**两阶段解耦**管线：第一阶段在锁外并发完成富媒体下载、图片尺寸嗅探与 EXIF 清理；第二阶段经 `_aioMutex` 串行化包裹“会话激活 + `sendMsg` IPC 派发”，IPC 返回即释放互斥锁并在锁外等待 `onAddSendMsg` 真实回显（富媒体动态延长回显超时），彻底消除多群并发互踢（AIO Thrashing）。
+出站发消息采用**两阶段解耦**管线：第一阶段在锁外并发完成富媒体流式下载、图片尺寸嗅探与 EXIF 清理；第二阶段经 `CausalSessionScheduler`（同会话亲和互斥队列 + `maxAffinityStreak` 防饥饿上限 + `aioSwitchCooldownMs` 高频切换冷却）串行化包裹“会话激活 + `sendMsg` IPC 派发”，IPC 返回即释放互斥锁并在锁外等待 `onAddSendMsg` 真实回显（富媒体动态延长回显超时），消除多群并发来回乒乓切窗（AIO Thrashing）。
 
-在激活会话或展示输入状态时，主进程维护唯一权威状态并同步驱动渲染层 `simulateHumanSessionFlow` 严格按真实客户端因果顺序执行：
+私聊与群聊严格遵循真实人类时间轴（**收到消息 -> 已读 -> 正在输入 -> 模型生成 -> 发送（或不发送）**）：
 
 1. 窗口获焦：`setFocusOnBase({ isFocus: true })`（窗口已获焦时不重复发送）
 2. 切换目标会话：若原驻留其他会话则先 `enterOrExitAio(prev, enterType: 2)`，再执行 `addActiveChatByUid` -> `enterOrExitAio(target, enterType: 1)`
-3. 标记会话已读：`setMsgRead`
-4. 展示“正在输入…”（私聊场景）：`sendShowInputStatusReq`
-5. 执行发送与两级空闲退场：默认无交互 45 秒后自动持锁发送 `enterOrExitAio(active, enterType: 2)` 退回会话列表，5 分钟无交互后自动发送 `setFocusOnBase({ isFocus: false })` 切入后台失焦
+3. 已读与输入态（`set_input_status` 或可选 `autoReadAndTypeOnPrivateRecv` 触发）：先调用 `setMsgRead` 消红点，再调用 `sendShowInputStatusReq` 展示“对方正在输入…”（模型最终决定不回复亦完全自然）
+4. 发送与两级空闲退场：`send_msg` 阶段若已在目标会话则直接派发 `sendMsg`（不再瞬时补发 0ms 输入态）；默认无交互 45 秒后自动持锁发送 `enterOrExitAio(active, enterType: 2)` 退回会话列表，5 分钟无交互后自动发送 `setFocusOnBase({ isFocus: false })` 切入后台失焦
 
 ### 2.5 真实回显 `msgId` 关联与 NTv2 富媒体闭环
 

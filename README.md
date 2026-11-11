@@ -134,8 +134,9 @@ Rosmontis 支持**零配置开箱即用**、**环境变量配置**与 **JSON 配
 | `ROSMONTIS_HTTP_PORT` / `ONEBOT_HTTP_PORT` | `3000` | OneBot v11 HTTP API 监听端口 |
 | `ROSMONTIS_WS_PORT` / `ONEBOT_WS_PORT` | `3001` | OneBot v11 正向 WebSocket 监听端口 |
 | `ROSMONTIS_REVERSE_WS_URL` / `ONEBOT_REVERSE_WS_URL` | *(空)* | 反向 WebSocket 目标地址（如 `ws://127.0.0.1:8080/onebot/v11/ws`） |
-| `ROSMONTIS_ACCESS_TOKEN` / `ONEBOT_ACCESS_TOKEN` | *(空)* | Bearer 鉴权 Token（同时作用于 HTTP、正向 WS 与反向 WS） |
-| `ROSMONTIS_HOST` / `ONEBOT_HOST` | `0.0.0.0` | HTTP / 正向 WS 绑定地址 |
+| `ROSMONTIS_ACCESS_TOKEN` / `ONEBOT_ACCESS_TOKEN` | *(非回环自动生成)* | Bearer 鉴权 Token（绑定非回环地址且留空时，Protected Mode 自动生成 256-bit 随机 Token 并输出至日志） |
+| `ROSMONTIS_HOST` / `ONEBOT_HOST` | `0.0.0.0` | HTTP / 正向 WS 绑定地址（宿主机单机部署推荐 `127.0.0.1`） |
+| `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API` | `0` | 设为 `1` 时显式开启 `get_cookies` / `get_clientkey` / QZone 等高敏凭据接口（默认关闭） |
 | `ROSMONTIS_CONFIG_DIR` | `/app/data/config` | 配置文件搜索目录（详见 [`config/rosmontis.example.json`](./config/rosmontis.example.json)） |
 | `ROSMONTIS_DISABLE` | `0` | 设为 `1` 时一键跳过桥接器加载，原样启动官方 QQ |
 
@@ -149,13 +150,13 @@ Rosmontis 支持**零配置开箱即用**、**环境变量配置**与 **JSON 配
 - **好友与群组信息**：`get_friend_list`, `get_stranger_info`, `send_like`, `delete_friend`, `get_group_list`, `get_group_info`, `get_group_member_info`, `get_group_member_list`, `get_group_honor_info`, `get_group_at_all_remain`, `get_group_shut_list`
 - **群务管理与申请处理**：`set_group_ban`, `set_group_whole_ban`, `set_group_kick`, `set_group_leave`, `set_group_name`, `set_group_card`, `set_group_special_title`, `set_group_admin`, `_send_group_notice`, `_get_group_notice`, `set_essence_msg`, `delete_essence_msg`, `get_essence_msg_list`, `get_group_system_msg`, `get_doubt_friends_add_request`, `set_group_add_request`, `set_friend_add_request`, `set_doubt_friends_add_request`
 - **群文件与私聊文件**：`get_group_root_files`, `get_group_files_by_folder`, `get_group_file_system_info`, `get_group_file_url`, `get_private_file_url`, `upload_group_file`, `upload_private_file`, `create_group_file_folder`, `delete_group_file`, `delete_group_folder`, `move_group_file`
-- **Web 凭据与空间扩展**：`get_cookies`, `get_csrf_token`, `get_credentials`, `send_qzone_msg`, `delete_qzone_msg`, `like_qzone`, `comment_qzone`
+- **Web 凭据与空间扩展（默认关闭，需显式开启 `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API=1`）**：`get_cookies`, `get_csrf_token`, `get_credentials`, `get_clientkey`, `send_qzone_msg`, `delete_qzone_msg`, `like_qzone`, `comment_qzone`
 
 ---
 
 ## 开发与测试
 
-本项目包含完整的协议契约测试与模拟 Electron 渲染窗口/主进程的端到端测试套件（23 组测试，零外部依赖）：
+本项目包含完整的协议契约、安全边界与模拟 Electron 渲染窗口/主进程的端到端测试套件（33 组测试，零外部依赖）：
 
 ```bash
 npm test
