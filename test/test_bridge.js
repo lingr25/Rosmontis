@@ -2588,7 +2588,7 @@ async function runTests() {
       });
       await new Promise((resolve) => slowImgServer.listen(0, "127.0.0.1", resolve));
       const slowPort = slowImgServer.address().port;
-      const { bridge, ipcCalls } = createCausalTestHarness();
+      const { bridge, ipcCalls } = createCausalTestHarness({ allowPrivateUrls: true });
 
       try {
         // Group A starts sending a slow remote image (120ms HTTP download)
