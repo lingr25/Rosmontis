@@ -605,6 +605,7 @@ async function runTests() {
         humanSimulation: false,
         allowExternalHttp: false,
         allowPtloginJump: false,
+        enableWebCredentialApi: true,
       },
     });
 
@@ -900,6 +901,25 @@ async function runTests() {
       }
     }
 
+    // Verify get_cookies fails cleanly with status === "failed" & retcode === 1403 when enableWebCredentialApi is omitted or false
+    for (const cfgOverride of [{}, { enableWebCredentialApi: false }]) {
+      const gatedBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_rosmontis_self",
+        ntApi: fakeNtApi,
+        config: {
+          selfUin: "100010001",
+          httpServers: [],
+          wsServers: [],
+          wsClients: [],
+          ...cfgOverride,
+        },
+      });
+      const gatedResp = await gatedBridge.handleOneBotAction("get_cookies", { domain: "qun.qq.com" });
+      assert.strictEqual(gatedResp.status, "failed");
+      assert.strictEqual(gatedResp.retcode, 1403);
+    }
+
     // Confirm send_poke invoked real sendNudge
     assert.ok(
       calledNtApis.some((c) => c.cmd === "nodeIKernelMsgService/sendNudge"),
@@ -1103,7 +1123,7 @@ async function runTests() {
     assert.strictEqual(forwardedEvents.length, 1, "Incoming event must be forwarded exactly once");
   });
 
-  await check("set_input_status activates AIO before sendShowInputStatusReq and coordinates with subsequent send_private_msg deduplication", async () => {
+  await check("set_input_status marks read before sendShowInputStatusReq and send_private_msg/send_msg skips 0ms sendShowInputStatusReq", async () => {
     const callOrder = [];
     const controller = new mainMod.NtqqOneBotBridge({
       selfUin: "100010001",
@@ -1118,6 +1138,7 @@ async function runTests() {
       },
     });
     controller.uinUidStore.record("100020002", "u_uid_100020002");
+    controller.uinUidStore.record("100030003", "u_uid_100030003");
 
     controller.capturedServices.ntApi = new Proxy(
       {},
@@ -1132,46 +1153,65 @@ async function runTests() {
       }
     );
 
-    // 1. Trigger set_input_status (event_type: 1)
-    const statusResp = await controller.handleOneBotAction("set_input_status", {
-      user_id: 100020002,
-      event_type: 1,
-    });
-    assert.strictEqual(statusResp.status, "ok");
+    try {
+      // 1. Trigger set_input_status (event_type: 1): setFocusOnBase -> addActiveChatByUid -> enterOrExitAio(1) -> setMsgRead -> sendShowInputStatusReq
+      const statusResp = await controller.handleOneBotAction("set_input_status", {
+        user_id: 100020002,
+        event_type: 1,
+      });
+      assert.strictEqual(statusResp.status, "ok");
 
-    const cmdsAfterTyping = callOrder.map((c) => c.cmd);
-    const enterIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/enterOrExitAio");
-    const activeIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/addActiveChatByUid");
-    const focusIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/setFocusOnBase");
-    const typingIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/sendShowInputStatusReq");
-    assert.ok(focusIdx >= 0 && focusIdx < activeIdx, "setFocusOnBase must precede addActiveChatByUid");
-    assert.ok(activeIdx >= 0 && activeIdx < enterIdx, "addActiveChatByUid must precede enterOrExitAio");
-    assert.ok(enterIdx >= 0 && enterIdx < typingIdx, "enterOrExitAio must precede sendShowInputStatusReq");
-    assert.strictEqual(
-      cmdsAfterTyping.includes("nodeIKernelMsgService/setMsgRead"),
-      false,
-      "set_input_status alone should not mark read"
-    );
+      const cmdsAfterTyping = callOrder.map((c) => c.cmd);
+      const focusIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/setFocusOnBase");
+      const activeIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/addActiveChatByUid");
+      const enterIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/enterOrExitAio");
+      const readIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/setMsgRead");
+      const typingIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/sendShowInputStatusReq");
+      assert.ok(focusIdx >= 0 && focusIdx < activeIdx, "setFocusOnBase must precede addActiveChatByUid");
+      assert.ok(activeIdx >= 0 && activeIdx < enterIdx, "addActiveChatByUid must precede enterOrExitAio");
+      assert.ok(enterIdx >= 0 && enterIdx < readIdx, "enterOrExitAio must precede setMsgRead");
+      assert.ok(readIdx >= 0 && readIdx < typingIdx, "setMsgRead must precede sendShowInputStatusReq");
 
-    // 2. Immediately send_private_msg -> setMsgRead MUST still execute, while sendShowInputStatusReq is deduplicated!
-    callOrder.length = 0;
-    const sendResp = await controller.handleOneBotAction("send_private_msg", {
-      user_id: 100020002,
-      message: "你好博士",
-    });
-    assert.strictEqual(sendResp.status, "ok");
+      // 2. Immediately send_private_msg -> already in AIO & read deduplicated, NO 0ms sendShowInputStatusReq before sendMsg!
+      callOrder.length = 0;
+      const sendResp = await controller.handleOneBotAction("send_private_msg", {
+        user_id: 100020002,
+        message: "你好博士",
+      });
+      assert.strictEqual(sendResp.status, "ok");
 
-    const cmdsAfterSend = callOrder.map((c) => c.cmd);
-    assert.ok(
-      cmdsAfterSend.includes("nodeIKernelMsgService/setMsgRead"),
-      "setMsgRead must still run on send_private_msg after set_input_status"
-    );
-    assert.strictEqual(
-      cmdsAfterSend.includes("nodeIKernelMsgService/sendShowInputStatusReq"),
-      false,
-      "sendShowInputStatusReq must be deduplicated within the 5s window"
-    );
-    assert.ok(cmdsAfterSend.includes("nodeIKernelMsgService/sendMsg"));
+      const cmdsAfterSend = callOrder.map((c) => c.cmd);
+      assert.strictEqual(
+        cmdsAfterSend.includes("nodeIKernelMsgService/setMsgRead"),
+        false,
+        "setMsgRead must be deduplicated within the 5s window after set_input_status already marked read"
+      );
+      assert.strictEqual(
+        cmdsAfterSend.includes("nodeIKernelMsgService/sendShowInputStatusReq"),
+        false,
+        "send_private_msg must NOT emit a 0ms sendShowInputStatusReq right before sendMsg"
+      );
+      assert.deepStrictEqual(cmdsAfterSend, ["nodeIKernelMsgService/sendMsg"]);
+
+      // 3. Direct send_msg to a fresh private peer activates AIO + marks read WITHOUT 0ms sendShowInputStatusReq
+      callOrder.length = 0;
+      const directMsgResp = await controller.handleOneBotAction("send_msg", {
+        message_type: "private",
+        user_id: 100030003,
+        message: "直接回复",
+      });
+      assert.strictEqual(directMsgResp.status, "ok");
+      const cmdsDirect = callOrder.map((c) => c.cmd);
+      assert.deepStrictEqual(cmdsDirect, [
+        "nodeIKernelMsgService/enterOrExitAio",
+        "nodeIKernelMsgService/addActiveChatByUid",
+        "nodeIKernelMsgService/enterOrExitAio",
+        "nodeIKernelMsgService/setMsgRead",
+        "nodeIKernelMsgService/sendMsg",
+      ]);
+    } finally {
+      await controller.stopServers();
+    }
   });
 
   await check("mark_msg_as_read & mark_group_msg_as_read resolve group/private peers even when message_id is absent from MessageIdStore", async () => {
@@ -2502,10 +2542,9 @@ async function runTests() {
             "nodeIKernelMsgService/addActiveChatByUid",
             "nodeIKernelMsgService/enterOrExitAio",
             "nodeIKernelMsgService/setMsgRead",
-            "nodeIKernelMsgService/sendShowInputStatusReq",
             "nodeIKernelMsgService/sendMsg",
           ],
-          "First private session entry must strictly follow setFocusOnBase(true) -> addActiveChatByUid -> enterOrExitAio(1) -> setMsgRead -> sendShowInputStatusReq -> sendMsg"
+          "Direct send_private_msg must strictly follow setFocusOnBase(true) -> addActiveChatByUid -> enterOrExitAio(1) -> setMsgRead -> sendMsg without a 0ms sendShowInputStatusReq"
         );
         assert.deepStrictEqual(ipcCalls[0].payload, { isFocus: true });
         assert.strictEqual(ipcCalls[2].payload.info.enterType, 1);
@@ -2938,10 +2977,1320 @@ async function runTests() {
     }
   });
 
+  console.log("=== 15. Testing Transport, Auth, Origin Guard, Protected Mode, Body Cap & RFC 6455 WS Hardening ===");
+  await check("Constant-time token auth (Bearer/Token/raw/query & allowQueryAccessToken: false), Origin guard, Protected Mode auto-token, HTTP 413 body cap, and RFC 6455 WS hardening", async () => {
+    const transportSec = require("../src/core/transport_security.js");
+
+    // 1. Unit-level constant-time token verification
+    assert.strictEqual(transportSec.verifyAccessTokenConstantTime("", ""), true);
+    assert.strictEqual(transportSec.verifyAccessTokenConstantTime("", "secret"), false);
+    assert.strictEqual(transportSec.verifyAccessTokenConstantTime(null, "secret"), false);
+    assert.strictEqual(transportSec.verifyAccessTokenConstantTime("short", "much_longer_secret_token"), false);
+    assert.strictEqual(transportSec.verifyAccessTokenConstantTime("exact_secret_123", "exact_secret_123"), true);
+
+    const httpRequestRaw = ({ port, urlPath = "/get_status", method = "POST", headers = {}, body = "{}" }) =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port,
+            path: urlPath,
+            method,
+            headers: {
+              "Content-Type": "application/json",
+              ...headers,
+            },
+          },
+          (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () => {
+              const rawText = Buffer.concat(chunks).toString("utf8");
+              let json = null;
+              try {
+                json = JSON.parse(rawText);
+              } catch (_) {}
+              resolve({ statusCode: res.statusCode, json, rawText });
+            });
+          }
+        );
+        req.on("error", reject);
+        req.end(body);
+      });
+
+    // 2. HTTP token formats (Bearer, Token, raw header, query param) + Origin guard + 413 body cap + WS hardening
+    {
+      const secBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_self",
+        online: true,
+        config: {
+          allowedOrigins: ["https://admin.rosmontis.local"],
+          maxHttpBodyBytes: 1024,
+          maxWsPayloadBytes: 256,
+          httpServers: [{ host: "127.0.0.1", port: 0, accessToken: "s3cr3t_t0k3n" }],
+          wsServers: [{ host: "127.0.0.1", port: 0, accessToken: "s3cr3t_t0k3n" }],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+        },
+      });
+      await secBridge.startServers();
+      try {
+        const httpPort = secBridge._httpServers[0].address().port;
+        const wsPort = secBridge._wsServers[0].address().port;
+
+        // Missing / wrong token -> 401
+        const rNoAuth = await httpRequestRaw({ port: httpPort });
+        assert.strictEqual(rNoAuth.statusCode, 401);
+        assert.strictEqual(rNoAuth.json.status, "failed");
+        assert.strictEqual(rNoAuth.json.retcode, 1403);
+
+        const rBadAuth = await httpRequestRaw({
+          port: httpPort,
+          headers: { Authorization: "Bearer wrong_token" },
+        });
+        assert.strictEqual(rBadAuth.statusCode, 401);
+
+        // Bearer, Token, raw header, and ?access_token= query param -> 200
+        const rBearer = await httpRequestRaw({
+          port: httpPort,
+          headers: { Authorization: "Bearer s3cr3t_t0k3n" },
+        });
+        assert.strictEqual(rBearer.statusCode, 200);
+        assert.strictEqual(rBearer.json.status, "ok");
+
+        const rTokenScheme = await httpRequestRaw({
+          port: httpPort,
+          headers: { Authorization: "Token s3cr3t_t0k3n" },
+        });
+        assert.strictEqual(rTokenScheme.statusCode, 200);
+        assert.strictEqual(rTokenScheme.json.status, "ok");
+
+        const rRawHdr = await httpRequestRaw({
+          port: httpPort,
+          headers: { Authorization: "s3cr3t_t0k3n" },
+        });
+        assert.strictEqual(rRawHdr.statusCode, 200);
+        assert.strictEqual(rRawHdr.json.status, "ok");
+
+        const rQuery = await httpRequestRaw({
+          port: httpPort,
+          urlPath: "/get_status?access_token=s3cr3t_t0k3n",
+        });
+        assert.strictEqual(rQuery.statusCode, 200);
+        assert.strictEqual(rQuery.json.status, "ok");
+
+        // Origin guard on HTTP POST: no Origin -> 200; evil.example or null -> 403; allowedOrigins -> 200
+        const rEvilOrigin = await httpRequestRaw({
+          port: httpPort,
+          headers: {
+            Authorization: "Bearer s3cr3t_t0k3n",
+            Origin: "http://evil.example",
+          },
+        });
+        assert.strictEqual(rEvilOrigin.statusCode, 403);
+        assert.strictEqual(rEvilOrigin.json.status, "failed");
+        assert.strictEqual(rEvilOrigin.json.retcode, 1403);
+
+        const rNullOrigin = await httpRequestRaw({
+          port: httpPort,
+          headers: {
+            Authorization: "Bearer s3cr3t_t0k3n",
+            Origin: "null",
+          },
+        });
+        assert.strictEqual(rNullOrigin.statusCode, 403);
+        assert.strictEqual(rNullOrigin.json.status, "failed");
+        assert.strictEqual(rNullOrigin.json.retcode, 1403);
+
+        const rAllowedOrigin = await httpRequestRaw({
+          port: httpPort,
+          headers: {
+            Authorization: "Bearer s3cr3t_t0k3n",
+            Origin: "https://ADMIN.rosmontis.local",
+          },
+        });
+        assert.strictEqual(rAllowedOrigin.statusCode, 200);
+        assert.strictEqual(rAllowedOrigin.json.status, "ok");
+
+        // HTTP JSON body size cap: maxHttpBodyBytes: 1024 rejects 4096-byte payload with 413 (retcode 1413)
+        const bigBody = JSON.stringify({ padding: "x".repeat(4096) });
+        const rTooLarge = await httpRequestRaw({
+          port: httpPort,
+          headers: { Authorization: "Bearer s3cr3t_t0k3n" },
+          body: bigBody,
+        });
+        assert.strictEqual(rTooLarge.statusCode, 413);
+        assert.strictEqual(rTooLarge.json.status, "failed");
+        assert.strictEqual(rTooLarge.json.retcode, 1413);
+
+        // Also test streaming chunked body without Content-Length exceeding 1024 bytes -> 413
+        const rChunkedTooLarge = await new Promise((resolve, reject) => {
+          const req = http.request(
+            {
+              hostname: "127.0.0.1",
+              port: httpPort,
+              path: "/get_status",
+              method: "POST",
+              headers: {
+                Authorization: "Bearer s3cr3t_t0k3n",
+                "Content-Type": "application/json",
+                "Transfer-Encoding": "chunked",
+              },
+            },
+            (res) => {
+              const bufs = [];
+              res.on("data", (c) => bufs.push(c));
+              res.on("end", () => {
+                resolve({
+                  statusCode: res.statusCode,
+                  json: JSON.parse(Buffer.concat(bufs).toString("utf8")),
+                });
+              });
+            }
+          );
+          req.on("error", reject);
+          req.write('{"pad":"' + "a".repeat(600));
+          req.write("b".repeat(600) + '"}');
+          req.end();
+        });
+        assert.strictEqual(rChunkedTooLarge.statusCode, 413);
+        assert.strictEqual(rChunkedTooLarge.json.retcode, 1413);
+
+        // WS upgrade with untrusted Origin receives HTTP/1.1 403 Forbidden
+        const wsForbiddenResp = await new Promise((resolve, reject) => {
+          const sock = net.connect(wsPort, "127.0.0.1");
+          let raw = "";
+          sock.on("connect", () => {
+            const secKey = crypto.randomBytes(16).toString("base64");
+            sock.write(
+              [
+                "GET / HTTP/1.1",
+                `Host: 127.0.0.1:${wsPort}`,
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                "Authorization: Bearer s3cr3t_t0k3n",
+                "Origin: http://evil.example",
+                `Sec-WebSocket-Key: ${secKey}`,
+                "Sec-WebSocket-Version: 13",
+                "",
+                "",
+              ].join("\r\n")
+            );
+          });
+          sock.on("data", (c) => {
+            raw += c.toString("utf8");
+          });
+          sock.on("close", () => resolve(raw));
+          sock.on("error", reject);
+        });
+        assert.ok(
+          wsForbiddenResp.startsWith("HTTP/1.1 403 Forbidden"),
+          `Expected WS 403 Forbidden on untrusted Origin, got: ${wsForbiddenResp}`
+        );
+
+        // Helper to upgrade a raw WS client and observe protocol close code
+        const openRawUpgradedWs = () =>
+          new Promise((resolve, reject) => {
+            const sock = net.connect(wsPort, "127.0.0.1");
+            let buf = Buffer.alloc(0);
+            let upgraded = false;
+            const onData = (chunk) => {
+              if (upgraded) return;
+              buf = Buffer.concat([buf, chunk]);
+              const sep = buf.indexOf("\r\n\r\n");
+              if (sep === -1) return;
+              const headerText = buf.subarray(0, sep).toString("utf8");
+              const rest = buf.subarray(sep + 4);
+              upgraded = true;
+              sock.removeListener("data", onData);
+              assert.ok(headerText.includes("101 Switching Protocols"));
+              const clientConn = new mainMod.Rfc6455Connection(sock, { isClient: true });
+              if (rest.length > 0) clientConn._onData(rest);
+              resolve({ sock, clientConn });
+            };
+            sock.on("data", onData);
+            sock.on("connect", () => {
+              const secKey = crypto.randomBytes(16).toString("base64");
+              sock.write(
+                [
+                  "GET / HTTP/1.1",
+                  `Host: 127.0.0.1:${wsPort}`,
+                  "Upgrade: websocket",
+                  "Connection: Upgrade",
+                  "Authorization: Bearer s3cr3t_t0k3n",
+                  "Origin: https://admin.rosmontis.local",
+                  `Sec-WebSocket-Key: ${secKey}`,
+                  "Sec-WebSocket-Version: 13",
+                  "",
+                  "",
+                ].join("\r\n")
+              );
+            });
+            sock.on("error", reject);
+          });
+
+        // RFC 6455 hardening (a): Unmasked client-to-server frame triggers Close 1002
+        {
+          const { sock, clientConn } = await openRawUpgradedWs();
+          const closePromise = new Promise((resolve) => {
+            clientConn.once("close", (code, reason) => resolve({ code, reason }));
+          });
+          // Send UNMASKED frame (mask = false) from client to server
+          sock.write(mainMod.encodeWsFrame(0x1, Buffer.from('{"action":"get_status"}'), false));
+          const closeInfo = await closePromise;
+          assert.strictEqual(closeInfo.code, 1002, `Expected Close 1002 for unmasked frame, got ${closeInfo.code}`);
+          sock.destroy();
+        }
+
+        // RFC 6455 hardening (b): Oversized WS frame (> maxWsPayloadBytes = 256) triggers Close 1009 immediately
+        {
+          const { sock, clientConn } = await openRawUpgradedWs();
+          const closePromise = new Promise((resolve) => {
+            clientConn.once("close", (code, reason) => resolve({ code, reason }));
+          });
+          // Send masked 1024-byte frame exceeding 256-byte limit
+          sock.write(mainMod.encodeWsFrame(0x1, Buffer.alloc(1024, 0x41), true));
+          const closeInfo = await closePromise;
+          assert.strictEqual(closeInfo.code, 1009, `Expected Close 1009 for oversized frame, got ${closeInfo.code}`);
+          sock.destroy();
+        }
+      } finally {
+        await secBridge.stopServers();
+      }
+    }
+
+    // 3. allowQueryAccessToken: false rejects ?access_token= query tokens while allowing Authorization header
+    {
+      const noQueryBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_self",
+        online: true,
+        config: {
+          allowQueryAccessToken: false,
+          httpServers: [{ host: "127.0.0.1", port: 0, accessToken: "hdr_only_tok" }],
+          wsServers: [],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+        },
+      });
+      await noQueryBridge.startServers();
+      try {
+        const port = noQueryBridge._httpServers[0].address().port;
+        const rQueryBlocked = await httpRequestRaw({
+          port,
+          urlPath: "/get_status?access_token=hdr_only_tok",
+        });
+        assert.strictEqual(rQueryBlocked.statusCode, 401);
+        assert.strictEqual(rQueryBlocked.json.retcode, 1403);
+
+        const rHdrAllowed = await httpRequestRaw({
+          port,
+          headers: { Authorization: "Bearer hdr_only_tok" },
+        });
+        assert.strictEqual(rHdrAllowed.statusCode, 200);
+        assert.strictEqual(rHdrAllowed.json.status, "ok");
+      } finally {
+        await noQueryBridge.stopServers();
+      }
+    }
+
+    // 4. Protected Mode auto-token: 127.0.0.1 stays unauthenticated; 0.0.0.0 auto-generates 64-hex token
+    {
+      const savedPubEnv = {
+        a: process.env.ROSMONTIS_ALLOW_UNAUTHENTICATED_PUBLIC,
+        b: process.env.ONEBOT_ALLOW_UNAUTHENTICATED_PUBLIC,
+        c: process.env.XIAO_BRIDGE_ALLOW_UNAUTHENTICATED_PUBLIC,
+      };
+      delete process.env.ROSMONTIS_ALLOW_UNAUTHENTICATED_PUBLIC;
+      delete process.env.ONEBOT_ALLOW_UNAUTHENTICATED_PUBLIC;
+      delete process.env.XIAO_BRIDGE_ALLOW_UNAUTHENTICATED_PUBLIC;
+
+      const loopbackBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        online: true,
+        config: {
+          httpServers: [{ host: "127.0.0.1", port: 0, accessToken: "" }],
+          wsServers: [{ host: "127.0.0.1", port: 0, accessToken: "" }],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+        },
+      });
+      const publicBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        online: true,
+        config: {
+          httpServers: [{ host: "0.0.0.0", port: 0, accessToken: "" }],
+          wsServers: [{ host: "0.0.0.0", port: 0, accessToken: "" }],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+        },
+      });
+      // Silence stderr warning during intentional Protected Mode test
+      const origStderrWrite = process.stderr.write;
+      const capturedWarnings = [];
+      process.stderr.write = function (chunk, ...rest) {
+        const s = String(chunk || "");
+        if (s.includes("Protected Mode engaged")) {
+          capturedWarnings.push(s);
+          return true;
+        }
+        return origStderrWrite.call(process.stderr, chunk, ...rest);
+      };
+      try {
+        await loopbackBridge.startServers();
+        assert.strictEqual(loopbackBridge.config.httpServers[0].accessToken, "");
+        assert.strictEqual(Boolean(loopbackBridge.config.httpServers[0].protectedModeAutoToken), false);
+        const loopPort = loopbackBridge._httpServers[0].address().port;
+        const rLoop = await httpRequestRaw({ port: loopPort });
+        assert.strictEqual(rLoop.statusCode, 200);
+
+        await publicBridge.startServers();
+        const generatedToken = publicBridge.config.httpServers[0].accessToken;
+        assert.match(generatedToken, /^[0-9a-f]{64}$/, "Expected 64-hex-char Protected Mode auto-token");
+        assert.strictEqual(publicBridge.config.httpServers[0].protectedModeAutoToken, true);
+        assert.strictEqual(publicBridge.config.wsServers[0].accessToken, generatedToken);
+        assert.strictEqual(capturedWarnings.length, 1);
+
+        const pubPort = publicBridge._httpServers[0].address().port;
+        const rPubUnauth = await httpRequestRaw({ port: pubPort });
+        assert.strictEqual(rPubUnauth.statusCode, 401);
+
+        const rPubAuth = await httpRequestRaw({
+          port: pubPort,
+          headers: { Authorization: `Bearer ${generatedToken}` },
+        });
+        assert.strictEqual(rPubAuth.statusCode, 200);
+        assert.strictEqual(rPubAuth.json.status, "ok");
+      } finally {
+        process.stderr.write = origStderrWrite;
+        if (savedPubEnv.a !== undefined) process.env.ROSMONTIS_ALLOW_UNAUTHENTICATED_PUBLIC = savedPubEnv.a;
+        if (savedPubEnv.b !== undefined) process.env.ONEBOT_ALLOW_UNAUTHENTICATED_PUBLIC = savedPubEnv.b;
+        if (savedPubEnv.c !== undefined) process.env.XIAO_BRIDGE_ALLOW_UNAUTHENTICATED_PUBLIC = savedPubEnv.c;
+        await loopbackBridge.stopServers();
+        await publicBridge.stopServers();
+      }
+    }
+
+    // 5. CRLF header injection attempt in connectReverseWebSocket is sanitized / rejected safely
+    {
+      // (a) Invalid header name with CRLF is rejected immediately without opening a socket
+      let invalidHdrErr = null;
+      const badHandle = mainMod.connectReverseWebSocket(
+        "ws://127.0.0.1:65530/ws",
+        { "X-Bad\r\nHeader": "injected" },
+        () => {},
+        () => {},
+        (err) => {
+          invalidHdrErr = err;
+        }
+      );
+      assert.strictEqual(badHandle, null);
+      assert.ok(invalidHdrErr && invalidHdrErr.code === "ERR_INVALID_HTTP_HEADER");
+
+      // (b) Header value containing CRLF injection attempt has \r\n stripped before hitting the wire
+      let capturedUpgradeRaw = "";
+      const inspectSrv = net.createServer((sock) => {
+        sock.on("data", (chunk) => {
+          capturedUpgradeRaw += chunk.toString("utf8");
+          if (capturedUpgradeRaw.includes("\r\n\r\n")) {
+            sock.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+          }
+        });
+      });
+      await new Promise((resolve) => inspectSrv.listen(0, "127.0.0.1", resolve));
+      const inspectPort = inspectSrv.address().port;
+      try {
+        await new Promise((resolve) => {
+          mainMod.connectReverseWebSocket(
+            `ws://127.0.0.1:${inspectPort}/onebot`,
+            {
+              Authorization: "Bearer safe_tok\r\nX-Injected-Evil: pwned\r\n\r\nGET /smuggled HTTP/1.1",
+              "X-Role": "Universal\r\nEvil-Two: 1",
+            },
+            () => resolve(),
+            () => {},
+            () => resolve()
+          );
+        });
+        const headerLines = capturedUpgradeRaw.split("\r\n");
+        assert.strictEqual(
+          headerLines.some((line) => /^x-injected-evil:/i.test(line) || /^evil-two:/i.test(line) || /^GET \/smuggled/i.test(line)),
+          false,
+          `CRLF injection leaked separate header lines: ${JSON.stringify(headerLines)}`
+        );
+        assert.ok(
+          headerLines.some((line) => line.startsWith("Authorization: Bearer safe_tokX-Injected-Evil: pwned")),
+          "Sanitized Authorization header should have CRLF stripped cleanly"
+        );
+      } finally {
+        await new Promise((resolve) => inspectSrv.close(resolve));
+      }
+    }
+  });
+
+  console.log("=== 16. Testing Electron IPC Spoofing Defense, Structured CMD/ACK Channel & Web Credential Gate ===");
+  await check("_isTrustedIpcEvent blocks spoofed renderer events, __ROSMONTIS_BRIDGE_CMD__ executes without per-call executeJavaScript, and all 11 WEB_CREDENTIAL_ACTIONS default to 1403", async () => {
+    const vm = require("vm");
+    const { WEB_CREDENTIAL_ACTIONS } = require("../src/core/qzone_actions.js");
+
+    // 1 & 2. _isTrustedIpcEvent spoofing checks + structured __ROSMONTIS_BRIDGE_CMD__ / __ROSMONTIS_BRIDGE_CMD_ACK__ round-trips
+    {
+      const ipcMainListeners = new Map();
+      const ipcMainHandlers = new Map();
+      const appListeners = new Map();
+      const fakeElectron = {
+        app: {
+          on(ev, fn) {
+            appListeners.set(ev, fn);
+          },
+        },
+        ipcMain: {
+          on(ch, fn) {
+            ipcMainListeners.set(ch, fn);
+          },
+          handle(ch, fn) {
+            ipcMainHandlers.set(ch, fn);
+          },
+        },
+        webContents: {
+          getAllWebContents: () => [],
+        },
+      };
+
+      const bridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_rosmontis_self",
+        config: {
+          selfUin: "100010001",
+          httpServers: [],
+          wsServers: [],
+          wsClients: [],
+          humanSimulation: true,
+          dedupeWindowMs: 5000,
+        },
+      });
+      bridge.uinUidStore.record("100020002", "u_ipc_peer");
+      assert.strictEqual(bridge.installElectronHooks(fakeElectron), true);
+
+      const mainFrameObj = { id: "frame-main" };
+      const childSubFrameObj = { id: "frame-sub-iframe" };
+      let currentRendererUrl = "app://./renderer/index.html#/main/message";
+      let executeJsCount = 0;
+
+      const rendererIpcListeners = new Map();
+      const ntKernelCalls = [];
+      let fakeWebContents = null;
+
+      const fakeIpcRenderer = {
+        on(ch, fn) {
+          rendererIpcListeners.set(ch, fn);
+        },
+        removeListener(ch, fn) {
+          if (rendererIpcListeners.get(ch) === fn) rendererIpcListeners.delete(ch);
+        },
+        send(ch, metaOrPayload, maybeData) {
+          if (ch === "__ROSMONTIS_BRIDGE_EVENT__") {
+            const onEv = ipcMainListeners.get("__ROSMONTIS_BRIDGE_EVENT__");
+            if (onEv) {
+              onEv({ sender: fakeWebContents, senderFrame: mainFrameObj }, metaOrPayload);
+            }
+            return;
+          }
+          if (ch === "__ROSMONTIS_BRIDGE_CMD_ACK__") {
+            const onAck = ipcMainListeners.get("__ROSMONTIS_BRIDGE_CMD_ACK__");
+            if (onAck) {
+              onAck({ sender: fakeWebContents, senderFrame: mainFrameObj }, metaOrPayload);
+            }
+            return;
+          }
+          if (ch === "RM_IPCFROM_RENDERER1" && metaOrPayload?.eventName === "ntApi" && maybeData?.cmdType === "invoke") {
+            const cmd = maybeData.cmdName;
+            const arg0 = Array.isArray(maybeData.payload) ? maybeData.payload[0] : maybeData.payload;
+            ntKernelCalls.push({ cmd, payload: arg0 });
+            const onMain = rendererIpcListeners.get("RM_IPCFROM_MAIN1");
+            if (typeof onMain === "function" && metaOrPayload.callbackId) {
+              setImmediate(() => {
+                let result = { result: 0, errMsg: "" };
+                if (cmd === "nodeIKernelGroupService/getGroupList") {
+                  result = {
+                    groupList: [
+                      { groupCode: "777001", groupName: "IPC测试群", memberCount: 12, maxMember: 200 },
+                    ],
+                  };
+                }
+                onMain(
+                  {},
+                  {
+                    callbackId: metaOrPayload.callbackId,
+                    promiseStatue: "full",
+                    type: "response",
+                    eventName: "ntApi",
+                    peerId: 1,
+                  },
+                  result
+                );
+              });
+            }
+          }
+        },
+      };
+
+      const fakeWindow = {
+        webContentId: 1,
+        location: { search: "?webcontentsid=1" },
+        ipcRenderer: fakeIpcRenderer,
+        document: { querySelector: () => null },
+        crypto,
+      };
+
+      const wcEvents = new EventEmitter();
+      fakeWebContents = Object.assign(wcEvents, {
+        id: 1,
+        mainFrame: mainFrameObj,
+        isDestroyed: () => false,
+        getURL: () => currentRendererUrl,
+        send(ch, payload) {
+          const fn = rendererIpcListeners.get(ch);
+          if (typeof fn === "function") {
+            fn({}, payload);
+          }
+        },
+        executeJavaScript(code) {
+          executeJsCount += 1;
+          const sandbox = {
+            window: fakeWindow,
+            crypto,
+            setTimeout,
+            clearTimeout,
+            URLSearchParams,
+          };
+          return Promise.resolve(vm.runInNewContext(code, sandbox));
+        },
+      });
+
+      try {
+        // Trigger web-contents-created + did-finish-load bootstrap injection
+        appListeners.get("web-contents-created")({}, fakeWebContents);
+        fakeWebContents.emit("did-finish-load");
+        await new Promise((r) => setImmediate(r));
+
+        assert.strictEqual(fakeWebContents.__rosmontisIpcTokenInjected, true);
+        assert.strictEqual(fakeWebContents.__rosmontisCmdChannelReady, true);
+        assert.strictEqual(executeJsCount, 1, "Bootstrap should run executeJavaScript once on load");
+        // Verify ipcAuthToken is NOT exposed on window.__ROSMONTIS_RENDERER_BRIDGE__
+        assert.strictEqual(fakeWindow.__ROSMONTIS_RENDERER_BRIDGE__.__ipcToken, undefined);
+        assert.strictEqual(fakeWindow.__ROSMONTIS_RENDERER_BRIDGE__.ipcAuthToken, undefined);
+        assert.strictEqual(
+          Object.keys(fakeWindow.__ROSMONTIS_RENDERER_BRIDGE__).includes("setIpcAuthToken"),
+          false
+        );
+
+        // Reset executeJsCount to prove zero per-message executeJavaScript calls afterward!
+        executeJsCount = 0;
+
+        // Structured IPC round-trip 1: invokeNt via get_group_list
+        const grpResp = await bridge.handleOneBotAction("get_group_list", {});
+        assert.strictEqual(grpResp.status, "ok");
+        assert.strictEqual(grpResp.data.length, 1);
+        assert.strictEqual(grpResp.data[0].group_id, 777001);
+        assert.strictEqual(executeJsCount, 0, "invokeNt must use __ROSMONTIS_BRIDGE_CMD__ without executeJavaScript");
+        assert.strictEqual(bridge.invokeStats.tier1 >= 1, true);
+        assert.strictEqual(bridge.invokeStats.degraded, 0);
+
+        // Structured IPC round-trip 2: simulateSession via set_input_status
+        ntKernelCalls.length = 0;
+        const typingResp = await bridge.handleOneBotAction("set_input_status", {
+          user_id: 100020002,
+          event_type: 1,
+        });
+        assert.strictEqual(typingResp.status, "ok");
+        assert.strictEqual(executeJsCount, 0, "simulateSession must use __ROSMONTIS_BRIDGE_CMD__ without executeJavaScript");
+        assert.deepStrictEqual(
+          ntKernelCalls.map((c) => c.cmd),
+          [
+            "nodeIKernelMsgService/setFocusOnBase",
+            "nodeIKernelMsgService/addActiveChatByUid",
+            "nodeIKernelMsgService/enterOrExitAio",
+            "nodeIKernelMsgService/setMsgRead",
+            "nodeIKernelMsgService/sendShowInputStatusReq",
+          ]
+        );
+
+        // Test _isTrustedIpcEvent & __ROSMONTIS_BRIDGE_EVENT__ spoofing vectors
+        const emittedEvents = [];
+        bridge.on("onebot_event", (ev) => emittedEvents.push(ev));
+        const onBridgeEvent = ipcMainListeners.get("__ROSMONTIS_BRIDGE_EVENT__");
+
+        const makeFakeRecvPayload = (msgId, token) => ({
+          cmdName: "nodeIKernelMsgListener/onRecvMsg",
+          eventName: "ntApi",
+          ...(token !== undefined ? { __ipcToken: token } : {}),
+          payload: [
+            [
+              {
+                msgId,
+                msgSeq: "501",
+                msgTime: "1710000000",
+                chatType: 1,
+                msgType: 2,
+                peerUid: "u_ipc_peer",
+                senderUid: "u_ipc_peer",
+                senderUin: "100020002",
+                sendNickName: "Doctor",
+                elements: [{ elementType: 1, textElement: { content: "spoof check" } }],
+              },
+            ],
+          ],
+        });
+
+        // Spoof 1: Unknown webContents
+        const unknownWc = { id: 99, mainFrame: mainFrameObj, isDestroyed: () => false, getURL: () => currentRendererUrl };
+        onBridgeEvent({ sender: unknownWc, senderFrame: mainFrameObj }, makeFakeRecvPayload("spoof_1", bridge._ipcAuthToken));
+
+        // Spoof 2: Subframe (senderFrame !== sender.mainFrame)
+        onBridgeEvent(
+          { sender: fakeWebContents, senderFrame: childSubFrameObj },
+          makeFakeRecvPayload("spoof_2", bridge._ipcAuthToken)
+        );
+
+        // Spoof 3: Untrusted https://evil.example URL
+        currentRendererUrl = "https://evil.example/malicious.html";
+        onBridgeEvent(
+          { sender: fakeWebContents, senderFrame: mainFrameObj },
+          makeFakeRecvPayload("spoof_3", bridge._ipcAuthToken)
+        );
+        currentRendererUrl = "app://./renderer/index.html#/main/message";
+
+        // Spoof 4: Wrong or missing __ipcToken
+        onBridgeEvent(
+          { sender: fakeWebContents, senderFrame: mainFrameObj },
+          makeFakeRecvPayload("spoof_4a", "wrong_forged_ipc_token")
+        );
+        onBridgeEvent(
+          { sender: fakeWebContents, senderFrame: mainFrameObj },
+          makeFakeRecvPayload("spoof_4b", undefined)
+        );
+
+        await new Promise((r) => setImmediate(r));
+        assert.strictEqual(emittedEvents.length, 0, "All 4 spoofed IPC vectors must emit zero OneBot events");
+
+        // Valid mainFrame event from injected renderer (via RM_IPCFROM_MAIN1 -> forwardToMain with sealed ipcAuthToken)
+        rendererIpcListeners.get("RM_IPCFROM_MAIN1")(
+          {},
+          { eventName: "ntApi", peerId: 1 },
+          {
+            cmdName: "nodeIKernelMsgListener/onRecvMsg",
+            cmdType: "event",
+            payload: [
+              [
+                {
+                  msgId: "valid_ipc_9001",
+                  msgSeq: "502",
+                  msgTime: "1710000005",
+                  chatType: 1,
+                  msgType: 2,
+                  peerUid: "u_ipc_peer",
+                  senderUid: "u_ipc_peer",
+                  senderUin: "100020002",
+                  sendNickName: "Doctor",
+                  elements: [{ elementType: 1, textElement: { content: "legitimate message" } }],
+                },
+              ],
+            ],
+          }
+        );
+        await new Promise((r) => setImmediate(r));
+        assert.strictEqual(emittedEvents.length, 1, "Legitimate mainFrame IPC event with valid __ipcToken must be processed");
+        assert.strictEqual(emittedEvents[0].raw_message, "legitimate message");
+      } finally {
+        await bridge.stopServers();
+      }
+    }
+
+    // 3. All 11 WEB_CREDENTIAL_ACTIONS return status: "failed", retcode: 1403 by default,
+    //    while get_rkey remains accessible and get_essence_msg_list / _get_group_notice fall back to NT kernel APIs
+    {
+      assert.strictEqual(WEB_CREDENTIAL_ACTIONS.size, 11);
+      const calledKernelCmds = [];
+      const defaultBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_rosmontis_self",
+        ntApi: new Proxy(
+          {},
+          {
+            get(_t, prop) {
+              if (typeof prop !== "string" || !prop.includes("/")) return undefined;
+              return async (payload) => {
+                calledKernelCmds.push(prop);
+                if (prop === "nodeIKernelUnitedConfigService/loadUnitedConfig") {
+                  return { configData: { content: "&rkey=test_cdn_rkey_123" } };
+                }
+                if (prop === "nodeIKernelGroupService/getGroupLatestEssenceList") {
+                  return { msgList: [{ msg_seq: 88, sender_uin: "100020002" }] };
+                }
+                if (prop === "nodeIKernelGroupService/getGroupBulletin") {
+                  return {
+                    feeds: [{ feedId: "notice_1", msg: { text: "NT内核群公告" } }],
+                  };
+                }
+                return { result: 0, errMsg: "" };
+              };
+            },
+          }
+        ),
+        config: {
+          selfUin: "100010001",
+          httpServers: [],
+          wsServers: [],
+          wsClients: [],
+        },
+      });
+
+      try {
+        for (const action of WEB_CREDENTIAL_ACTIONS) {
+          const resp = await defaultBridge.handleOneBotAction(action, {
+            domain: "qun.qq.com",
+            content: "test",
+            tid: "t1",
+          });
+          assert.strictEqual(resp.status, "failed", `Expected ${action} to fail when gated`);
+          assert.strictEqual(resp.retcode, 1403, `Expected ${action} retcode === 1403, got ${resp.retcode}`);
+        }
+
+        const rkeyResp = await defaultBridge.handleOneBotAction("get_rkey", {});
+        assert.strictEqual(rkeyResp.status, "ok");
+        assert.strictEqual(rkeyResp.retcode, 0);
+        assert.strictEqual(rkeyResp.data.rkeys.length, 2);
+        assert.strictEqual(rkeyResp.data.rkeys[0].rkey, "&rkey=test_cdn_rkey_123");
+
+        const essenceResp = await defaultBridge.handleOneBotAction("get_essence_msg_list", {
+          group_id: 654321,
+        });
+        assert.strictEqual(essenceResp.status, "ok");
+        assert.strictEqual(Array.isArray(essenceResp.data), true);
+        assert.strictEqual(essenceResp.data.length, 1);
+        assert.ok(calledKernelCmds.includes("nodeIKernelGroupService/getGroupLatestEssenceList"));
+
+        const noticeResp = await defaultBridge.handleOneBotAction("_get_group_notice", {
+          group_id: 654321,
+        });
+        assert.strictEqual(noticeResp.status, "ok");
+        assert.strictEqual(Array.isArray(noticeResp.data), true);
+        assert.strictEqual(noticeResp.data[0].feedId, "notice_1");
+        assert.ok(calledKernelCmds.includes("nodeIKernelGroupService/getGroupBulletin"));
+      } finally {
+        await defaultBridge.stopServers();
+      }
+    }
+  });
+
+  console.log("=== 17. Testing Causal Session Scheduler, Peer-Affinity Mutex, Auto-Read Cooldown & messageFormat ===");
+  await check("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & maxAffinityStreak, autoReadAndTypeOnPrivateRecv coalescing/cooldown, and messageFormat string vs array", async () => {
+    const { CausalSessionScheduler } = require("../src/core/session_scheduler.js");
+
+    function createPrivateCausalBridge(cfgOverrides = {}) {
+      const calls = [];
+      const bridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_rosmontis_self",
+        ntApi: new Proxy(
+          {},
+          {
+            get(_t, prop) {
+              if (typeof prop !== "string" || !prop.includes("/")) return undefined;
+              return async (payload) => {
+                calls.push({ cmd: prop, payload, at: Date.now() });
+                if (prop === "nodeIKernelMsgService/sendMsg") {
+                  return { result: 0, errMsg: "", msgId: `7700000000000000${calls.length}` };
+                }
+                return { result: 0, errMsg: "" };
+              };
+            },
+          }
+        ),
+        config: {
+          selfUin: "100010001",
+          httpServers: [],
+          wsServers: [],
+          wsClients: [],
+          humanSimulation: true,
+          dedupeWindowMs: 5000,
+          aioSwitchCooldownMs: 0,
+          ...cfgOverrides,
+        },
+      });
+      bridge.uinUidStore.record("100020002", "u_priv_1");
+      bridge.uinUidStore.record("100030003", "u_priv_2");
+      bridge.uinUidStore.record("100040004", "u_priv_3");
+      return { bridge, calls };
+    }
+
+    // 1a. Full private-chat causal timeline: recv -> set_input_status -> LLM gap -> send_private_msg
+    {
+      const { bridge, calls } = createPrivateCausalBridge({ autoReadAndTypeOnPrivateRecv: false });
+      try {
+        await bridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+          [
+            {
+              msgId: "c_in_1",
+              msgSeq: "101",
+              msgTime: "1710000100",
+              chatType: 1,
+              msgType: 2,
+              peerUid: "u_priv_1",
+              senderUid: "u_priv_1",
+              senderUin: "100020002",
+              sendNickName: "Doctor",
+              elements: [{ elementType: 1, textElement: { content: "在吗迷迭香？" } }],
+            },
+          ],
+        ]);
+        assert.strictEqual(calls.length, 0, "Passive receipt with autoReadAndTypeOnPrivateRecv=false should not invoke AIO commands yet");
+
+        // Step 2: set_input_status -> focus -> activeChat -> enterAio(1) -> setMsgRead -> sendShowInputStatusReq
+        const stRes = await bridge.handleOneBotAction("set_input_status", {
+          user_id: 100020002,
+          event_type: 1,
+        });
+        assert.strictEqual(stRes.status, "ok");
+        assert.deepStrictEqual(
+          calls.map((c) => c.cmd),
+          [
+            "nodeIKernelMsgService/setFocusOnBase",
+            "nodeIKernelMsgService/addActiveChatByUid",
+            "nodeIKernelMsgService/enterOrExitAio",
+            "nodeIKernelMsgService/setMsgRead",
+            "nodeIKernelMsgService/sendShowInputStatusReq",
+          ]
+        );
+
+        // Step 3: LLM generation gap
+        await new Promise((r) => setTimeout(r, 30));
+
+        // Step 4: send_private_msg -> sendMsg directly on already-active peer with NO redundant enterOrExitAio and NO 0ms sendShowInputStatusReq
+        calls.length = 0;
+        const sendRes = await bridge.handleOneBotAction("send_private_msg", {
+          user_id: 100020002,
+          message: "我在的，博士。",
+        });
+        assert.strictEqual(sendRes.status, "ok");
+        assert.deepStrictEqual(
+          calls.map((c) => c.cmd),
+          ["nodeIKernelMsgService/sendMsg"],
+          "send_private_msg on already-active session must invoke sendMsg directly with zero redundant enterOrExitAio or 0ms sendShowInputStatusReq"
+        );
+      } finally {
+        await bridge.stopServers();
+      }
+    }
+
+    // 1b. "Typed then deleted / chose not to reply" path: set_input_status runs, send_private_msg is NEVER called -> clean idle exit/blur & zero leaks
+    {
+      const { bridge, calls } = createPrivateCausalBridge({
+        aioIdleExitMs: 45,
+        focusIdleBlurMs: 95,
+      });
+      try {
+        await bridge.handleOneBotAction("set_input_status", {
+          user_id: 100020002,
+          event_type: 1,
+        });
+        assert.strictEqual(bridge._activeAioPeerKey, "1:u_priv_1:");
+        assert.strictEqual(bridge._windowFocused, true);
+
+        // Never call send_private_msg; let idle timers settle cleanly
+        await new Promise((r) => setTimeout(r, 135));
+
+        assert.strictEqual(bridge._activeAioPeerKey, "");
+        assert.strictEqual(bridge._windowFocused, false);
+        assert.strictEqual(bridge._sendEchoWaiters.size, 0);
+        assert.strictEqual(bridge._sessionScheduler.pendingReactionCount, 0);
+        assert.ok(
+          calls.some(
+            (c) =>
+              c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
+              c.payload?.info?.enterType === 2 &&
+              c.payload?.info?.peer?.peerUid === "u_priv_1"
+          ),
+          "Unanswered typing session must cleanly exit AIO after idle timeout"
+        );
+        assert.ok(
+          calls.some(
+            (c) => c.cmd === "nodeIKernelMsgService/setFocusOnBase" && c.payload?.isFocus === false
+          ),
+          "Unanswered typing session must cleanly blur window after focus idle timeout"
+        );
+      } finally {
+        await bridge.stopServers();
+      }
+    }
+
+    // 2. Peer-affinity mutex scheduling (CausalSessionScheduler) + maxAffinityStreak anti-starvation
+    {
+      let activePeer = "A";
+      const scheduler = new CausalSessionScheduler({
+        getActivePeerKey: () => activePeer,
+        maxAffinityStreak: 2,
+      });
+      try {
+        // (a) Peer A holds lock; [B1, A2, B2] queue up while activePeer === "A" -> A2 runs BEFORE B1!
+        const order1 = [];
+        let releaseA1;
+        const holdA1 = new Promise((r) => {
+          releaseA1 = r;
+        });
+
+        const pA1 = scheduler.runExclusive("A", async () => {
+          order1.push("A1");
+          await holdA1;
+        });
+        const pB1 = scheduler.runExclusive("B", async () => {
+          activePeer = "B";
+          order1.push("B1");
+        });
+        const pA2 = scheduler.runExclusive("A", async () => {
+          activePeer = "A";
+          order1.push("A2");
+        });
+        const pB2 = scheduler.runExclusive("B", async () => {
+          activePeer = "B";
+          order1.push("B2");
+        });
+
+        releaseA1();
+        await Promise.all([pA1, pB1, pA2, pB2]);
+        assert.deepStrictEqual(
+          order1,
+          ["A1", "A2", "B1", "B2"],
+          "A2 must execute before B1 while activePeerKey === 'A' to eliminate A->B->A->B ping-pong"
+        );
+
+        // (b) maxAffinityStreak: 2 prevents starvation when [B1, A2, A3, A4] queue behind A1
+        activePeer = "A";
+        const order2 = [];
+        let releaseFirst;
+        const holdFirst = new Promise((r) => {
+          releaseFirst = r;
+        });
+
+        const qA1 = scheduler.runExclusive("A", async () => {
+          order2.push("A1");
+          await holdFirst;
+        });
+        const qB1 = scheduler.runExclusive("B", async () => {
+          activePeer = "B";
+          order2.push("B1");
+        });
+        const qA2 = scheduler.runExclusive("A", async () => {
+          activePeer = "A";
+          order2.push("A2");
+        });
+        const qA3 = scheduler.runExclusive("A", async () => {
+          activePeer = "A";
+          order2.push("A3");
+        });
+        const qA4 = scheduler.runExclusive("A", async () => {
+          activePeer = "A";
+          order2.push("A4");
+        });
+
+        releaseFirst();
+        await Promise.all([qA1, qB1, qA2, qA3, qA4]);
+        assert.deepStrictEqual(
+          order2,
+          ["A1", "A2", "A3", "B1", "A4"],
+          "After maxAffinityStreak=2 consecutive affinity picks (A2, A3), B1 must run before A4 to prevent starvation"
+        );
+      } finally {
+        scheduler.dispose();
+      }
+    }
+
+    // 3. High-frequency switch cooldown & autoReadAndTypeOnPrivateRecv (burst coalescing, immediate cancel, cooldown skip)
+    {
+      // Keep event loop alive while awaiting serverless sleepUnref(humanReadToTypingDelayMs); cleared in finally
+      const keepAlive = setInterval(() => {}, 1000);
+      const { bridge, calls } = createPrivateCausalBridge({
+        autoReadAndTypeOnPrivateRecv: true,
+        autoReadReactionDelayMs: 35,
+        humanReadToTypingDelayMs: 10,
+        aioSwitchCooldownMs: 400,
+      });
+      try {
+        const pushPrivRecv = (msgId, peerUid, uin, text) =>
+          bridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+            [
+              {
+                msgId,
+                msgSeq: msgId.replace(/\D+/g, "") || "1",
+                msgTime: String(Math.floor(Date.now() / 1000)),
+                chatType: 1,
+                msgType: 2,
+                peerUid,
+                senderUid: peerUid,
+                senderUin: uin,
+                sendNickName: "Friend",
+                elements: [{ elementType: 1, textElement: { content: text } }],
+              },
+            ],
+          ]);
+
+        // (a) Rapid 3-message burst from u_priv_1 coalesces into 1 delayed read+typing reaction
+        await pushPrivRecv("burst_1", "u_priv_1", "100020002", "msg 1");
+        await pushPrivRecv("burst_2", "u_priv_1", "100020002", "msg 2");
+        await pushPrivRecv("burst_3", "u_priv_1", "100020002", "msg 3");
+        assert.strictEqual(bridge._sessionScheduler.pendingReactionCount, 1);
+        assert.strictEqual(calls.length, 0, "Auto-read reaction must wait for reaction delay");
+
+        await new Promise((r) => setTimeout(r, 80));
+        assert.strictEqual(bridge._sessionScheduler.pendingReactionCount, 0);
+        const readCalls = calls.filter((c) => c.cmd === "nodeIKernelMsgService/setMsgRead");
+        const typingCalls = calls.filter((c) => c.cmd === "nodeIKernelMsgService/sendShowInputStatusReq");
+        assert.strictEqual(readCalls.length, 1, "Coalesced burst must mark read once");
+        assert.strictEqual(typingCalls.length, 1, "Coalesced burst must send typing once");
+        assert.ok(typingCalls[0].at >= readCalls[0].at, "sendShowInputStatusReq must occur after setMsgRead");
+
+        // Wait for 400ms cooldown from u_priv_1 switch to expire before testing cancel on u_priv_2 / u_priv_3
+        bridge._sessionScheduler.lastSwitchAt = Date.now() - 1000;
+
+        // (b) Immediate cancellation when send_private_msg or set_input_status runs first
+        bridge.config.autoReadReactionDelayMs = 80;
+        calls.length = 0;
+        await pushPrivRecv("cancel_by_send", "u_priv_2", "100030003", "fast reply test");
+        assert.strictEqual(bridge._sessionScheduler.hasPendingReaction("1:u_priv_2:"), true);
+
+        const fastReply = await bridge.handleOneBotAction("send_private_msg", {
+          user_id: 100030003,
+          message: "秒回消息",
+        });
+        assert.strictEqual(fastReply.status, "ok");
+        assert.strictEqual(
+          bridge._sessionScheduler.hasPendingReaction("1:u_priv_2:"),
+          false,
+          "send_private_msg must immediately cancel pending auto-read/typing reaction"
+        );
+        await new Promise((r) => setTimeout(r, 100));
+        assert.strictEqual(
+          calls.some((c) => c.cmd === "nodeIKernelMsgService/sendShowInputStatusReq"),
+          false,
+          "Cancelled reaction must never fire a late sendShowInputStatusReq after send_private_msg"
+        );
+
+        await pushPrivRecv("cancel_by_typing", "u_priv_3", "100040004", "explicit typing test");
+        assert.strictEqual(bridge._sessionScheduler.hasPendingReaction("1:u_priv_3:"), true);
+        bridge._sessionScheduler.lastSwitchAt = Date.now() - 1000;
+        await bridge.handleOneBotAction("set_input_status", {
+          user_id: 100040004,
+          event_type: 1,
+        });
+        assert.strictEqual(
+          bridge._sessionScheduler.hasPendingReaction("1:u_priv_3:"),
+          false,
+          "set_input_status must immediately cancel pending auto-read/typing reaction"
+        );
+
+        // (c) Advisory switch skipped when another peer just switched within aioSwitchCooldownMs (400ms)
+        bridge.config.autoReadReactionDelayMs = 20;
+        bridge._recentReadByPeer.clear();
+        bridge._recentTypingByPeer.clear();
+        await bridge.handleOneBotAction("send_group_msg", {
+          group_id: 999888,
+          message: "锁定当前活跃群会话",
+        });
+        assert.strictEqual(bridge._activeAioPeerKey, "2:999888:");
+        calls.length = 0;
+
+        // Incoming private message arrives immediately while 400ms cooldown from 2:999888: is active
+        await pushPrivRecv("cooldown_skip_1", "u_priv_1", "100020002", "should skip advisory switch");
+        await new Promise((r) => setTimeout(r, 55));
+        assert.strictEqual(
+          bridge._activeAioPeerKey,
+          "2:999888:",
+          "Advisory auto-read reaction must skip switching when another peer just switched within aioSwitchCooldownMs"
+        );
+        assert.strictEqual(calls.length, 0);
+      } finally {
+        clearInterval(keepAlive);
+        await bridge.stopServers();
+      }
+    }
+
+    // 4. End-to-end messageFormat: "string" vs "array" across broadcastOneBotEvent, WS clients, and get_msg
+    {
+      const fmtBridge = new mainMod.NtqqOneBotBridge({
+        selfUin: "100010001",
+        selfUid: "u_rosmontis_self",
+        online: true,
+        config: {
+          selfUin: "100010001",
+          messageFormat: "string",
+          httpServers: [],
+          wsServers: [
+            { host: "127.0.0.1", port: 0, accessToken: "", messageFormat: "string" },
+            { host: "127.0.0.1", port: 0, accessToken: "", messageFormat: "array" },
+          ],
+          wsClients: [],
+          heartbeatIntervalMs: 0,
+          humanSimulation: false,
+        },
+      });
+      fmtBridge.uinUidStore.record("100020002", "u_fmt_peer");
+      await fmtBridge.startServers();
+
+      const connectWsTestClient = (port) =>
+        new Promise((resolve, reject) => {
+          const msgs = [];
+          const waiters = [];
+          const handle = mainMod.connectReverseWebSocket(
+            `ws://127.0.0.1:${port}/`,
+            {},
+            (conn) =>
+              resolve({
+                conn,
+                handle,
+                msgs,
+                nextJson: (predicate) => {
+                  const idx = msgs.findIndex(predicate);
+                  if (idx >= 0) {
+                    const [found] = msgs.splice(idx, 1);
+                    return Promise.resolve(found);
+                  }
+                  return new Promise((res) => waiters.push({ predicate, res }));
+                },
+              }),
+            (text) => {
+              const parsed = JSON.parse(text);
+              const wIdx = waiters.findIndex((w) => w.predicate(parsed));
+              if (wIdx >= 0) {
+                const [w] = waiters.splice(wIdx, 1);
+                w.res(parsed);
+              } else {
+                msgs.push(parsed);
+              }
+            },
+            () => {}
+          );
+          if (!handle) reject(new Error("Failed to connect WS test client"));
+        });
+
+      let wsStrClient = null;
+      let wsArrClient = null;
+      try {
+        const wsStrPort = fmtBridge._wsServers[0].address().port;
+        const wsArrPort = fmtBridge._wsServers[1].address().port;
+        wsStrClient = await connectWsTestClient(wsStrPort);
+        wsArrClient = await connectWsTestClient(wsArrPort);
+
+        await wsStrClient.nextJson((m) => m.post_type === "meta_event" && m.sub_type === "connect");
+        await wsArrClient.nextJson((m) => m.post_type === "meta_event" && m.sub_type === "connect");
+
+        const localEvents = [];
+        fmtBridge.on("onebot_event", (ev) => localEvents.push(ev));
+
+        // Emit incoming message containing face + text
+        await fmtBridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+          [
+            {
+              msgId: "fmt_msg_7001",
+              msgSeq: "7001",
+              msgTime: "1710000200",
+              chatType: 1,
+              msgType: 2,
+              peerUid: "u_fmt_peer",
+              senderUid: "u_fmt_peer",
+              senderUin: "100020002",
+              sendNickName: "Doctor",
+              elements: [
+                { elementType: 6, faceElement: { faceIndex: 14, faceType: 1 } },
+                { elementType: 1, textElement: { content: "博士你好" } },
+              ],
+            },
+          ],
+        ]);
+
+        const strBroadcast = await wsStrClient.nextJson((m) => m.post_type === "message");
+        const arrBroadcast = await wsArrClient.nextJson((m) => m.post_type === "message");
+
+        // Verify local broadcastOneBotEvent (global messageFormat: "string")
+        assert.strictEqual(localEvents.length, 1);
+        assert.strictEqual(typeof localEvents[0].message, "string");
+        assert.strictEqual(localEvents[0].message, "[CQ:face,id=14]博士你好");
+
+        // Verify WS client 1 (messageFormat: "string") vs WS client 2 (messageFormat: "array")
+        assert.strictEqual(typeof strBroadcast.message, "string");
+        assert.strictEqual(strBroadcast.message, "[CQ:face,id=14]博士你好");
+
+        assert.strictEqual(Array.isArray(arrBroadcast.message), true);
+        assert.deepStrictEqual(arrBroadcast.message, [
+          { type: "face", data: { id: "14" } },
+          { type: "text", data: { text: "博士你好" } },
+        ]);
+
+        const msgId = strBroadcast.message_id;
+
+        // Verify get_msg over WS client 1 ("string") vs WS client 2 ("array")
+        wsStrClient.conn.sendJson({
+          action: "get_msg",
+          params: { message_id: msgId },
+          echo: "get_str",
+        });
+        const getStrReply = await wsStrClient.nextJson((m) => m.echo === "get_str");
+        assert.strictEqual(getStrReply.status, "ok");
+        assert.strictEqual(typeof getStrReply.data.message, "string");
+        assert.strictEqual(getStrReply.data.message, "[CQ:face,id=14]博士你好");
+
+        wsArrClient.conn.sendJson({
+          action: "get_msg",
+          params: { message_id: msgId },
+          echo: "get_arr",
+        });
+        const getArrReply = await wsArrClient.nextJson((m) => m.echo === "get_arr");
+        assert.strictEqual(getArrReply.status, "ok");
+        assert.strictEqual(Array.isArray(getArrReply.data.message), true);
+        assert.deepStrictEqual(getArrReply.data.message, [
+          { type: "face", data: { id: "14" } },
+          { type: "text", data: { text: "博士你好" } },
+        ]);
+
+        // Also verify direct handleOneBotAction("get_msg") respects global "string" and per-call message_format override
+        const directDefault = await fmtBridge.handleOneBotAction("get_msg", { message_id: msgId });
+        assert.strictEqual(directDefault.data.message, "[CQ:face,id=14]博士你好");
+
+        const directArray = await fmtBridge.handleOneBotAction("get_msg", {
+          message_id: msgId,
+          message_format: "array",
+        });
+        assert.strictEqual(Array.isArray(directArray.data.message), true);
+      } finally {
+        if (wsStrClient) wsStrClient.handle.close();
+        if (wsArrClient) wsArrClient.handle.close();
+        await fmtBridge.stopServers();
+      }
+    }
+  });
+
   console.log(`\nALL ${passed} TEST SUITES PASSED SUCCESSFULLY!`);
+  return passed;
 }
 
-runTests().catch((err) => {
-  console.error("Test suite failed:", err);
-  process.exit(1);
+let allSuitesFinished = false;
+process.on("exit", (code) => {
+  if (code === 0 && !allSuitesFinished) {
+    console.error("FATAL: Event loop drained before runTests() completed all suites!");
+    process.exitCode = 1;
+  }
 });
+
+runTests()
+  .then(() => {
+    allSuitesFinished = true;
+  })
+  .catch((err) => {
+    console.error("Test suite failed:", err);
+    process.exit(1);
+  });
