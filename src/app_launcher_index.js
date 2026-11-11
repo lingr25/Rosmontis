@@ -14,7 +14,11 @@
 const path = require("path");
 
 function bootBridgeMain() {
-  if (process.env.ROSMONTIS_DISABLE === "1") {
+  if (
+    process.env.ROSMONTIS_DISABLE === "1" ||
+    process.env.ROSMONTIS_BRIDGE_DISABLE === "1" ||
+    process.env.XIAO_BRIDGE_DISABLE === "1"
+  ) {
     return null;
   }
   try {
@@ -46,7 +50,10 @@ function loadOfficialInternalIndex(targetModule, majorNodeLoader) {
   return loader.load("internal_index", targetModule || module);
 }
 
-if (process.env.ROSMONTIS_TEST_MODE !== "1") {
+if (
+  process.env.ROSMONTIS_TEST_MODE !== "1" &&
+  process.env.XIAO_BRIDGE_TEST_MODE !== "1"
+) {
   bootBridgeMain();
   loadOfficialInternalIndex(module);
 }

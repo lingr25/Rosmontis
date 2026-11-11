@@ -87,15 +87,17 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 **防重复发送保护（Side-Effect Replay Guard）**：
 对于 `sendMsg`、`recallMsg`、转发、戳一戳、表情回应、群管理等有外部副作用的命令（`SIDE_EFFECT_NT_METHODS`），只有当上一级**根本未派发**（如渲染窗口尚未就绪，携带 `ROSMONTIS_BRIDGE_UNAVAILABLE` 标记）时才允许回退到下一级；一旦某级已派发请求，任何超时或业务错误均直接返回调用方，**绝不在下一级重放**，彻底杜绝大图慢速上传时的重复刷屏。
 
-### 2.4 会话因果状态机（Human Session Simulation）
+### 2.4 会话因果状态机与两阶段并发互斥（Human Session Simulation）
 
-在执行发消息或输入状态展示前，渲染层 `simulateHumanSessionFlow` 自动按真实客户端交互顺序补齐前置状态，并在同一会话驻留窗口（默认 45 秒）内幂等去重：
+出站发消息采用**两阶段解耦**管线：第一阶段在锁外并发完成富媒体下载、图片尺寸嗅探与 EXIF 清理；第二阶段经 `_aioMutex` 串行化包裹“会话激活 + `sendMsg` IPC 派发”，IPC 返回即释放互斥锁并在锁外等待 `onAddSendMsg` 真实回显（富媒体动态延长回显超时），彻底消除多群并发互踢（AIO Thrashing）。
 
-1. 窗口焦点心跳：`setFocusOnBase`
-2. 激活目标会话：`addActiveChatByUid` + `enterOrExitAio`
+在激活会话或展示输入状态时，主进程维护唯一权威状态并同步驱动渲染层 `simulateHumanSessionFlow` 严格按真实客户端因果顺序执行：
+
+1. 窗口获焦：`setFocusOnBase({ isFocus: true })`（窗口已获焦时不重复发送）
+2. 切换目标会话：若原驻留其他会话则先 `enterOrExitAio(prev, enterType: 2)`，再执行 `addActiveChatByUid` -> `enterOrExitAio(target, enterType: 1)`
 3. 标记会话已读：`setMsgRead`
 4. 展示“正在输入…”（私聊场景）：`sendShowInputStatusReq`
-5. 执行发送并在空闲后平缓离开 AIO
+5. 执行发送与两级空闲退场：默认无交互 45 秒后自动持锁发送 `enterOrExitAio(active, enterType: 2)` 退回会话列表，5 分钟无交互后自动发送 `setFocusOnBase({ isFocus: false })` 切入后台失焦
 
 ### 2.5 真实回显 `msgId` 关联与 NTv2 富媒体闭环
 

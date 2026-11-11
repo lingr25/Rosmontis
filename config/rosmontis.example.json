@@ -1,4 +1,9 @@
 {
+  "humanSimulation": true,
+  "aioIdleExitMs": 45000,
+  "focusIdleBlurMs": 300000,
+  "sendEchoTimeoutMs": 3000,
+  "richMediaEchoTimeoutMs": 15000,
   "networks": {
     "httpServers": [
       {

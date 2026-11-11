@@ -370,14 +370,28 @@ function filterEnabledEntries(list) {
 }
 
 function loadBridgeConfig(customConfigDir) {
-  const envSelfUin = String(process.env.ONEBOT_SELF_ID || process.env.ROSMONTIS_SELF_ID || "").trim();
+  const envSelfUin = String(
+    process.env.ROSMONTIS_SELF_ID ||
+      process.env.ONEBOT_SELF_ID ||
+      process.env.XIAO_BRIDGE_SELF_ID ||
+      ""
+  ).trim();
   const defaultConfig = {
     selfUin: envSelfUin,
-    selfNickname: process.env.ONEBOT_SELF_NICKNAME || process.env.ROSMONTIS_SELF_NICKNAME || "Rosmontis",
+    selfNickname:
+      process.env.ROSMONTIS_SELF_NICKNAME ||
+      process.env.ONEBOT_SELF_NICKNAME ||
+      process.env.XIAO_BRIDGE_SELF_NICKNAME ||
+      "Rosmontis",
     httpServers: [],
     wsServers: [],
     wsClients: [],
-    heartbeatIntervalMs: Number(process.env.ROSMONTIS_HEARTBEAT_MS || process.env.ONEBOT_HEARTBEAT_MS || 5000),
+    heartbeatIntervalMs: Number(
+      process.env.ROSMONTIS_HEARTBEAT_MS ||
+        process.env.ONEBOT_HEARTBEAT_MS ||
+        process.env.XIAO_BRIDGE_HEARTBEAT_MS ||
+        5000
+    ),
   };
 
   const searchDirs = customConfigDir
@@ -385,6 +399,7 @@ function loadBridgeConfig(customConfigDir) {
     : [
         process.env.ROSMONTIS_CONFIG_DIR,
         process.env.ONEBOT_CONFIG_DIR,
+        process.env.XIAO_BRIDGE_CONFIG_DIR,
         "/etc/rosmontis",
         "/app/data/config",
         "/app/config",
@@ -400,7 +415,7 @@ function loadBridgeConfig(customConfigDir) {
   for (const dir of searchDirs) {
     try {
       if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
-      const cfgPattern = /^(?:rosmontis|onebot)(?:_([a-zA-Z0-9_-]+))?\.json$/;
+      const cfgPattern = /^(?:rosmontis|onebot|xiao_bridge)(?:_([a-zA-Z0-9_-]+))?\.json$/;
       const files = fs
         .readdirSync(dir)
         .filter((f) => cfgPattern.test(f) && !f.endsWith(".example.json"));
@@ -421,6 +436,7 @@ function loadBridgeConfig(customConfigDir) {
           parsedEntries.push({
             file,
             uin,
+            raw,
             nets,
             hasWsClients,
             mtimeMs: Number(stat?.mtimeMs || 0),
@@ -449,9 +465,24 @@ function loadBridgeConfig(customConfigDir) {
 
       const bestEntry = parsedEntries[0];
       if (bestEntry) {
-        const { uin, nets } = bestEntry;
+        const { uin, raw, nets } = bestEntry;
         if (!defaultConfig.selfUin && uin) {
           defaultConfig.selfUin = uin;
+        }
+        for (const optKey of [
+          "humanSimulation",
+          "aioIdleExitMs",
+          "focusIdleBlurMs",
+          "sendEchoTimeoutMs",
+          "richMediaEchoTimeoutMs",
+          "dedupeWindowMs",
+          "autoQuickLogin",
+          "keepMapHook",
+          "quietLogs",
+        ]) {
+          if (raw && raw[optKey] !== undefined) {
+            defaultConfig[optKey] = raw[optKey];
+          }
         }
         hasExplicitHttpServersKey = Array.isArray(nets.httpServers);
         hasExplicitWsServersKey = Array.isArray(nets.wsServers);
@@ -465,13 +496,34 @@ function loadBridgeConfig(customConfigDir) {
     } catch (_) {}
   }
 
-  const envHttpPort = Number(process.env.ROSMONTIS_HTTP_PORT || process.env.ONEBOT_HTTP_PORT || 0);
-  const envWsPort = Number(process.env.ROSMONTIS_WS_PORT || process.env.ONEBOT_WS_PORT || 0);
-  const envRevWsUrl = process.env.ROSMONTIS_REVERSE_WS_URL || process.env.ONEBOT_REVERSE_WS_URL || "";
+  const envHttpPort = Number(
+    process.env.ROSMONTIS_HTTP_PORT ||
+      process.env.ONEBOT_HTTP_PORT ||
+      process.env.XIAO_BRIDGE_HTTP_PORT ||
+      0
+  );
+  const envWsPort = Number(
+    process.env.ROSMONTIS_WS_PORT ||
+      process.env.ONEBOT_WS_PORT ||
+      process.env.XIAO_BRIDGE_WS_PORT ||
+      0
+  );
+  const envRevWsUrl =
+    process.env.ROSMONTIS_REVERSE_WS_URL ||
+    process.env.ONEBOT_REVERSE_WS_URL ||
+    process.env.XIAO_BRIDGE_REVERSE_WS_URL ||
+    "";
   const envToken = String(
-    process.env.ROSMONTIS_ACCESS_TOKEN || process.env.ONEBOT_ACCESS_TOKEN || ""
+    process.env.ROSMONTIS_ACCESS_TOKEN ||
+      process.env.ONEBOT_ACCESS_TOKEN ||
+      process.env.XIAO_BRIDGE_ACCESS_TOKEN ||
+      ""
   ).trim();
-  const listenHost = process.env.ROSMONTIS_HOST || process.env.ONEBOT_HOST || "0.0.0.0";
+  const listenHost =
+    process.env.ROSMONTIS_HOST ||
+    process.env.ONEBOT_HOST ||
+    process.env.XIAO_BRIDGE_HOST ||
+    "0.0.0.0";
 
   if (defaultConfig.httpServers.length === 0 && (!loadedFromFile || !hasExplicitHttpServersKey || envHttpPort > 0)) {
     defaultConfig.httpServers.push({
@@ -766,6 +818,25 @@ function isBridgeUnavailableError(err) {
   return String(err.message || err).includes(BRIDGE_UNAVAILABLE_TAG);
 }
 
+let cachedRendererBridgeSource = null;
+
+function getRendererBridgeSource() {
+  if (cachedRendererBridgeSource !== null) {
+    return cachedRendererBridgeSource;
+  }
+  try {
+    const rendererPath = path.join(__dirname, "bridge_renderer.js");
+    if (!fs.existsSync(rendererPath)) {
+      cachedRendererBridgeSource = "";
+      return "";
+    }
+    cachedRendererBridgeSource = fs.readFileSync(rendererPath, "utf8");
+    return cachedRendererBridgeSource;
+  } catch (_) {
+    return "";
+  }
+}
+
 class NtqqOneBotBridge extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -803,6 +874,7 @@ class NtqqOneBotBridge extends EventEmitter {
 
     this.rendererExecute = options.rendererExecute || null; // async (cmd, args) => result
     this.rendererSimulateSession = options.rendererSimulateSession || null;
+    this.rendererLeaveSession = options.rendererLeaveSession || null;
     this.activeWebContents = null;
     this._knownWebContents = new Set();
     this._attachedEmitters = new WeakSet();
@@ -821,6 +893,11 @@ class NtqqOneBotBridge extends EventEmitter {
     this._tempCleanupRing = []; // bounded ring of cleanup callbacks
     this._activeAioPeer = null;
     this._activeAioPeerKey = "";
+    this._windowFocused = false;
+    this._aioMutex = Promise.resolve();
+    this._aioInteractionSeq = 0;
+    this._aioIdleTimer = null;
+    this._focusBlurTimer = null;
     this._logThrottle = new Map(); // key -> last log timestamp
     this.invokeStats = {
       tier1: 0,
@@ -989,7 +1066,11 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   _mapHookReleaseDisabled() {
-    return process.env.ROSMONTIS_KEEP_MAP_HOOK === "1" || this.config?.keepMapHook === true;
+    return (
+      process.env.ROSMONTIS_KEEP_MAP_HOOK === "1" ||
+      process.env.XIAO_BRIDGE_KEEP_MAP_HOOK === "1" ||
+      this.config?.keepMapHook === true
+    );
   }
 
   _scheduleMapHookMaxLifetime() {
@@ -1600,6 +1681,13 @@ class NtqqOneBotBridge extends EventEmitter {
       webContents.on("destroyed", onDestroyed);
     }
 
+    let pageInjected = false;
+    let injectPending = false;
+    const resetPageInjected = () => {
+      pageInjected = false;
+      injectPending = false;
+    };
+
     const injectScript = () => {
       try {
         if (!this._isWebContentsAlive(webContents)) return;
@@ -1616,24 +1704,44 @@ class NtqqOneBotBridge extends EventEmitter {
         if (this._shouldPromoteWebContents(webContents)) {
           this.activeWebContents = webContents;
         }
-        const rendererPath = path.join(__dirname, "bridge_renderer.js");
-        if (!fs.existsSync(rendererPath)) return;
-        const code = fs.readFileSync(rendererPath, "utf8");
+        const maybeTriggerQuickLogin = () => {
+          if (!this.online && url.includes("login") && this.config.autoQuickLogin !== false) {
+            const timer = setTimeout(() => {
+              this._tryAutoQuickLogin({ webContents }).catch(() => {});
+            }, 1500);
+            if (timer && typeof timer.unref === "function") timer.unref();
+          }
+        };
+        if (pageInjected || injectPending) {
+          maybeTriggerQuickLogin();
+          return;
+        }
+        const code = getRendererBridgeSource();
+        if (!code) return;
         const wid = Number(webContents.id || 1);
-        const script = `(function(){ window.__ROSMONTIS_WINDOW_ID__ = ${wid}; ${code}\n if (typeof installRendererBridge === "function") { installRendererBridge(window, { windowId: ${wid}, autoRegisterListeners: true }); } })();`;
+        const syncPatchJson = JSON.stringify({
+          activeAioPeer: this._activeAioPeer,
+          activeAioPeerKey: this._activeAioPeerKey,
+          focused: this._windowFocused,
+        });
+        const script = `(function(){ if (window.__ROSMONTIS_RENDERER_BRIDGE__) { window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(${wid}); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(${syncPatchJson}); return true; } window.__ROSMONTIS_WINDOW_ID__ = ${wid}; ${code}\n if (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: ${wid}, autoRegisterListeners: true }); if (b && typeof b.syncSessionState === "function") b.syncSessionState(${syncPatchJson}); } return true; })();`;
+        injectPending = true;
         Promise.resolve(webContents.executeJavaScript(script, true))
           .then(() => {
-            if (!this.online && url.includes("login") && this.config.autoQuickLogin !== false) {
-              const timer = setTimeout(() => {
-                this._tryAutoQuickLogin({ webContents }).catch(() => {});
-              }, 1500);
-              if (timer && typeof timer.unref === "function") timer.unref();
-            }
+            injectPending = false;
+            pageInjected = true;
+            maybeTriggerQuickLogin();
           })
-          .catch(() => {});
-      } catch (_) {}
+          .catch(() => {
+            injectPending = false;
+          });
+      } catch (_) {
+        injectPending = false;
+      }
     };
 
+    webContents.on("did-start-loading", resetPageInjected);
+    webContents.on("did-navigate", resetPageInjected);
     webContents.on("dom-ready", injectScript);
     webContents.on("did-finish-load", injectScript);
     webContents.on("did-navigate-in-page", injectScript);
@@ -1811,7 +1919,13 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   _logWarn(key, message, intervalMs = 60000) {
-    if (process.env.ROSMONTIS_QUIET === "1" || this.config?.quietLogs) return;
+    if (
+      process.env.ROSMONTIS_QUIET === "1" ||
+      process.env.XIAO_BRIDGE_QUIET === "1" ||
+      this.config?.quietLogs
+    ) {
+      return;
+    }
     const now = Date.now();
     const last = this._logThrottle.get(key) || 0;
     if (now - last < intervalMs) return;
@@ -1958,7 +2072,166 @@ class NtqqOneBotBridge extends EventEmitter {
     throw unavailable;
   }
 
-  async simulateHumanSession(opts) {
+  _withAioLock(fn) {
+    const run = () => Promise.resolve().then(fn);
+    const task = this._aioMutex.then(run, run);
+    this._aioMutex = task.then(
+      () => {},
+      () => {}
+    );
+    return task;
+  }
+
+  _clearIdleTimers() {
+    if (this._aioIdleTimer) {
+      clearTimeout(this._aioIdleTimer);
+      this._aioIdleTimer = null;
+    }
+    if (this._focusBlurTimer) {
+      clearTimeout(this._focusBlurTimer);
+      this._focusBlurTimer = null;
+    }
+  }
+
+  _resetHumanSessionState({ resetRenderer = false } = {}) {
+    this._aioInteractionSeq += 1;
+    this._clearIdleTimers();
+    this._activeAioPeer = null;
+    this._activeAioPeerKey = "";
+    this._windowFocused = false;
+    this._recentReadByPeer.clear();
+    this._recentTypingByPeer.clear();
+    if (
+      resetRenderer &&
+      this._isWebContentsAlive(this.activeWebContents) &&
+      typeof this.activeWebContents.executeJavaScript === "function"
+    ) {
+      Promise.resolve(
+        this.activeWebContents.executeJavaScript(
+          "window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.resetSessionState && window.__ROSMONTIS_RENDERER_BRIDGE__.resetSessionState()",
+          true
+        )
+      ).catch(() => {});
+    }
+  }
+
+  _touchAioActivity() {
+    this._aioInteractionSeq += 1;
+    const seq = this._aioInteractionSeq;
+    this._clearIdleTimers();
+    if (this.config.humanSimulation === false) return;
+
+    const aioIdleMs = Number(this.config.aioIdleExitMs ?? 45000);
+    if (aioIdleMs > 0) {
+      this._aioIdleTimer = setTimeout(() => {
+        this._aioIdleTimer = null;
+        if (seq !== this._aioInteractionSeq || !this._activeAioPeer) return;
+        this._withAioLock(async () => {
+          if (seq !== this._aioInteractionSeq || !this._activeAioPeer) return;
+          await this._leaveSessionUnlocked({ exitAio: true, blurWindow: false });
+        }).catch(() => {});
+      }, aioIdleMs);
+      if (typeof this._aioIdleTimer.unref === "function") this._aioIdleTimer.unref();
+    }
+
+    const focusBlurMs = Number(this.config.focusIdleBlurMs ?? 300000);
+    if (focusBlurMs > 0) {
+      this._focusBlurTimer = setTimeout(() => {
+        this._focusBlurTimer = null;
+        if (seq !== this._aioInteractionSeq || (!this._windowFocused && !this._activeAioPeer)) {
+          return;
+        }
+        this._withAioLock(async () => {
+          if (seq !== this._aioInteractionSeq || (!this._windowFocused && !this._activeAioPeer)) {
+            return;
+          }
+          await this._leaveSessionUnlocked({ exitAio: true, blurWindow: true });
+        }).catch(() => {});
+      }, focusBlurMs);
+      if (typeof this._focusBlurTimer.unref === "function") this._focusBlurTimer.unref();
+    }
+  }
+
+  async _leaveSessionUnlocked({ exitAio = true, blurWindow = false } = {}) {
+    const shouldExitAio = Boolean(exitAio && this._activeAioPeer && this._activeAioPeerKey);
+    const shouldBlur = Boolean(blurWindow && this._windowFocused);
+    if (!shouldExitAio && !shouldBlur) {
+      return { exitedAio: false, blurredWindow: false };
+    }
+
+    const leaveOpts = {
+      exitAio: shouldExitAio,
+      blurWindow: shouldBlur,
+      knownActivePeer: this._activeAioPeer,
+      knownActivePeerKey: this._activeAioPeerKey,
+      knownFocused: this._windowFocused,
+    };
+
+    if (typeof this.rendererLeaveSession === "function") {
+      try {
+        const res = await this.rendererLeaveSession(leaveOpts);
+        if (res !== undefined && res !== null) {
+          if (shouldExitAio) {
+            this._activeAioPeer = null;
+            this._activeAioPeerKey = "";
+          }
+          if (shouldBlur) {
+            this._windowFocused = false;
+          }
+          return res;
+        }
+      } catch (_) {}
+    }
+
+    if (
+      this._isWebContentsAlive(this.activeWebContents) &&
+      typeof this.activeWebContents.executeJavaScript === "function"
+    ) {
+      try {
+        const optsJson = JSON.stringify(leaveOpts);
+        const js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.leaveHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.leaveHumanSessionFlow(${optsJson}) : null`;
+        const res = await this.activeWebContents.executeJavaScript(js, true);
+        if (res && typeof res === "object" && ("exitedAio" in res || "blurredWindow" in res)) {
+          if (shouldExitAio) {
+            this._activeAioPeer = null;
+            this._activeAioPeerKey = "";
+          }
+          if (shouldBlur) {
+            this._windowFocused = false;
+          }
+          return res;
+        }
+      } catch (_) {}
+    }
+
+    let exitedAio = false;
+    let blurredWindow = false;
+    if (shouldExitAio) {
+      const prevPeer = this._activeAioPeer;
+      this._activeAioPeer = null;
+      this._activeAioPeerKey = "";
+      try {
+        await this.invokeNt("nodeIKernelMsgService/enterOrExitAio", {
+          info: { peer: prevPeer, enterType: 2 },
+        });
+        exitedAio = true;
+      } catch (_) {}
+    }
+    if (shouldBlur) {
+      this._windowFocused = false;
+      try {
+        await this.invokeNt("nodeIKernelMsgService/setFocusOnBase", { isFocus: false });
+        blurredWindow = true;
+      } catch (_) {}
+    }
+    return { fallback: true, exitedAio, blurredWindow };
+  }
+
+  async leaveHumanSession(opts) {
+    return this._withAioLock(() => this._leaveSessionUnlocked(opts));
+  }
+
+  async _activateSessionUnlocked(opts) {
     const peer = {
       chatType: Number(opts?.chatType || 1),
       peerUid: String(opts?.peerUid || ""),
@@ -1968,7 +2241,7 @@ class NtqqOneBotBridge extends EventEmitter {
 
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId}`;
     const now = Date.now();
-    const dedupeMs = Number(opts?.dedupeWindowMs ?? 5000);
+    const dedupeMs = Number(opts?.dedupeWindowMs ?? this.config?.dedupeWindowMs ?? 5000);
     const effEventType = Number(opts?.eventType ?? 1);
     const shouldMarkRead =
       Boolean(opts?.markRead) && now - (this._recentReadByPeer.get(peerKey) || 0) >= dedupeMs;
@@ -1985,12 +2258,17 @@ class NtqqOneBotBridge extends EventEmitter {
       sendTyping: shouldSendTyping,
       eventType: effEventType,
       dedupeWindowMs: dedupeMs,
+      bypassDedupe: true,
+      knownActivePeer: this._activeAioPeer,
+      knownActivePeerKey: this._activeAioPeerKey,
+      knownFocused: this._windowFocused,
     };
 
     if (typeof this.rendererSimulateSession === "function") {
       try {
         const res = await this.rendererSimulateSession(effectiveOpts);
         if (res !== undefined && res !== null) {
+          this._windowFocused = res.focused !== undefined ? Boolean(res.focused) : true;
           this._activeAioPeer = peer;
           this._activeAioPeerKey = peerKey;
           if (shouldMarkRead && res.markRead !== false) {
@@ -1999,10 +2277,12 @@ class NtqqOneBotBridge extends EventEmitter {
           if (shouldSendTyping && effEventType === 1 && res.sendTyping !== false) {
             this._setBoundedMap(this._recentTypingByPeer, peerKey, Date.now());
           }
+          this._touchAioActivity();
           return res;
         }
       } catch (_) {}
     }
+
     if (
       this._isWebContentsAlive(this.activeWebContents) &&
       typeof this.activeWebContents.executeJavaScript === "function"
@@ -2011,7 +2291,8 @@ class NtqqOneBotBridge extends EventEmitter {
         const optsJson = JSON.stringify(effectiveOpts);
         const js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow(${optsJson}) : null`;
         const res = await this.activeWebContents.executeJavaScript(js, true);
-        if (res) {
+        if (res && typeof res === "object" && ("enterOrExitAio" in res || "alreadyInAio" in res)) {
+          this._windowFocused = res.focused !== undefined ? Boolean(res.focused) : true;
           this._activeAioPeer = peer;
           this._activeAioPeerKey = peerKey;
           if (shouldMarkRead && res.markRead !== false) {
@@ -2020,30 +2301,43 @@ class NtqqOneBotBridge extends EventEmitter {
           if (shouldSendTyping && effEventType === 1 && res.sendTyping !== false) {
             this._setBoundedMap(this._recentTypingByPeer, peerKey, Date.now());
           }
+          this._touchAioActivity();
           return res;
         }
       } catch (_) {}
     }
 
-    // Fallback via invokeNt with session-switch and anti-burst deduplication
-    if (this._activeAioPeerKey !== peerKey) {
+    // Fallback via invokeNt with strict causal ordering:
+    // setFocusOnBase(true) -> enterOrExitAio(prev, 2) -> addActiveChatByUid(new) -> enterOrExitAio(new, 1) -> setMsgRead -> sendShowInputStatusReq
+    let didFocus = false;
+    if (!this._windowFocused) {
+      try {
+        await this.invokeNt("nodeIKernelMsgService/setFocusOnBase", { isFocus: true });
+        didFocus = true;
+        this._windowFocused = true;
+      } catch (_) {}
+    } else {
+      didFocus = true;
+    }
+
+    let exitedPreviousAio = false;
+    const alreadyInAio = this._activeAioPeerKey === peerKey;
+    if (!alreadyInAio) {
       if (this._activeAioPeer && this._activeAioPeerKey) {
         try {
           await this.invokeNt("nodeIKernelMsgService/enterOrExitAio", {
             info: { peer: this._activeAioPeer, enterType: 2 },
           });
+          exitedPreviousAio = true;
         } catch (_) {}
       }
-      try {
-        await this.invokeNt("nodeIKernelMsgService/enterOrExitAio", {
-          info: { peer, enterType: 1 },
-        });
-      } catch (_) {}
       try {
         await this.invokeNt("nodeIKernelMsgService/addActiveChatByUid", { peer });
       } catch (_) {}
       try {
-        await this.invokeNt("nodeIKernelMsgService/setFocusOnBase", { isFocus: true });
+        await this.invokeNt("nodeIKernelMsgService/enterOrExitAio", {
+          info: { peer, enterType: 1 },
+        });
       } catch (_) {}
       this._activeAioPeer = peer;
       this._activeAioPeerKey = peerKey;
@@ -2072,7 +2366,19 @@ class NtqqOneBotBridge extends EventEmitter {
         }
       } catch (_) {}
     }
-    return { fallback: true, markRead: didMarkRead, sendTyping: didSendTyping };
+    this._touchAioActivity();
+    return {
+      fallback: true,
+      alreadyInAio,
+      exitedPreviousAio,
+      setFocusOnBase: didFocus,
+      markRead: didMarkRead,
+      sendTyping: didSendTyping,
+    };
+  }
+
+  async simulateHumanSession(opts) {
+    return this._withAioLock(() => this._activateSessionUnlocked(opts));
   }
 
   // --------------------------------------------------------------------------
@@ -2364,6 +2670,7 @@ class NtqqOneBotBridge extends EventEmitter {
     }
     if (eventName === "onKickedOffLine") {
       this.online = false;
+      this._resetHumanSessionState({ resetRenderer: true });
       this.broadcastOneBotEvent(
         formatNoticeEvent(
           "bot_offline",
@@ -2907,17 +3214,45 @@ class NtqqOneBotBridge extends EventEmitter {
     return true;
   }
 
-  async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
-    if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
-      await this.simulateHumanSession({
-        chatType: peer.chatType,
-        peerUid: peer.peerUid,
-        guildId: peer.guildId || "",
-        markRead: true,
-        sendTyping: peer.chatType === 1,
-      });
-    }
+  _hasRichMediaElements(elements) {
+    if (!Array.isArray(elements)) return false;
+    return elements.some((el) => {
+      if (!el || typeof el !== "object") return false;
+      const t = Number(el.elementType);
+      return (
+        t === 2 ||
+        t === 3 ||
+        t === 4 ||
+        t === 5 ||
+        Boolean(el.picElement || el.fileElement || el.pttElement || el.videoElement)
+      );
+    });
+  }
 
+  _computeSendEchoTimeoutMs(elements) {
+    const textTimeout = Math.max(0, Number(this.config.sendEchoTimeoutMs ?? 3000));
+    if (!this._hasRichMediaElements(elements)) {
+      return textTimeout;
+    }
+    const rawRich =
+      this.config.richMediaEchoTimeoutMs ??
+      this.config.sendRichMediaEchoTimeoutMs ??
+      15000;
+    const baseRich = Math.max(textTimeout, Math.max(0, Number(rawRich)));
+    let totalBytes = 0;
+    for (const el of elements) {
+      const sub = el?.picElement || el?.fileElement || el?.pttElement || el?.videoElement;
+      const sz = Number(sub?.fileSize || 0);
+      if (Number.isFinite(sz) && sz > 0) totalBytes += sz;
+    }
+    const extraMb =
+      totalBytes > 1024 * 1024 ? Math.ceil((totalBytes - 1024 * 1024) / (1024 * 1024)) : 0;
+    const maxTimeout = Math.max(baseRich, Number(this.config.maxSendEchoTimeoutMs ?? 60000));
+    return Math.min(maxTimeout, baseRich + extraMb * 2000);
+  }
+
+  async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
+    // Phase 1 (unlocked): concurrent heavy I/O (HTTP media download, EXIF normalize, @UIN->UID)
     const { elements, sideEffects, cleanupCallbacks } = await oneBotSegmentsToNtElements(message, {
       autoEscape,
       groupId,
@@ -2928,35 +3263,55 @@ class NtqqOneBotBridge extends EventEmitter {
     });
 
     try {
-      for (const effect of sideEffects) {
-        if (effect.type === "poke") {
-          await this._sendPokeInternal(
-            peer.chatType === 2 ? Number(peer.peerUid) : undefined,
-            effect.qq || (peer.chatType === 1 ? Number(this.uinUidStore.getUinSync(peer.peerUid)) : 0)
-          );
+      // Phase 2 (AIO-mutex serialized): activate target AIO + dispatch sendMsg IPC, then release immediately
+      const { echoWaiter, sendRes } = await this._withAioLock(async () => {
+        if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
+          await this._activateSessionUnlocked({
+            chatType: peer.chatType,
+            peerUid: peer.peerUid,
+            guildId: peer.guildId || "",
+            markRead: true,
+            sendTyping: peer.chatType === 1,
+          });
         }
-      }
 
-      if (elements.length === 0) {
+        for (const effect of sideEffects) {
+          if (effect.type === "poke") {
+            await this._sendPokeInternal(
+              peer.chatType === 2 ? Number(peer.peerUid) : undefined,
+              effect.qq || (peer.chatType === 1 ? Number(this.uinUidStore.getUinSync(peer.peerUid)) : 0)
+            );
+          }
+        }
+
+        if (elements.length === 0) {
+          return { echoWaiter: null, sendRes: null };
+        }
+
+        const waiter = this._registerSendEchoWaiter(peer, elements);
+        try {
+          const res = await this.invokeNt(
+            "nodeIKernelMsgService/sendMsg",
+            {
+              msgId: "0",
+              peer,
+              msgElements: elements,
+              msgAttributeInfos: new Map(),
+            },
+            ["0", peer, elements, new Map()]
+          );
+          if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
+            this._touchAioActivity();
+          }
+          return { echoWaiter: waiter, sendRes: res };
+        } catch (err) {
+          waiter.cancel();
+          throw err;
+        }
+      });
+
+      if (!echoWaiter) {
         return { message_id: this.messageIdStore.register("", peer, "0") };
-      }
-
-      const echoWaiter = this._registerSendEchoWaiter(peer, elements);
-      let sendRes;
-      try {
-        sendRes = await this.invokeNt(
-          "nodeIKernelMsgService/sendMsg",
-          {
-            msgId: "0",
-            peer,
-            msgElements: elements,
-            msgAttributeInfos: new Map(),
-          },
-          ["0", peer, elements, new Map()]
-        );
-      } catch (err) {
-        echoWaiter.cancel();
-        throw err;
       }
 
       if (sendRes && typeof sendRes.result === "number" && sendRes.result !== 0) {
@@ -2964,6 +3319,7 @@ class NtqqOneBotBridge extends EventEmitter {
         throw new Error(sendRes.errMsg || `sendMsg failed with code ${sendRes.result}`);
       }
 
+      // Phase 3 (unlocked): await onAddSendMsg echo correlation without holding _aioMutex
       const normId = (v) => (v !== undefined && v !== null && String(v) !== "0" ? String(v) : "");
       let realMsgId = normId(sendRes?.msgId || sendRes?.msgRecord?.msgId);
       let msgSeq = String(sendRes?.msgSeq || sendRes?.msgRecord?.msgSeq || "0");
@@ -2972,7 +3328,8 @@ class NtqqOneBotBridge extends EventEmitter {
         echoWaiter.cancel();
         this.sendEchoStats.fromResult += 1;
       } else {
-        const echo = await echoWaiter.wait(Number(this.config.sendEchoTimeoutMs ?? 3000));
+        const echoTimeoutMs = this._computeSendEchoTimeoutMs(elements);
+        const echo = await echoWaiter.wait(echoTimeoutMs);
         if (echo && echo.msgId) {
           realMsgId = echo.msgId;
           if (msgSeq === "0" && echo.msgSeq) msgSeq = echo.msgSeq;
@@ -2982,7 +3339,7 @@ class NtqqOneBotBridge extends EventEmitter {
           this.sendEchoStats.timedOut += 1;
           this._logWarn(
             `send-echo-timeout:${this._sendPeerKey(peer)}`,
-            `sendMsg to ${this._sendPeerKey(peer)} succeeded but no onAddSendMsg echo arrived; message_id will not be recallable`
+            `sendMsg to ${this._sendPeerKey(peer)} succeeded but no onAddSendMsg echo arrived within ${echoTimeoutMs}ms; message_id will not be recallable`
           );
         }
       }
@@ -5702,6 +6059,8 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   async stopServers() {
+    this._aioInteractionSeq += 1;
+    this._clearIdleTimers();
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
@@ -5757,6 +6116,8 @@ function installMainBridge(options = {}) {
 if (
   require.main !== module &&
   process.env.ROSMONTIS_NO_AUTOINSTALL !== "1" &&
+  process.env.ROSMONTIS_BRIDGE_NO_AUTOINSTALL !== "1" &&
+  process.env.XIAO_BRIDGE_NO_AUTOINSTALL !== "1" &&
   process.versions &&
   process.versions.electron
 ) {

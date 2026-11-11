@@ -474,6 +474,108 @@ function installRendererBridge(targetWindow, options = {}) {
     });
   }
 
+  function rethrowIfBridgeUnavailable(err) {
+    if (err && String(err.message || err).includes("ROSMONTIS_BRIDGE_UNAVAILABLE")) {
+      throw err;
+    }
+  }
+
+  function syncSessionState(patch = {}) {
+    if (!patch || typeof patch !== "object") {
+      return {
+        activeAioPeer: sessionState.activeAioPeer,
+        activeAioPeerKey: sessionState.activeAioPeerKey,
+        focused: sessionState.focused,
+      };
+    }
+    if ("activeAioPeer" in patch && patch.activeAioPeer !== undefined) {
+      sessionState.activeAioPeer = patch.activeAioPeer || null;
+    }
+    if ("activeAioPeerKey" in patch && patch.activeAioPeerKey !== undefined) {
+      sessionState.activeAioPeerKey = String(patch.activeAioPeerKey || "");
+      if (!sessionState.activeAioPeerKey) {
+        sessionState.activeAioPeer = null;
+      }
+    }
+    if ("focused" in patch && patch.focused !== undefined) {
+      sessionState.focused = Boolean(patch.focused);
+    }
+    if (patch.clearDedupe) {
+      sessionState.lastReadAtByPeer.clear();
+      sessionState.lastTypingAtByPeer.clear();
+    }
+    return {
+      activeAioPeer: sessionState.activeAioPeer,
+      activeAioPeerKey: sessionState.activeAioPeerKey,
+      focused: sessionState.focused,
+    };
+  }
+
+  async function leaveHumanSessionFlow({
+    exitAio = true,
+    blurWindow = false,
+    knownActivePeer = undefined,
+    knownActivePeerKey = undefined,
+    knownFocused = undefined,
+  } = {}) {
+    syncSessionState({
+      activeAioPeer: knownActivePeer,
+      activeAioPeerKey: knownActivePeerKey,
+      focused: knownFocused,
+    });
+
+    const result = {
+      exitedAio: false,
+      blurredWindow: false,
+      activeAioPeer: sessionState.activeAioPeer,
+      activeAioPeerKey: sessionState.activeAioPeerKey,
+      focused: sessionState.focused,
+    };
+
+    if (exitAio && sessionState.activeAioPeer && sessionState.activeAioPeerKey) {
+      const prevPeer = sessionState.activeAioPeer;
+      sessionState.activeAioPeer = null;
+      sessionState.activeAioPeerKey = "";
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/enterOrExitAio",
+          [
+            {
+              info: {
+                peer: prevPeer,
+                enterType: 2,
+              },
+            },
+            null,
+          ],
+          4000
+        );
+        result.exitedAio = true;
+      } catch (err) {
+        rethrowIfBridgeUnavailable(err);
+      }
+    }
+
+    if (blurWindow && sessionState.focused) {
+      sessionState.focused = false;
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/setFocusOnBase",
+          [{ isFocus: false }, null],
+          4000
+        );
+        result.blurredWindow = true;
+      } catch (err) {
+        rethrowIfBridgeUnavailable(err);
+      }
+    }
+
+    result.activeAioPeer = sessionState.activeAioPeer;
+    result.activeAioPeerKey = sessionState.activeAioPeerKey;
+    result.focused = sessionState.focused;
+    return result;
+  }
+
   async function simulateHumanSessionFlow({
     chatType = 1,
     peerUid = "",
@@ -482,7 +584,17 @@ function installRendererBridge(targetWindow, options = {}) {
     sendTyping = false,
     eventType = 1,
     dedupeWindowMs = 5000,
+    bypassDedupe = false,
+    knownActivePeer = undefined,
+    knownActivePeerKey = undefined,
+    knownFocused = undefined,
   } = {}) {
+    syncSessionState({
+      activeAioPeer: knownActivePeer,
+      activeAioPeerKey: knownActivePeerKey,
+      focused: knownFocused,
+    });
+
     const peer = {
       chatType: Number(chatType),
       peerUid: String(peerUid || ""),
@@ -496,6 +608,7 @@ function installRendererBridge(targetWindow, options = {}) {
       enterOrExitAio: false,
       addActiveChatByUid: false,
       setFocusOnBase: false,
+      focusActivated: false,
       markRead: false,
       markReadSkipped: false,
       sendTyping: false,
@@ -509,6 +622,25 @@ function installRendererBridge(targetWindow, options = {}) {
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId}`;
     const now = Date.now();
 
+    // 1. Causal step 1: bring window to foreground focus BEFORE touching chat list / AIO
+    if (!sessionState.focused) {
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/setFocusOnBase",
+          [{ isFocus: true }, null],
+          4000
+        );
+        steps.setFocusOnBase = true;
+        steps.focusActivated = true;
+        sessionState.focused = true;
+      } catch (err) {
+        rethrowIfBridgeUnavailable(err);
+      }
+    } else {
+      steps.setFocusOnBase = true;
+    }
+
+    // 2. Causal step 2: leave previous AIO (if any) -> addActiveChatByUid -> enterOrExitAio(1)
     if (sessionState.activeAioPeerKey !== peerKey) {
       if (sessionState.activeAioPeer && sessionState.activeAioPeerKey) {
         try {
@@ -526,7 +658,20 @@ function installRendererBridge(targetWindow, options = {}) {
             4000
           );
           steps.exitedPreviousAio = true;
-        } catch (_) {}
+        } catch (err) {
+          rethrowIfBridgeUnavailable(err);
+        }
+      }
+
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/addActiveChatByUid",
+          [{ peer }, null],
+          4000
+        );
+        steps.addActiveChatByUid = true;
+      } catch (err) {
+        rethrowIfBridgeUnavailable(err);
       }
 
       try {
@@ -544,29 +689,8 @@ function installRendererBridge(targetWindow, options = {}) {
           4000
         );
         steps.enterOrExitAio = true;
-      } catch (_) {}
-
-      try {
-        await invokeNtApi(
-          "nodeIKernelMsgService/addActiveChatByUid",
-          [{ peer }, null],
-          4000
-        );
-        steps.addActiveChatByUid = true;
-      } catch (_) {}
-
-      if (!sessionState.focused) {
-        try {
-          await invokeNtApi(
-            "nodeIKernelMsgService/setFocusOnBase",
-            [{ isFocus: true }, null],
-            4000
-          );
-          steps.setFocusOnBase = true;
-          sessionState.focused = true;
-        } catch (_) {}
-      } else {
-        steps.setFocusOnBase = true;
+      } catch (err) {
+        rethrowIfBridgeUnavailable(err);
       }
 
       sessionState.activeAioPeer = peer;
@@ -575,12 +699,12 @@ function installRendererBridge(targetWindow, options = {}) {
       steps.alreadyInAio = true;
       steps.enterOrExitAio = true;
       steps.addActiveChatByUid = true;
-      steps.setFocusOnBase = sessionState.focused;
     }
 
+    // 3. Causal step 3: mark conversation read
     if (markRead) {
       const lastReadAt = sessionState.lastReadAtByPeer.get(peerKey) || 0;
-      if (now - lastReadAt >= dedupeWindowMs) {
+      if (bypassDedupe || now - lastReadAt >= dedupeWindowMs) {
         try {
           await invokeNtApi(
             "nodeIKernelMsgService/setMsgRead",
@@ -589,16 +713,19 @@ function installRendererBridge(targetWindow, options = {}) {
           );
           steps.markRead = true;
           setBoundedMap(sessionState.lastReadAtByPeer, peerKey, Date.now());
-        } catch (_) {}
+        } catch (err) {
+          rethrowIfBridgeUnavailable(err);
+        }
       } else {
         steps.markReadSkipped = true;
       }
     }
 
+    // 4. Causal step 4: show typing indicator in private chat
     if (sendTyping && Number(chatType) === 1) {
       const effEventType = Number(eventType ?? 1);
       const lastTypingAt = sessionState.lastTypingAtByPeer.get(peerKey) || 0;
-      if (effEventType !== 1 || now - lastTypingAt >= dedupeWindowMs) {
+      if (bypassDedupe || effEventType !== 1 || now - lastTypingAt >= dedupeWindowMs) {
         try {
           await invokeNtApi(
             "nodeIKernelMsgService/sendShowInputStatusReq",
@@ -619,17 +746,22 @@ function installRendererBridge(targetWindow, options = {}) {
           if (effEventType === 1) {
             setBoundedMap(sessionState.lastTypingAtByPeer, peerKey, Date.now());
           }
-        } catch (_) {}
+        } catch (err) {
+          rethrowIfBridgeUnavailable(err);
+        }
       } else {
         steps.sendTypingSkipped = true;
       }
     }
 
+    steps.activeAioPeer = sessionState.activeAioPeer;
+    steps.activeAioPeerKey = sessionState.activeAioPeerKey;
+    steps.focused = sessionState.focused;
     return steps;
   }
 
   const bridgeApi = {
-    version: "1.1.0",
+    version: "1.2.0",
     get windowId() {
       return windowId;
     },
@@ -643,6 +775,7 @@ function installRendererBridge(targetWindow, options = {}) {
     get sessionState() {
       return sessionState;
     },
+    syncSessionState,
     resetSessionState() {
       sessionState.activeAioPeer = null;
       sessionState.activeAioPeerKey = "";
@@ -660,6 +793,7 @@ function installRendererBridge(targetWindow, options = {}) {
       return JSON.stringify(res === undefined ? { __rosmontisVoid__: true } : encodeBridgeMaps(res));
     },
     simulateHumanSessionFlow,
+    leaveHumanSessionFlow,
     _handleIncomingMainIpc: handleIncomingMainIpc,
   };
 

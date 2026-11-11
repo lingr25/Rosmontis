@@ -864,6 +864,8 @@ async function resolveMediaSource(sourceStr, options = {}) {
   const tempDir =
     options.tempDir ||
     process.env.ROSMONTIS_TEMP_DIR ||
+    process.env.ONEBOT_TEMP_DIR ||
+    process.env.XIAO_BRIDGE_TEMP_DIR ||
     path.join(process.env.HOME || "/tmp", ".rosmontis_tmp");
   fs.mkdirSync(tempDir, { recursive: true });
   const maxTempFiles = Math.max(8, Number(options.maxTempFiles || 128));
