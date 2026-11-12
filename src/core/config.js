@@ -7,6 +7,7 @@ const {
   DEFAULT_MAX_HTTP_BODY_BYTES,
   DEFAULT_MAX_WS_PAYLOAD_BYTES,
 } = require("./transport_security");
+const { DEFAULT_MAX_WS_SEND_BUFFER_BYTES } = require("./ws_rfc6455");
 
 function filterEnabledEntries(list) {
   if (!Array.isArray(list)) return [];
@@ -341,6 +342,38 @@ function loadBridgeConfig(customConfigDir) {
     "ROSMONTIS_MAX_WS_PAYLOAD_BYTES",
     "ONEBOT_MAX_WS_PAYLOAD_BYTES",
     "XIAO_BRIDGE_MAX_WS_PAYLOAD_BYTES"
+  );
+
+  defaultConfig.maxWsSendBufferBytes = _resolvePositiveIntWithDefault(
+    loadedRaw.maxWsSendBufferBytes,
+    DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
+    "ROSMONTIS_MAX_WS_SEND_BUFFER_BYTES",
+    "ONEBOT_MAX_WS_SEND_BUFFER_BYTES",
+    "XIAO_BRIDGE_MAX_WS_SEND_BUFFER_BYTES"
+  );
+
+  defaultConfig.wsPingIntervalMs = _resolveNonNegativeNumberWithDefault(
+    loadedRaw.wsPingIntervalMs,
+    30000,
+    "ROSMONTIS_WS_PING_INTERVAL_MS",
+    "ONEBOT_WS_PING_INTERVAL_MS",
+    "XIAO_BRIDGE_WS_PING_INTERVAL_MS"
+  );
+
+  defaultConfig.wsPongTimeoutMs = _resolvePositiveIntWithDefault(
+    loadedRaw.wsPongTimeoutMs,
+    90000,
+    "ROSMONTIS_WS_PONG_TIMEOUT_MS",
+    "ONEBOT_WS_PONG_TIMEOUT_MS",
+    "XIAO_BRIDGE_WS_PONG_TIMEOUT_MS"
+  );
+
+  defaultConfig.forwardEchoTimeoutMs = _resolveNonNegativeNumberWithDefault(
+    loadedRaw.forwardEchoTimeoutMs,
+    0,
+    "ROSMONTIS_FORWARD_ECHO_TIMEOUT_MS",
+    "ONEBOT_FORWARD_ECHO_TIMEOUT_MS",
+    "XIAO_BRIDGE_FORWARD_ECHO_TIMEOUT_MS"
   );
 
   _applyOptionalBoolOverride(

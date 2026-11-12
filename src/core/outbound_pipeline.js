@@ -268,14 +268,16 @@ const outboundPipelineMixin = {
     return `${Number(peer?.chatType) || 0}:${String(peer?.peerUid || "")}`;
   },
 
-  _registerSendEchoWaiter(peer, elements) {
+  _registerSendEchoWaiter(peer, elements, elementPredicate = null) {
     const key = this._sendPeerKey(peer);
     const sigFn =
       typeof this?.constructor?._ntElementsSignature === "function"
         ? this.constructor._ntElementsSignature
         : _ntElementsSignature;
+    const hasPredicate = typeof elementPredicate === "function";
     const waiter = {
-      sig: sigFn(elements),
+      sig: hasPredicate ? null : sigFn(elements),
+      elementPredicate: hasPredicate ? elementPredicate : null,
       echo: null,
       resolve: null,
       done: false,
@@ -342,10 +344,15 @@ const outboundPipelineMixin = {
       typeof this?.constructor?._elementsSignatureMatch === "function"
         ? this.constructor._elementsSignatureMatch
         : _elementsSignatureMatch;
-    const sig = sigFn(ntMsg.elements);
-    const waiter = queue.find(
-      (w) => !w.done && !w.echo && matchFn(w.sig, sig)
-    );
+    let sig = null;
+    const waiter = queue.find((w) => {
+      if (w.done || w.echo) return false;
+      if (typeof w.elementPredicate === "function") {
+        return Boolean(w.elementPredicate(ntMsg));
+      }
+      if (!sig) sig = sigFn(ntMsg.elements);
+      return matchFn(w.sig, sig);
+    });
     if (!waiter) return false;
     waiter.echo = {
       msgId: String(ntMsg.msgId),
@@ -488,6 +495,7 @@ const outboundPipelineMixin = {
       let realMsgId = normId(sendRes?.msgId || sendRes?.msgRecord?.msgId);
       let msgSeq = String(sendRes?.msgSeq || sendRes?.msgRecord?.msgSeq || "0");
       let msgTime = Math.floor(Date.now() / 1000);
+      let echoRawMsg = sendRes?.msgRecord || null;
       if (realMsgId) {
         echoWaiter.cancel();
         this.sendEchoStats.fromResult += 1;
@@ -498,6 +506,7 @@ const outboundPipelineMixin = {
           realMsgId = echo.msgId;
           if (msgSeq === "0" && echo.msgSeq) msgSeq = echo.msgSeq;
           if (Number.isFinite(echo.msgTime) && echo.msgTime > 0) msgTime = echo.msgTime;
+          if (echo.rawMsg) echoRawMsg = echo.rawMsg;
           this.sendEchoStats.matched += 1;
         } else {
           this.sendEchoStats.timedOut += 1;
@@ -516,12 +525,84 @@ const outboundPipelineMixin = {
         senderUid: this.selfUid,
         groupId: peer.chatType === 2 ? peer.peerUid : "",
         msgTime,
+        rawMsg: echoRawMsg || null,
       });
+      if (echoRawMsg && typeof this.messageIdStore.indexMsgMedia === "function") {
+        this.messageIdStore.indexMsgMedia(echoRawMsg, shortId);
+      }
 
       return { message_id: shortId, real_id: realMsgId };
     } finally {
       this._scheduleTempCleanup(cleanupCallbacks, Boolean(options.cleanupTempImmediately));
     }
+  },
+
+  async _invokeForwardWithEcho(peer, invokeFn, fallbackSeed = "") {
+    const timeoutMs =
+      Number(this.config?.forwardEchoTimeoutMs) > 0
+        ? Number(this.config.forwardEchoTimeoutMs)
+        : Math.min(Math.max(50, Number(this.config?.sendEchoTimeoutMs) || 200), 200);
+    const echoWaiter = this._registerSendEchoWaiter(
+      peer,
+      null,
+      (ntMsg) => Boolean(ntMsg && ntMsg.msgId && String(ntMsg.msgId) !== "0")
+    );
+
+    let res;
+    try {
+      res = await invokeFn();
+    } catch (err) {
+      echoWaiter.cancel();
+      throw err;
+    }
+
+    if (res && typeof res.result === "number" && res.result !== 0) {
+      echoWaiter.cancel();
+      throw new Error(res.errMsg || `forward failed with code ${res.result}`);
+    }
+
+    const normId = (v) => (v !== undefined && v !== null && String(v) !== "0" ? String(v) : "");
+    const directMsgId = normId(res?.msgId || res?.result?.msgId || res?.msgRecord?.msgId);
+    const directSeq = String(res?.msgSeq || res?.result?.msgSeq || res?.msgRecord?.msgSeq || "0");
+    if (directMsgId) {
+      echoWaiter.cancel();
+      const rawMsg = res?.msgRecord || null;
+      const oneBotId = this.messageIdStore.register(directMsgId, peer, directSeq, {
+        senderUin: this.selfUin,
+        senderUid: this.selfUid,
+        groupId: peer.chatType === 2 ? peer.peerUid : "",
+        rawMsg,
+      });
+      if (rawMsg && typeof this.messageIdStore.indexMsgMedia === "function") {
+        this.messageIdStore.indexMsgMedia(rawMsg, oneBotId);
+      }
+      return { message_id: oneBotId, real_id: String(directMsgId), msgId: String(directMsgId) };
+    }
+
+    const echo = await echoWaiter.wait(timeoutMs);
+    if (echo && echo.msgId) {
+      const rawMsg = echo.rawMsg || null;
+      const oneBotId = this.messageIdStore.register(echo.msgId, peer, echo.msgSeq || "0", {
+        senderUin: this.selfUin,
+        senderUid: this.selfUid,
+        groupId: peer.chatType === 2 ? peer.peerUid : "",
+        ...(Number.isFinite(echo.msgTime) && echo.msgTime > 0 ? { msgTime: echo.msgTime } : {}),
+        rawMsg,
+      });
+      if (rawMsg && typeof this.messageIdStore.indexMsgMedia === "function") {
+        this.messageIdStore.indexMsgMedia(rawMsg, oneBotId);
+      }
+      return { message_id: oneBotId, real_id: String(echo.msgId), msgId: String(echo.msgId) };
+    }
+
+    const seedPart = fallbackSeed ? `${String(fallbackSeed)}_` : "";
+    const syntheticId = `fwd_${seedPart}${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const oneBotId = this.messageIdStore.register(syntheticId, peer, "0", {
+      senderUin: this.selfUin,
+      senderUid: this.selfUid,
+      groupId: peer.chatType === 2 ? peer.peerUid : "",
+    });
+    return { message_id: oneBotId, real_id: String(syntheticId), msgId: String(syntheticId) };
   },
 
   async _sendPokeInternal(groupId, userId) {

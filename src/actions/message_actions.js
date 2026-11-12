@@ -1,14 +1,245 @@
 "use strict";
 
+const bridgeOneBot = require("../bridge_onebot");
 const {
   segmentsToCqCode,
   parseCqCodeToSegments,
   normalizeOneBotMessage,
   ntMsgToOneBotSegments,
   formatNtMsgToOneBotEvent,
-} = require("../bridge_onebot");
+} = bridgeOneBot;
 
 const { resolveCompatVersionInfo } = require("../core/config");
+
+const MAX_FORWARD_DEPTH = 3;
+
+function stripTransientNtMedia(ntMsg) {
+  if (typeof bridgeOneBot.stripTransientNtMedia === "function") {
+    return bridgeOneBot.stripTransientNtMedia(ntMsg);
+  }
+  if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
+  for (const el of ntMsg.elements) {
+    if (el && el.picElement && Object.prototype.hasOwnProperty.call(el.picElement, "__base64Uri")) {
+      delete el.picElement.__base64Uri;
+    }
+  }
+}
+
+function resolveStoreEntry(store, id) {
+  if (!store || id === undefined || id === null || id === "") return null;
+  if (typeof store.resolveByOneBotId === "function") {
+    const hit = store.resolveByOneBotId(id);
+    if (hit) return hit;
+  }
+  if (typeof store.getByShortId === "function") {
+    const hit = store.getByShortId(id);
+    if (hit) return hit;
+  }
+  if (typeof store.getByMsgId === "function") {
+    const hit = store.getByMsgId(id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function stageForwardNodes(
+  bridge,
+  rawNodes,
+  fallbackPeer,
+  getSelfPeer,
+  defaultSource = "",
+  depth = 1
+) {
+  const nodes = Array.isArray(rawNodes) ? rawNodes : [];
+  const msgInfos = [];
+  let stagedCustomCount = 0;
+  let firstRefPeer = null;
+  const selfNick =
+    bridge.selfNickname && bridge.selfNickname !== "QQBot" ? bridge.selfNickname : "";
+
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const nd = node;
+    const d = nd.data && typeof nd.data === "object" && !Array.isArray(nd.data) ? nd.data : nd;
+    const customName = String(
+      d.name ||
+        d.nickname ||
+        nd.sender?.card ||
+        nd.sender?.nickname ||
+        d.sender?.card ||
+        d.sender?.nickname ||
+        ""
+    ).trim();
+    const customUin = String(
+      d.uin || d.user_id || nd.sender?.user_id || d.sender?.user_id || bridge.selfUin || "0"
+    );
+    const nodeShowName = String(
+      customName || defaultSource || selfNick || customUin || bridge.selfNickname || "QQBot"
+    );
+
+    if (d.id !== undefined && d.id !== null && String(d.id) !== "") {
+      const ref = resolveStoreEntry(bridge.messageIdStore, d.id);
+      if (ref) {
+        const refMsgId = String(ref.msgId || ref.ntMsgId || "");
+        const refPeerUid = String(ref.peer?.peerUid || ref.peerUid || "");
+        const refChatType = Number(ref.peer?.chatType || ref.chatType || 1);
+        if (!firstRefPeer && refPeerUid) {
+          firstRefPeer = {
+            chatType: refChatType,
+            peerUid: refPeerUid,
+            guildId: String(ref.peer?.guildId || ""),
+          };
+        }
+        const refSenderName =
+          customName ||
+          String(
+            ref.oneBotEvent?.sender?.card || ref.oneBotEvent?.sender?.nickname || ""
+          ).trim() ||
+          nodeShowName;
+        if (refMsgId) {
+          msgInfos.push({ msgId: refMsgId, senderShowName: refSenderName });
+        }
+      }
+      continue;
+    }
+
+    const content = d.content !== undefined ? d.content : d.message;
+    if (content === undefined) continue;
+
+    stagedCustomCount += 1;
+    const selfPeer = await getSelfPeer();
+    const rawItems = Array.isArray(content)
+      ? content
+      : content &&
+        typeof content === "object" &&
+        String(content.type || "").trim().toLowerCase() === "node"
+      ? [content]
+      : null;
+    const hasNestedNodes = Boolean(
+      rawItems &&
+        rawItems.some(
+          (it) => it && typeof it === "object" && String(it.type || "").trim().toLowerCase() === "node"
+        )
+    );
+
+    if (!hasNestedNodes) {
+      const subSent = await bridge._sendMessageToPeer(
+        selfPeer,
+        content,
+        false,
+        undefined,
+        { skipHumanSimulation: true }
+      );
+      if (subSent?.real_id) {
+        msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
+      }
+    } else if (depth >= MAX_FORWARD_DEPTH) {
+      const flattened = rawItems.map((it) =>
+        it && typeof it === "object" && String(it.type || "").trim().toLowerCase() === "node"
+          ? { type: "text", data: { text: "[转发消息]" } }
+          : it
+      );
+      const subSent = await bridge._sendMessageToPeer(
+        selfPeer,
+        flattened,
+        false,
+        undefined,
+        { skipHumanSimulation: true }
+      );
+      if (subSent?.real_id) {
+        msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
+      }
+    } else {
+      let idx = 0;
+      while (idx < rawItems.length) {
+        const cur = rawItems[idx];
+        const isNode =
+          cur && typeof cur === "object" && String(cur.type || "").trim().toLowerCase() === "node";
+        if (isNode) {
+          const innerNodes = [];
+          while (
+            idx < rawItems.length &&
+            rawItems[idx] &&
+            typeof rawItems[idx] === "object" &&
+            String(rawItems[idx].type || "").trim().toLowerCase() === "node"
+          ) {
+            innerNodes.push(rawItems[idx]);
+            idx += 1;
+          }
+          const inner = await stageForwardNodes(
+            bridge,
+            innerNodes,
+            selfPeer,
+            getSelfPeer,
+            "",
+            depth + 1
+          );
+          if (inner.msgInfos.length > 0) {
+            const innerFwd = await bridge._invokeForwardWithEcho(selfPeer, () =>
+              bridge.invokeNt(
+                "nodeIKernelMsgService/multiForwardMsgWithComment",
+                {
+                  msgInfos: inner.msgInfos,
+                  srcContact: inner.srcContact,
+                  dstContact: selfPeer,
+                  commentElements: [],
+                  msgAttributeInfos: new Map(),
+                },
+                [inner.msgInfos, inner.srcContact, selfPeer, [], new Map()]
+              )
+            );
+            if (innerFwd?.real_id) {
+              msgInfos.push({ msgId: String(innerFwd.real_id), senderShowName: nodeShowName });
+            }
+          }
+        } else {
+          const segRun = [];
+          while (
+            idx < rawItems.length &&
+            !(
+              rawItems[idx] &&
+              typeof rawItems[idx] === "object" &&
+              String(rawItems[idx].type || "").trim().toLowerCase() === "node"
+            )
+          ) {
+            const seg = rawItems[idx];
+            if (
+              !(
+                seg &&
+                String(seg.type || "").toLowerCase() === "text" &&
+                (seg.data?.text ?? seg.text) === ""
+              )
+            ) {
+              segRun.push(seg);
+            }
+            idx += 1;
+          }
+          if (segRun.length > 0) {
+            const subSent = await bridge._sendMessageToPeer(
+              selfPeer,
+              segRun,
+              false,
+              undefined,
+              { skipHumanSimulation: true }
+            );
+            if (subSent?.real_id) {
+              msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  let srcContact = fallbackPeer;
+  if (stagedCustomCount > 0) {
+    srcContact = await getSelfPeer();
+  } else if (firstRefPeer) {
+    srcContact = firstRefPeer;
+  }
+
+  return { msgInfos, srcContact, stagedCustomCount, firstRefPeer };
+}
 
 function extractExclusiveForwardNodes(message, autoEscape = false) {
   if (autoEscape && typeof message === "string") return null;
@@ -122,6 +353,7 @@ async function dispatch(action, p, context = {}) {
           send_echo: { ...this.sendEchoStats },
           map_hook_active: Boolean(this._mapSetHook) && Map.prototype.set === this._mapSetHook,
           map_hook_release: this.mapHookRelease || null,
+          listenErrors: Array.isArray(this.listenErrors) ? this.listenErrors : [],
         },
       };
 
@@ -236,63 +468,72 @@ async function dispatch(action, p, context = {}) {
         }
         return copy;
       };
-      const entry =
-        this.messageIdStore.getByShortId(p.message_id) ||
-        this.messageIdStore.getByMsgId(p.message_id);
-      if (entry && entry.rawMsg) {
-        await this._hydrateNtMsgMedia(entry.rawMsg);
-        const refreshed = formatNtMsgToOneBotEvent(entry.rawMsg, {
-          selfId: this.selfUin,
-          uinUidStore: this.uinUidStore,
-          messageIdStore: this.messageIdStore,
-          reportSelfMessage: true,
-          messageFormat: reqMsgFormat,
-        });
-        if (refreshed) {
-          const copy = formatMsgPayload({ ...refreshed });
-          delete copy.post_type;
-          delete copy.self_id;
-          copy.real_id = entry.msgId;
-          return copy;
+      const entry = resolveStoreEntry(this.messageIdStore, p.message_id);
+      let rawMsg = entry?.rawMsg || null;
+      const entryMsgId = String(entry?.msgId || entry?.ntMsgId || "");
+      const entryPeer =
+        entry?.peer ||
+        (entry?.peerUid
+          ? {
+              chatType: Number(entry.chatType || 1),
+              peerUid: String(entry.peerUid),
+              guildId: "",
+            }
+          : null);
+      if (
+        !rawMsg &&
+        entry &&
+        entryPeer?.peerUid &&
+        entryMsgId &&
+        !/^(sent_|fwd_|echo_timeout_)/.test(entryMsgId)
+      ) {
+        try {
+          const res = await this.invokeNt(
+            "nodeIKernelMsgService/getMsgsByMsgId",
+            { peer: entryPeer, msgIds: [entryMsgId] },
+            [entryPeer, [entryMsgId]]
+          );
+          rawMsg = res?.msgList?.[0] || null;
+        } catch (_) {
+          rawMsg = null;
+        }
+      }
+      if (rawMsg) {
+        try {
+          await this._hydrateNtMsgMedia(rawMsg);
+          const refreshed = formatNtMsgToOneBotEvent(rawMsg, {
+            selfId: this.selfUin,
+            uinUidStore: this.uinUidStore,
+            messageIdStore: this.messageIdStore,
+            reportSelfMessage: true,
+            messageFormat: reqMsgFormat,
+          });
+          if (refreshed) {
+            const copy = formatMsgPayload({ ...refreshed });
+            delete copy.post_type;
+            delete copy.self_id;
+            copy.real_id = rawMsg.msgId || entryMsgId;
+            return copy;
+          }
+        } finally {
+          stripTransientNtMedia(rawMsg);
         }
       }
       if (entry && entry.oneBotEvent) {
         const copy = formatMsgPayload({ ...entry.oneBotEvent });
         delete copy.post_type;
         delete copy.self_id;
-        copy.real_id = entry.msgId;
+        copy.real_id = entryMsgId;
         return copy;
       }
-      if (entry && entry.peer?.peerUid) {
-        const res = await this.invokeNt(
-          "nodeIKernelMsgService/getMsgsByMsgId",
-          { peer: entry.peer, msgIds: [String(entry.msgId)] },
-          [entry.peer, [String(entry.msgId)]]
-        );
-        const rawMsg = res?.msgList?.[0];
-        if (rawMsg) {
-          await this._hydrateNtMsgMedia(rawMsg);
-          const formatted = formatNtMsgToOneBotEvent(rawMsg, {
-            selfId: this.selfUin,
-            uinUidStore: this.uinUidStore,
-            messageIdStore: this.messageIdStore,
-            messageFormat: reqMsgFormat,
-          });
-          if (formatted) {
-            const copy = formatMsgPayload({ ...formatted });
-            delete copy.post_type;
-            delete copy.self_id;
-            copy.real_id = rawMsg.msgId;
-            return copy;
-          }
-        }
-      }
       if (entry) {
+        const peerChatType = Number(entryPeer?.chatType || entry.chatType || 1);
+        const peerUidStr = String(entryPeer?.peerUid || entry.peerUid || "");
         return formatMsgPayload({
           time: Number(entry.msgTime || Math.floor(Date.now() / 1000)),
-          message_type: entry.peer?.chatType === 2 ? "group" : "private",
-          message_id: entry.shortId,
-          real_id: entry.msgId,
+          message_type: peerChatType === 2 ? "group" : "private",
+          message_id: entry.shortId ?? entry.oneBotId,
+          real_id: entryMsgId,
           message_seq: Number(entry.msgSeq || 0),
           sender: {
             user_id: Number(entry.senderUin || this.selfUin || 0),
@@ -301,7 +542,7 @@ async function dispatch(action, p, context = {}) {
           message: [],
           raw_message: "",
           font: 14,
-          ...(entry.peer?.chatType === 2 ? { group_id: Number(entry.peer.peerUid || 0) } : {}),
+          ...(peerChatType === 2 ? { group_id: Number(peerUidStr || entry.groupId || 0) } : {}),
         });
       }
       throw new Error("message not found");
@@ -311,10 +552,9 @@ async function dispatch(action, p, context = {}) {
     case "get_forward_msg": {
       const resId = String(p.id || p.message_id || p.res_id || "");
       if (!resId) throw new Error("id is required");
-      const entry =
-        this.messageIdStore.getByShortId(resId) || this.messageIdStore.getByMsgId(resId);
+      const entry = resolveStoreEntry(this.messageIdStore, resId);
       const peer = entry?.peer || { chatType: 2, peerUid: String(p.group_id || "0"), guildId: "" };
-      const rootMsgId = entry?.msgId || resId;
+      const rootMsgId = entry?.msgId || entry?.ntMsgId || resId;
       const res = await this.invokeNt(
         "nodeIKernelMsgService/getMultiMsg",
         {
@@ -327,34 +567,38 @@ async function dispatch(action, p, context = {}) {
       const msgList = Array.isArray(res?.msgList) ? res.msgList : [];
       const messages = [];
       for (const m of msgList) {
-        await this._hydrateNtMsgMedia(m);
-        const { segments, raw_message } = ntMsgToOneBotSegments(m, {
-          uinUidStore: this.uinUidStore,
-          messageIdStore: this.messageIdStore,
-        });
-        const uin = Number(
-          m.senderUin || this.uinUidStore.getUinSync(m.senderUid) || 0
-        );
-        const nickname = String(m.sendMemberName || m.sendNickName || uin || "群友");
-        const shortId = this.messageIdStore.register(
-          m.msgId,
-          { chatType: m.chatType || peer.chatType, peerUid: m.peerUid || peer.peerUid },
-          m.msgSeq,
-          { senderUin: uin, senderUid: m.senderUid, rawMsg: m }
-        );
-        messages.push({
-          type: "node",
-          data: {
-            user_id: uin,
-            nickname,
-            sender: { user_id: uin, nickname },
-            content: segments,
-            message: segments,
-            raw_message,
-            time: Number(m.msgTime || Math.floor(Date.now() / 1000)),
-            message_id: shortId,
-          },
-        });
+        try {
+          await this._hydrateNtMsgMedia(m);
+          const { segments, raw_message } = ntMsgToOneBotSegments(m, {
+            uinUidStore: this.uinUidStore,
+            messageIdStore: this.messageIdStore,
+          });
+          const uin = Number(
+            m.senderUin || this.uinUidStore.getUinSync(m.senderUid) || 0
+          );
+          const nickname = String(m.sendMemberName || m.sendNickName || uin || "群友");
+          const shortId = this.messageIdStore.register(
+            m.msgId,
+            { chatType: m.chatType || peer.chatType, peerUid: m.peerUid || peer.peerUid },
+            m.msgSeq,
+            { senderUin: uin, senderUid: m.senderUid, rawMsg: m }
+          );
+          messages.push({
+            type: "node",
+            data: {
+              user_id: uin,
+              nickname,
+              sender: { user_id: uin, nickname },
+              content: segments,
+              message: segments,
+              raw_message,
+              time: Number(m.msgTime || Math.floor(Date.now() / 1000)),
+              message_id: shortId,
+            },
+          });
+        } finally {
+          stripTransientNtMedia(m);
+        }
       }
       return { messages };
     }
@@ -376,66 +620,47 @@ async function dispatch(action, p, context = {}) {
         ? p.message
         : [];
 
-      const hasCustomNodes = nodes.some((n) => {
-        const nd = n?.data || n || {};
-        return !nd.id && (nd.content !== undefined || nd.message !== undefined);
-      });
-
-      let srcContact = peer;
-      if (hasCustomNodes) {
+      let cachedSelfPeer = null;
+      const getSelfPeer = async () => {
+        if (cachedSelfPeer) return cachedSelfPeer;
         let selfUid = this.selfUid || this.uinUidStore.getUidSync(this.selfUin);
         if (!selfUid && this.selfUin) {
           selfUid = await this.uinUidStore.resolveUid(this.selfUin, this.invokeNt.bind(this));
           if (selfUid) this.selfUid = selfUid;
         }
-        if (selfUid) {
-          srcContact = { chatType: 1, peerUid: selfUid, guildId: "" };
-        }
-      }
+        cachedSelfPeer = selfUid ? { chatType: 1, peerUid: selfUid, guildId: "" } : peer;
+        return cachedSelfPeer;
+      };
 
-      const sentIds = [];
-      for (const node of nodes) {
-        const nd = node?.data || node || {};
-        const content = nd.content !== undefined ? nd.content : nd.message;
-        if (nd.id) {
-          const ref =
-            this.messageIdStore.getByShortId(nd.id) || this.messageIdStore.getByMsgId(nd.id);
-          if (ref?.msgId) sentIds.push(String(ref.msgId));
-        } else if (content !== undefined) {
-          const subSent = await this._sendMessageToPeer(
-            srcContact,
-            content,
-            false,
-            undefined,
-            { skipHumanSimulation: true }
-          );
-          if (subSent?.real_id) sentIds.push(String(subSent.real_id));
-        }
-      }
-      let messageId = 0;
-      const forwardId = `fwd_${Date.now()}`;
-      if (sentIds.length > 0) {
-        const msgInfos = sentIds.map((id) => ({
-          msgId: id,
-          senderShowName: String(p.source || this.selfNickname || "QQBot"),
-        }));
+      const { msgInfos, srcContact } = await stageForwardNodes(
+        this,
+        nodes,
+        peer,
+        getSelfPeer,
+        p.source ? String(p.source) : "",
+        1
+      );
+
+      if (msgInfos.length > 0) {
         try {
-          const fwdRes = await this.invokeNt(
-            "nodeIKernelMsgService/multiForwardMsgWithComment",
-            {
-              msgInfos,
-              srcContact,
-              dstContact: peer,
-              commentElements: [],
-              msgAttributeInfos: new Map(),
-            },
-            [msgInfos, srcContact, peer, [], new Map()]
+          const sent = await this._invokeForwardWithEcho(peer, () =>
+            this.invokeNt(
+              "nodeIKernelMsgService/multiForwardMsgWithComment",
+              {
+                msgInfos,
+                srcContact,
+                dstContact: peer,
+                commentElements: [],
+                msgAttributeInfos: new Map(),
+              },
+              [msgInfos, srcContact, peer, [], new Map()]
+            )
           );
-          messageId = this.messageIdStore.register(
-            fwdRes?.msgId || forwardId,
-            peer,
-            fwdRes?.msgSeq || "0"
-          );
+          return {
+            message_id: sent.message_id,
+            res_id: sent.real_id,
+            forward_id: sent.real_id,
+          };
         } catch (_) {
           // Fallback: send combined text ONLY if staging did not already send directly to `peer`
           if (srcContact.peerUid !== peer.peerUid || srcContact.chatType !== peer.chatType) {
@@ -449,45 +674,59 @@ async function dispatch(action, p, context = {}) {
               .join("\n\n");
             if (combined) {
               const fallbackRes = await this._sendMessageToPeer(peer, combined);
-              messageId = fallbackRes.message_id;
+              const fbRealId = String(fallbackRes.real_id || `fwd_${Date.now()}`);
+              return {
+                message_id: fallbackRes.message_id,
+                res_id: fbRealId,
+                forward_id: fbRealId,
+              };
             }
           }
         }
       }
+      const emptyForwardId = `fwd_${Date.now()}`;
       return {
-        message_id: messageId,
-        res_id: forwardId,
-        forward_id: forwardId,
+        message_id: 0,
+        res_id: emptyForwardId,
+        forward_id: emptyForwardId,
       };
     }
 
     case "forward_friend_single_msg":
     case "forward_group_single_msg": {
-      const entry =
-        this.messageIdStore.getByShortId(p.message_id) ||
-        this.messageIdStore.getByMsgId(p.message_id);
+      const entry = resolveStoreEntry(this.messageIdStore, p.message_id);
       if (!entry) throw new Error("message not found");
       const dstContact =
         action === "forward_group_single_msg"
           ? { chatType: 2, peerUid: String(p.group_id), guildId: "" }
           : await this._resolvePeerForUser(p.user_id);
-      await this.invokeNt(
-        "nodeIKernelMsgService/forwardMsgWithComment",
-        {
-          msgIds: [String(entry.msgId)],
-          srcContact: entry.peer,
-          dstContacts: [dstContact],
-          commentElements: [],
-          msgAttributeInfos: new Map(),
-        },
-        [[String(entry.msgId)], entry.peer, [dstContact], [], new Map()]
-      );
-      const newShortId = this.messageIdStore.register(
-        `fwd_${entry.msgId}_${Date.now()}`,
+      const srcContact =
+        entry.peer ||
+        (entry.peerUid
+          ? {
+              chatType: Number(entry.chatType || 1),
+              peerUid: String(entry.peerUid),
+              guildId: "",
+            }
+          : dstContact);
+      const srcMsgId = String(entry.msgId || entry.ntMsgId || "");
+      const sent = await this._invokeForwardWithEcho(
         dstContact,
-        "0"
+        () =>
+          this.invokeNt(
+            "nodeIKernelMsgService/forwardMsgWithComment",
+            {
+              msgIds: [srcMsgId],
+              srcContact,
+              dstContacts: [dstContact],
+              commentElements: [],
+              msgAttributeInfos: new Map(),
+            },
+            [[srcMsgId], srcContact, [dstContact], [], new Map()]
+          ),
+        srcMsgId
       );
-      return { message_id: newShortId };
+      return { message_id: sent.message_id, real_id: sent.real_id };
     }
 
     case "get_group_msg_history":
@@ -499,11 +738,10 @@ async function dispatch(action, p, context = {}) {
       const count = Math.max(1, Math.min(Number(p.count || 20), 100));
       let startMsgId = "0";
       if (p.message_id && Number(p.message_id) > 0) {
-        const ref =
-          this.messageIdStore.getByShortId(p.message_id) ||
-          this.messageIdStore.getByMsgId(p.message_id);
-        if (ref?.msgId && /^\d+$/.test(String(ref.msgId))) {
-          startMsgId = String(ref.msgId);
+        const ref = resolveStoreEntry(this.messageIdStore, p.message_id);
+        const refMsgId = ref?.msgId || ref?.ntMsgId;
+        if (refMsgId && /^\d+$/.test(String(refMsgId))) {
+          startMsgId = String(refMsgId);
         }
       }
       const queryOrder = startMsgId === "0";
@@ -535,15 +773,19 @@ async function dispatch(action, p, context = {}) {
         context?.messageFormat || p?.message_format || this.config.messageFormat || "array";
       const messages = [];
       for (const m of rawList) {
-        await this._hydrateNtMsgMedia(m);
-        const ev = formatNtMsgToOneBotEvent(m, {
-          selfId: this.selfUin,
-          uinUidStore: this.uinUidStore,
-          messageIdStore: this.messageIdStore,
-          reportSelfMessage: true,
-          messageFormat: reqMsgFormat,
-        });
-        if (ev) messages.push(this._formatEventForEndpoint(ev, reqMsgFormat));
+        try {
+          await this._hydrateNtMsgMedia(m);
+          const ev = formatNtMsgToOneBotEvent(m, {
+            selfId: this.selfUin,
+            uinUidStore: this.uinUidStore,
+            messageIdStore: this.messageIdStore,
+            reportSelfMessage: true,
+            messageFormat: reqMsgFormat,
+          });
+          if (ev) messages.push(this._formatEventForEndpoint(ev, reqMsgFormat));
+        } finally {
+          stripTransientNtMedia(m);
+        }
       }
       return { messages };
     }

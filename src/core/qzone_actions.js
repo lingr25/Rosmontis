@@ -1,188 +1,124 @@
 "use strict";
 
-const http = require("http");
-const https = require("https");
-
 /**
  * Web Credential, Cookie & QZone Action Gate (`src/core/qzone_actions.js`)
  *
  * Isolates high-privilege web credential (`clientkey`, `p_skey`, `skey`, `bkn`/`csrf_token`)
  * and QZone actions behind an explicit opt-in security gate while leaving internal NT media
  * CDN rkey actions (`get_rkey` / `nc_get_rkey`) unblocked.
+ *
+ * All outbound HTTP/HTTPS, cookie-jar, redirect-validation, and JSON/JSONP helpers delegate
+ * directly to the SSRF-hardened `./web_http` module.
  */
 
-const WEB_CREDENTIAL_ACTIONS = new Set([
-  "get_clientkey",
-  "get_cookies",
-  "get_csrf_token",
-  "get_credentials",
-  "get_qzone_msg_list",
-  "get_qzone_feeds",
-  "send_qzone_msg",
-  "delete_qzone_msg",
-  "like_qzone",
-  "unlike_qzone",
-  "comment_qzone",
-]);
+const webHttp = require("./web_http");
 
-function isWebCredentialApiEnabled(config) {
-  return (
-    config?.enableWebCredentialApi === true ||
-    process.env.ROSMONTIS_ENABLE_WEB_CREDENTIAL_API === "1" ||
-    process.env.ONEBOT_ENABLE_WEB_CREDENTIAL_API === "1" ||
-    process.env.XIAO_BRIDGE_ENABLE_WEB_CREDENTIAL_API === "1"
-  );
-}
-
-function assertWebCredentialApiEnabled(config, action = "") {
-  if (!isWebCredentialApiEnabled(config)) {
-    const label = action ? ` for action '${action}'` : "";
-    const err = new Error(
-      `Web credential / QZone API is disabled by default${label}; set enableWebCredentialApi=true or ROSMONTIS_ENABLE_WEB_CREDENTIAL_API=1 to enable`
-    );
-    err.code = "ERR_WEB_CREDENTIAL_API_DISABLED";
-    throw err;
-  }
-}
-
-function defaultComputeBkn(skey) {
-  const s = String(skey || "");
-  let hash = 5381;
-  for (let i = 0; i < s.length; i++) {
-    hash += (hash << 5) + s.charCodeAt(i);
-  }
-  return hash & 0x7fffffff;
-}
-
-function defaultCookieObjToString(cookies) {
-  if (!cookies || typeof cookies !== "object") return "";
-  return Object.entries(cookies)
-    .filter(([, v]) => v !== undefined && v !== null && v !== "")
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-}
-
-function defaultParseJsonpOrJson(text) {
-  const raw = String(text || "").trim();
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (_) {}
-  const firstParen = raw.indexOf("(");
-  const lastParen = raw.lastIndexOf(")");
-  if (firstParen !== -1 && lastParen > firstParen) {
-    try {
-      return JSON.parse(raw.slice(firstParen + 1, lastParen));
-    } catch (_) {}
-  }
-  return {};
-}
-
-function defaultHttpsGetCookies(urlStr, maxRedirects = 5) {
-  return new Promise((resolve, reject) => {
-    const collected = {};
-    function step(currentUrl, remaining) {
-      let parsed;
-      try {
-        parsed = new URL(currentUrl);
-      } catch (err) {
-        reject(err);
-        return;
-      }
-      const mod = parsed.protocol === "http:" ? http : https;
-      const req = mod.request(
-        parsed,
-        {
-          method: "GET",
-          timeout: 10000,
-          headers: {
-            Cookie: defaultCookieObjToString(collected),
-          },
-        },
-        (res) => {
-          const setCookie = res.headers["set-cookie"] || [];
-          for (const line of setCookie) {
-            const pair = String(line).split(";")[0];
-            const eqIdx = pair.indexOf("=");
-            if (eqIdx > 0) {
-              const k = pair.slice(0, eqIdx).trim();
-              const v = pair.slice(eqIdx + 1).trim();
-              if (v) collected[k] = v;
-            }
-          }
-          res.resume();
-          const loc = res.headers.location;
-          if (loc && remaining > 0 && res.statusCode >= 300 && res.statusCode < 400) {
-            const nextUrl = new URL(loc, parsed).toString();
-            step(nextUrl, remaining - 1);
-            return;
-          }
-          resolve(collected);
-        }
-      );
-      req.on("timeout", () => req.destroy(new Error("httpsGetCookies timeout")));
-      req.on("error", reject);
-      req.end();
-    }
-    step(urlStr, maxRedirects);
-  });
-}
-
-function defaultHttpRequestText(urlStr, method = "GET", body = "", headers = {}) {
-  return new Promise((resolve, reject) => {
-    let parsed;
-    try {
-      parsed = new URL(urlStr);
-    } catch (err) {
-      reject(err);
-      return;
-    }
-    const mod = parsed.protocol === "http:" ? http : https;
-    const payloadBuf = body ? Buffer.from(String(body), "utf8") : null;
-    const reqHeaders = { ...headers };
-    if (payloadBuf && reqHeaders["Content-Length"] === undefined) {
-      reqHeaders["Content-Length"] = payloadBuf.length;
-    }
-    const req = mod.request(
-      parsed,
-      {
-        method,
-        timeout: 15000,
-        headers: reqHeaders,
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error("httpRequestText timeout")));
-    req.on("error", reject);
-    if (payloadBuf) req.write(payloadBuf);
-    req.end();
-  });
-}
+const {
+  WEB_CREDENTIAL_ACTIONS,
+  isWebCredentialApiEnabled,
+  assertWebCredentialApiEnabled,
+  computeBkn,
+  cookieObjToString,
+  isTrustedTencentHost,
+  isAllowedRedirectHost,
+  assertSafeTencentRedirect,
+  httpsGetCookies: defaultHttpsGetCookies,
+  httpRequestText: defaultHttpRequestText,
+  httpGetJson: defaultHttpGetJson,
+  httpPostFormJson: defaultHttpPostFormJson,
+  parseJsonpOrJson: defaultParseJsonpOrJson,
+} = webHttp;
 
 function resolveHelpers(helpers = {}) {
+  const resolvedComputeBkn =
+    typeof helpers?.computeBkn === "function"
+      ? helpers.computeBkn
+      : typeof helpers?.computeGtk === "function"
+      ? helpers.computeGtk
+      : computeBkn;
+  const resolvedCookieObjToString =
+    typeof helpers?.cookieObjToString === "function"
+      ? helpers.cookieObjToString
+      : cookieObjToString;
+  const resolvedHttpsGetCookies =
+    typeof helpers?.httpsGetCookies === "function"
+      ? helpers.httpsGetCookies
+      : defaultHttpsGetCookies;
+  const resolvedHttpRequestText =
+    typeof helpers?.httpRequestText === "function"
+      ? helpers.httpRequestText
+      : defaultHttpRequestText;
+  const resolvedParseJsonpOrJson =
+    typeof helpers?.parseJsonpOrJson === "function"
+      ? helpers.parseJsonpOrJson
+      : defaultParseJsonpOrJson;
+
+  const usesDefaultRequestLayer =
+    resolvedHttpRequestText === defaultHttpRequestText &&
+    resolvedParseJsonpOrJson === defaultParseJsonpOrJson;
+
+  const resolvedHttpGetJson =
+    typeof helpers?.httpGetJson === "function"
+      ? helpers.httpGetJson
+      : usesDefaultRequestLayer
+      ? defaultHttpGetJson
+      : async (urlStr, headers = {}, options = undefined) => {
+          const text =
+            options !== undefined
+              ? await resolvedHttpRequestText(urlStr, "GET", "", headers, undefined, options)
+              : await resolvedHttpRequestText(urlStr, "GET", "", headers);
+          return resolvedParseJsonpOrJson(text);
+        };
+
+  const resolvedHttpPostFormJson =
+    typeof helpers?.httpPostFormJson === "function"
+      ? helpers.httpPostFormJson
+      : usesDefaultRequestLayer
+      ? defaultHttpPostFormJson
+      : async (urlStr, formParams = {}, headers = {}, options = undefined) => {
+          let encodedBody = "";
+          if (Buffer.isBuffer(formParams) || typeof formParams === "string") {
+            encodedBody = formParams;
+          } else if (formParams instanceof URLSearchParams) {
+            encodedBody = formParams.toString();
+          } else if (formParams && typeof formParams === "object") {
+            const sp = new URLSearchParams();
+            for (const [k, v] of Object.entries(formParams)) {
+              if (v !== undefined && v !== null) {
+                sp.append(k, String(v));
+              }
+            }
+            encodedBody = sp.toString();
+          }
+          const hasCt =
+            headers &&
+            typeof headers === "object" &&
+            Object.keys(headers).some((k) => k.toLowerCase() === "content-type");
+          const reqHeaders = hasCt
+            ? headers
+            : { ...headers, "Content-Type": "application/x-www-form-urlencoded" };
+          const text =
+            options !== undefined
+              ? await resolvedHttpRequestText(
+                  urlStr,
+                  "POST",
+                  encodedBody,
+                  reqHeaders,
+                  undefined,
+                  options
+                )
+              : await resolvedHttpRequestText(urlStr, "POST", encodedBody, reqHeaders);
+          return resolvedParseJsonpOrJson(text);
+        };
+
   return {
-    computeBkn:
-      typeof helpers?.computeBkn === "function" ? helpers.computeBkn : defaultComputeBkn,
-    cookieObjToString:
-      typeof helpers?.cookieObjToString === "function"
-        ? helpers.cookieObjToString
-        : defaultCookieObjToString,
-    httpsGetCookies:
-      typeof helpers?.httpsGetCookies === "function"
-        ? helpers.httpsGetCookies
-        : defaultHttpsGetCookies,
-    httpRequestText:
-      typeof helpers?.httpRequestText === "function"
-        ? helpers.httpRequestText
-        : defaultHttpRequestText,
-    parseJsonpOrJson:
-      typeof helpers?.parseJsonpOrJson === "function"
-        ? helpers.parseJsonpOrJson
-        : defaultParseJsonpOrJson,
+    computeBkn: resolvedComputeBkn,
+    cookieObjToString: resolvedCookieObjToString,
+    httpsGetCookies: resolvedHttpsGetCookies,
+    httpRequestText: resolvedHttpRequestText,
+    httpGetJson: resolvedHttpGetJson,
+    httpPostFormJson: resolvedHttpPostFormJson,
+    parseJsonpOrJson: resolvedParseJsonpOrJson,
   };
 }
 
@@ -228,7 +164,7 @@ async function getCookiesObject(bridge, domain = "qun.qq.com", helpers = {}) {
       const ck = await fetchClientKey(bridge);
       if (ck.clientKey) {
         const jumpUrl =
-          `https://ssl.ptlogin2.qq.com/jump?ptlang=1033&clientuin=${uin}` +
+          `https://ssl.ptlogin2.qq.com/jump?ptlang=1033&clientuin=${encodeURIComponent(String(uin))}` +
           `&clientkey=${encodeURIComponent(ck.clientKey)}` +
           `&u1=${encodeURIComponent(`https://${domain}/${uin}/infocenter`)}` +
           `&keyindex=${encodeURIComponent(ck.keyIndex || "19")}`;
@@ -247,7 +183,12 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
   const params = p && typeof p === "object" ? p : {};
   const resolvedHelpers = resolveHelpers(helpers);
-  const { computeBkn, cookieObjToString, httpRequestText, parseJsonpOrJson } = resolvedHelpers;
+  const {
+    computeBkn: calcBkn,
+    cookieObjToString: serializeCookies,
+    httpGetJson,
+    httpPostFormJson,
+  } = resolvedHelpers;
 
   switch (act) {
     case "get_clientkey":
@@ -255,20 +196,20 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
     case "get_cookies": {
       const cookies = await getCookiesObject(bridge, params.domain || "qun.qq.com", resolvedHelpers);
-      return { cookies: cookieObjToString(cookies) };
+      return { cookies: serializeCookies(cookies) };
     }
 
     case "get_csrf_token": {
       const cookies = await getCookiesObject(bridge, params.domain || "qun.qq.com", resolvedHelpers);
-      const token = computeBkn(cookies.p_skey || cookies.skey);
+      const token = calcBkn(cookies.p_skey || cookies.skey);
       return { token };
     }
 
     case "get_credentials": {
       const cookies = await getCookiesObject(bridge, params.domain || "qun.qq.com", resolvedHelpers);
-      const token = computeBkn(cookies.p_skey || cookies.skey);
+      const token = calcBkn(cookies.p_skey || cookies.skey);
       return {
-        cookies: cookieObjToString(cookies),
+        cookies: serializeCookies(cookies),
         token,
         csrf_token: token,
       };
@@ -276,7 +217,7 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
     case "get_qzone_msg_list": {
       const cookies = await getCookiesObject(bridge, "qzone.qq.com", resolvedHelpers);
-      const bkn = computeBkn(cookies.p_skey || cookies.skey);
+      const bkn = calcBkn(cookies.p_skey || cookies.skey);
       const targetUin = String(params.target_uin || bridge.selfUin || "");
       const pos = Number(params.pos || 0);
       const num = Number(params.num || 10);
@@ -295,10 +236,9 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
           format: "jsonp",
           need_private_comment: "1",
         }).toString();
-      const text = await httpRequestText(url, "GET", "", {
-        Cookie: cookieObjToString(cookies),
+      const data = await httpGetJson(url, {
+        Cookie: serializeCookies(cookies),
       });
-      const data = parseJsonpOrJson(text);
       const list = Array.isArray(data.msglist) ? data.msglist : [];
       return {
         total: Number(data.total ?? list.length),
@@ -317,7 +257,7 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
     case "get_qzone_feeds": {
       const cookies = await getCookiesObject(bridge, "qzone.qq.com", resolvedHelpers);
-      const bkn = computeBkn(cookies.p_skey || cookies.skey);
+      const bkn = calcBkn(cookies.p_skey || cookies.skey);
       const url =
         `https://h5.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more?` +
         new URLSearchParams({
@@ -335,10 +275,9 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
           useutf8: "1",
           outputhtmlfeed: "1",
         }).toString();
-      const text = await httpRequestText(url, "GET", "", {
-        Cookie: cookieObjToString(cookies),
+      const data = await httpGetJson(url, {
+        Cookie: serializeCookies(cookies),
       });
-      const data = parseJsonpOrJson(text);
       const rawFeeds = Array.isArray(data.data?.data) ? data.data.data : [];
       return {
         feeds: rawFeeds.filter(Boolean).map((f) => ({
@@ -355,7 +294,7 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
     case "send_qzone_msg": {
       const cookies = await getCookiesObject(bridge, "qzone.qq.com", resolvedHelpers);
-      const bkn = computeBkn(cookies.p_skey || cookies.skey);
+      const bkn = calcBkn(cookies.p_skey || cookies.skey);
       const hostUin = String(bridge.selfUin || "");
       const url = `https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6?g_tk=${bkn}`;
       const body = new URLSearchParams({
@@ -372,11 +311,10 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
         format: "json",
         qzreferrer: `https://user.qzone.qq.com/${hostUin}`,
       }).toString();
-      const text = await httpRequestText(url, "POST", body, {
-        Cookie: cookieObjToString(cookies),
+      const data = await httpPostFormJson(url, body, {
+        Cookie: serializeCookies(cookies),
         "Content-Type": "application/x-www-form-urlencoded",
       });
-      const data = parseJsonpOrJson(text);
       return {
         tid: String(data.t1_tid || data.tid || `qz_${Date.now()}`),
         time: Number(data.t1_time || data.now || Math.floor(Date.now() / 1000)),
@@ -385,7 +323,7 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
     case "delete_qzone_msg": {
       const cookies = await getCookiesObject(bridge, "qzone.qq.com", resolvedHelpers);
-      const bkn = computeBkn(cookies.p_skey || cookies.skey);
+      const bkn = calcBkn(cookies.p_skey || cookies.skey);
       const hostUin = String(bridge.selfUin || "");
       const url = `https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6?g_tk=${bkn}`;
       const body = new URLSearchParams({
@@ -396,8 +334,8 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
         format: "fs",
         qzreferrer: `https://user.qzone.qq.com/${hostUin}`,
       }).toString();
-      await httpRequestText(url, "POST", body, {
-        Cookie: cookieObjToString(cookies),
+      await httpPostFormJson(url, body, {
+        Cookie: serializeCookies(cookies),
         "Content-Type": "application/x-www-form-urlencoded",
       });
       return {};
@@ -407,7 +345,7 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
     case "unlike_qzone": {
       const like = act === "like_qzone";
       const cookies = await getCookiesObject(bridge, "qzone.qq.com", resolvedHelpers);
-      const bkn = computeBkn(cookies.p_skey || cookies.skey);
+      const bkn = calcBkn(cookies.p_skey || cookies.skey);
       const opUin = String(bridge.selfUin || "");
       const targetUin = String(params.target_uin || opUin);
       const tid = String(params.tid || "");
@@ -429,8 +367,8 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
         fupdate: "1",
         format: "json",
       }).toString();
-      await httpRequestText(url, "POST", body, {
-        Cookie: cookieObjToString(cookies),
+      await httpPostFormJson(url, body, {
+        Cookie: serializeCookies(cookies),
         "Content-Type": "application/x-www-form-urlencoded",
       });
       return {};
@@ -438,7 +376,7 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
 
     case "comment_qzone": {
       const cookies = await getCookiesObject(bridge, "qzone.qq.com", resolvedHelpers);
-      const bkn = computeBkn(cookies.p_skey || cookies.skey);
+      const bkn = calcBkn(cookies.p_skey || cookies.skey);
       const selfUin = String(bridge.selfUin || "");
       const hostUin = String(params.target_uin || selfUin);
       const tid = String(params.tid || "");
@@ -460,11 +398,10 @@ async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helper
         source: "ic",
         platformid: "52",
       }).toString();
-      const text = await httpRequestText(url, "POST", body, {
-        Cookie: cookieObjToString(cookies),
+      const data = await httpPostFormJson(url, body, {
+        Cookie: serializeCookies(cookies),
         "Content-Type": "application/x-www-form-urlencoded",
       });
-      const data = parseJsonpOrJson(text);
       return { comment_id: String(data.commentid || data.commentId || "") };
     }
 
@@ -477,6 +414,17 @@ module.exports = {
   WEB_CREDENTIAL_ACTIONS,
   isWebCredentialApiEnabled,
   assertWebCredentialApiEnabled,
+  computeBkn,
+  computeGtk: computeBkn,
+  cookieObjToString,
+  isTrustedTencentHost,
+  isAllowedRedirectHost,
+  assertSafeTencentRedirect,
+  httpsGetCookies: defaultHttpsGetCookies,
+  httpRequestText: defaultHttpRequestText,
+  httpGetJson: defaultHttpGetJson,
+  httpPostFormJson: defaultHttpPostFormJson,
+  parseJsonpOrJson: defaultParseJsonpOrJson,
   fetchClientKey,
   getCookiesObject,
   dispatchWebCredentialOrQzoneAction,

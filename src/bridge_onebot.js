@@ -21,6 +21,7 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { pathToFileURL } = require("url");
 const {
   DEFAULT_MAX_MEDIA_BYTES,
   inspectImageDimensions,
@@ -36,16 +37,35 @@ const {
   resolveMediaSource,
 } = require("./core/media_security");
 
+function pickPositiveUin(...candidates) {
+  for (const c of candidates) {
+    if (c === null || c === undefined || c === "" || typeof c === "boolean") continue;
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) {
+      const t = Math.trunc(n);
+      if (t > 0) return t;
+    }
+  }
+  return 0;
+}
+
 // ============================================================================
 // 1. MessageIdStore (Bounded LRU, 32-bit positive integer OneBot message_id)
 // ============================================================================
 
 class MessageIdStore {
-  constructor(maxEntries = 10000) {
+  constructor(maxEntries = 10000, maxRawEntries = 256) {
     this.maxEntries = Math.max(2, Number(maxEntries) || 10000);
+    const parsedMaxRaw =
+      maxRawEntries !== undefined && maxRawEntries !== null ? Number(maxRawEntries) : 256;
+    this.maxRawEntries =
+      Number.isFinite(parsedMaxRaw) && parsedMaxRaw >= 0 ? Math.trunc(parsedMaxRaw) : 256;
     this.byShortId = new Map();
+    this.byOneBotId = this.byShortId;
     this.byMsgId = new Map();
     this.byPeerSeq = new Map();
+    this._rawIds = new Set();
+    this.byMediaKey = new Map();
     this._seqCounter = 100000;
   }
 
@@ -77,12 +97,34 @@ class MessageIdStore {
     return candidate;
   }
 
+  _touchRawId(oneBotId) {
+    if (oneBotId === undefined || oneBotId === null) return;
+    const id = Number(oneBotId);
+    this._rawIds.delete(id);
+    this._rawIds.add(id);
+    this._evictRawIfNeeded();
+  }
+
+  _evictRawIfNeeded() {
+    while (this._rawIds.size > this.maxRawEntries) {
+      const id = this._rawIds.values().next().value;
+      if (id === undefined) break;
+      this._rawIds.delete(id);
+      const old = this.byShortId.get(id);
+      if (old) {
+        old.rawMsg = null;
+        old.oneBotEvent = null;
+      }
+    }
+  }
+
   _evictIfNeeded() {
     while (this.byShortId.size > this.maxEntries) {
       const oldestKey = this.byShortId.keys().next().value;
       if (oldestKey === undefined) break;
       const entry = this.byShortId.get(oldestKey);
       this.byShortId.delete(oldestKey);
+      this._rawIds.delete(oldestKey);
       if (entry) {
         if (entry.msgId && this.byMsgId.get(entry.msgId) === entry) {
           this.byMsgId.delete(entry.msgId);
@@ -94,6 +136,14 @@ class MessageIdStore {
         );
         if (psKey && this.byPeerSeq.get(psKey) === entry) {
           this.byPeerSeq.delete(psKey);
+        }
+        if (entry._mediaKeys) {
+          for (const k of entry._mediaKeys) {
+            const cur = this.byMediaKey.get(k);
+            if (cur && cur.oneBotId === oldestKey) {
+              this.byMediaKey.delete(k);
+            }
+          }
         }
       }
     }
@@ -110,6 +160,174 @@ class MessageIdStore {
     return this.byShortId.size;
   }
 
+  resolveByNtKey(chatType, peerUid, msgId) {
+    if (msgId !== undefined && msgId !== null && String(msgId) !== "" && String(msgId) !== "0") {
+      const byId = this.byMsgId.get(String(msgId));
+      if (byId) return this._touch(byId);
+    }
+    return null;
+  }
+
+  resolve(shortId) {
+    return this.getByShortId(shortId);
+  }
+
+  indexMsgMedia(ntMsg, oneBotId = null) {
+    if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
+    if (oneBotId == null && ntMsg.msgId && ntMsg.peerUid) {
+      oneBotId = this.resolveByNtKey(ntMsg.chatType, ntMsg.peerUid, ntMsg.msgId)?.oneBotId ?? null;
+    } else if (oneBotId == null && ntMsg.msgId) {
+      oneBotId = this.byMsgId.get(String(ntMsg.msgId))?.oneBotId ?? null;
+    }
+    const entry = oneBotId != null ? this.byOneBotId.get(Number(oneBotId)) || null : null;
+    if (entry && !entry._mediaKeys) {
+      entry._mediaKeys = new Set();
+    }
+    const resolvedOneBotId = entry
+      ? entry.oneBotId
+      : oneBotId != null
+      ? Number(oneBotId) || null
+      : null;
+
+    const setKey = (k, desc, fallbackOnly = false) => {
+      if (!k || typeof k !== "string") return;
+      const trimmed = k.trim();
+      if (!trimmed) return;
+      if (fallbackOnly && this.byMediaKey.has(trimmed)) {
+        const prev = this.byMediaKey.get(trimmed);
+        if (prev && prev.ntMsgId && desc.ntMsgId && prev.ntMsgId !== desc.ntMsgId) {
+          return;
+        }
+      }
+      this.byMediaKey.set(trimmed, desc);
+      if (entry) entry._mediaKeys.add(trimmed);
+    };
+
+    for (const el of ntMsg.elements) {
+      if (!el || typeof el !== "object") continue;
+      const elementType = Number(el.elementType) || 0;
+      let md5 = "";
+      let fileUuid = "";
+      let fileName = "";
+      let sourcePath = "";
+      let url = "";
+
+      if (elementType === 2 && el.picElement) {
+        const pe = el.picElement;
+        md5 = pe.md5HexStr || "";
+        fileUuid = pe.fileUuid || "";
+        fileName = pe.fileName || "";
+        sourcePath = pe.sourcePath || "";
+        url = pe.originImageUrl || "";
+      } else if (elementType === 3 && el.fileElement) {
+        const fe = el.fileElement;
+        md5 = fe.fileMd5 || "";
+        fileUuid = fe.fileUuid || "";
+        fileName = fe.fileName || "";
+        sourcePath = fe.filePath || "";
+        url = "";
+      } else if (elementType === 4 && el.pttElement) {
+        const ptt = el.pttElement;
+        md5 = ptt.md5HexStr || "";
+        fileUuid = ptt.fileUuid || "";
+        fileName = ptt.fileName || "";
+        sourcePath = ptt.filePath || ptt.sourcePath || "";
+        url = "";
+      } else if (elementType === 5 && el.videoElement) {
+        const ve = el.videoElement;
+        md5 = ve.videoMd5 || ve.md5HexStr || "";
+        fileUuid = ve.fileUuid || "";
+        fileName = ve.fileName || "";
+        sourcePath = ve.filePath || ve.sourcePath || "";
+        url = "";
+      } else {
+        continue;
+      }
+
+      const desc = {
+        oneBotId: resolvedOneBotId,
+        shortId: resolvedOneBotId,
+        ntMsgId: String(ntMsg.msgId || ""),
+        msgId: String(ntMsg.msgId || ""),
+        chatType: Number(ntMsg.chatType) || 0,
+        peerUid: String(ntMsg.peerUid || ""),
+        elementId: String(el.elementId || ""),
+        elementType,
+        md5: String(md5 || ""),
+        fileUuid: String(fileUuid || ""),
+        fileName: String(fileName || ""),
+        sourcePath: String(sourcePath || ""),
+        url: String(url || ""),
+      };
+
+      if (desc.fileUuid) {
+        setKey(desc.fileUuid, desc);
+      }
+      if (desc.md5) {
+        setKey(desc.md5, desc);
+        setKey(desc.md5.toLowerCase(), desc);
+      }
+      if (desc.fileName) {
+        const base = path.basename(desc.fileName);
+        setKey(desc.fileName, desc);
+        setKey(desc.fileName.toLowerCase(), desc, true);
+        if (base && base !== desc.fileName) {
+          setKey(base, desc);
+          setKey(base.toLowerCase(), desc, true);
+        }
+      }
+      if (desc.md5) {
+        const md5Lower = desc.md5.toLowerCase();
+        for (const ext of [".jpg", ".png", ".gif", ".amr", ".silk"]) {
+          setKey(`${md5Lower}${ext}`, desc, true);
+        }
+      }
+    }
+  }
+
+  lookupMedia(fileToken) {
+    if (!fileToken || typeof fileToken !== "string") return null;
+    const raw = fileToken.trim();
+    if (!raw) return null;
+
+    const direct = this.byMediaKey.get(raw) || this.byMediaKey.get(raw.toLowerCase());
+    if (direct) return direct;
+
+    if (raw.startsWith("ntqq://")) {
+      try {
+        const normalized = raw.includes("&amp;") ? raw.replace(/&amp;/g, "&") : raw;
+        const parsed = new URL(normalized);
+        const uuid = parsed.searchParams.get("uuid") || "";
+        const md5 = parsed.searchParams.get("md5") || "";
+        const file = parsed.searchParams.get("file") || "";
+        for (const cand of [uuid, md5, md5.toLowerCase(), file, file.toLowerCase()]) {
+          if (cand && this.byMediaKey.has(cand)) {
+            return this.byMediaKey.get(cand);
+          }
+        }
+        if (file) {
+          const fileMd5Match = /^([0-9a-fA-F]{32})\.[a-zA-Z0-9]+$/.exec(file);
+          if (fileMd5Match) {
+            const byFileMd5 =
+              this.byMediaKey.get(fileMd5Match[1].toLowerCase()) ||
+              this.byMediaKey.get(fileMd5Match[1]);
+            if (byFileMd5) return byFileMd5;
+          }
+        }
+      } catch (_) {}
+    }
+
+    const md5ExtMatch = /^([0-9a-fA-F]{32})\.[a-zA-Z0-9]+$/.exec(raw);
+    if (md5ExtMatch) {
+      const hit =
+        this.byMediaKey.get(md5ExtMatch[1].toLowerCase()) ||
+        this.byMediaKey.get(md5ExtMatch[1]);
+      if (hit) return hit;
+    }
+
+    return null;
+  }
+
   register(msgId, peer, msgSeq, extra = {}) {
     if (msgId && typeof msgId === "object" && !Array.isArray(msgId)) {
       const obj = msgId;
@@ -124,6 +342,26 @@ class MessageIdStore {
         obj
       );
     }
+    if (peer !== undefined && peer !== null && typeof peer !== "object" && arguments.length >= 3) {
+      const chatTypeArg = peer;
+      const peerUidArg = msgSeq;
+      const msgSeqArg = arguments[3];
+      const senderUinArg = arguments[4];
+      const rawMsgArg = arguments[5] ?? null;
+      const oneBotEventArg = arguments[6] ?? null;
+      return this.register(
+        msgId,
+        { chatType: Number(chatTypeArg) || 1, peerUid: String(peerUidArg ?? ""), guildId: "" },
+        msgSeqArg,
+        {
+          ...(senderUinArg !== undefined ? { senderUin: senderUinArg } : {}),
+          ...(rawMsgArg !== null && rawMsgArg !== undefined ? { rawMsg: rawMsgArg } : {}),
+          ...(oneBotEventArg !== null && oneBotEventArg !== undefined
+            ? { oneBotEvent: oneBotEventArg }
+            : {}),
+        }
+      );
+    }
     const msgIdStr = msgId !== undefined && msgId !== null && String(msgId) !== "0" ? String(msgId) : "";
     const normPeer = {
       chatType: Number(peer?.chatType || extra.chatType || 1),
@@ -132,6 +370,13 @@ class MessageIdStore {
     };
     const msgSeqStr = msgSeq !== undefined && msgSeq !== null ? String(msgSeq) : "";
     const psKey = MessageIdStore._peerSeqKey(normPeer.chatType, normPeer.peerUid, msgSeqStr);
+    const rawMsg = extra.rawMsg || null;
+    const rawRandom =
+      extra.msgRandom !== undefined && extra.msgRandom !== null && extra.msgRandom !== ""
+        ? extra.msgRandom
+        : rawMsg?.msgRandom;
+    const msgRandom =
+      rawRandom !== undefined && rawRandom !== null && rawRandom !== "" ? String(rawRandom) : null;
 
     let existing = null;
     if (msgIdStr && this.byMsgId.has(msgIdStr)) {
@@ -170,12 +415,27 @@ class MessageIdStore {
         existing.msgSeq = msgSeqStr;
         if (psKey) this.byPeerSeq.set(psKey, existing);
       }
-      if (extra.senderUin !== undefined) existing.senderUin = String(extra.senderUin);
-      if (extra.senderUid !== undefined) existing.senderUid = String(extra.senderUid);
-      if (extra.groupId !== undefined) existing.groupId = String(extra.groupId);
+      if (extra.senderUin !== undefined) {
+        const nextUin = String(extra.senderUin);
+        if (pickPositiveUin(nextUin) > 0 || !existing.senderUin) {
+          existing.senderUin = nextUin;
+        }
+      }
+      if (extra.senderUid !== undefined && (extra.senderUid || !existing.senderUid)) {
+        existing.senderUid = String(extra.senderUid);
+      }
+      if (extra.groupId !== undefined && (extra.groupId || !existing.groupId)) {
+        existing.groupId = String(extra.groupId);
+      }
       if (extra.msgTime !== undefined) existing.msgTime = Number(extra.msgTime);
-      if (extra.rawMsg !== undefined) existing.rawMsg = extra.rawMsg;
-      if (extra.oneBotEvent !== undefined) existing.oneBotEvent = extra.oneBotEvent;
+      if (msgRandom && !existing.msgRandom) existing.msgRandom = msgRandom;
+      if (!existing._mediaKeys) existing._mediaKeys = new Set();
+      if (rawMsg) {
+        existing.rawMsg = rawMsg;
+        this._touchRawId(existing.shortId);
+        this.indexMsgMedia(rawMsg, existing.shortId);
+      }
+      if (extra.oneBotEvent) existing.oneBotEvent = extra.oneBotEvent;
       this._touch(existing);
       return existing.shortId;
     }
@@ -183,18 +443,21 @@ class MessageIdStore {
     const shortId = this._computeShortId(msgIdStr, normPeer, msgSeqStr);
     const entry = {
       shortId,
+      oneBotId: shortId,
       msgId: msgIdStr || String(shortId),
       peer: normPeer,
       chatType: normPeer.chatType,
       peerUid: normPeer.peerUid,
       msgSeq: msgSeqStr || "0",
+      msgRandom,
       senderUin: extra.senderUin !== undefined ? String(extra.senderUin) : "",
       senderUid: extra.senderUid !== undefined ? String(extra.senderUid) : "",
       groupId: extra.groupId !== undefined ? String(extra.groupId) : "",
       msgTime: Number(extra.msgTime || Math.floor(Date.now() / 1000)),
-      rawMsg: extra.rawMsg || null,
+      rawMsg,
       oneBotEvent: extra.oneBotEvent || null,
       createdAt: Date.now(),
+      _mediaKeys: new Set(),
     };
 
     this.byShortId.set(shortId, entry);
@@ -203,6 +466,10 @@ class MessageIdStore {
     }
     if (psKey) {
       this.byPeerSeq.set(psKey, entry);
+    }
+    if (rawMsg) {
+      this._touchRawId(shortId);
+      this.indexMsgMedia(rawMsg, shortId);
     }
     this._evictIfNeeded();
     return shortId;
@@ -272,6 +539,10 @@ class UinUidStore {
   }
 
   record(uin, uid, meta = null) {
+    return this.remember(uin, uid, meta);
+  }
+
+  register(uin, uid, meta = null) {
     return this.remember(uin, uid, meta);
   }
 
@@ -443,6 +714,7 @@ class UinUidStore {
   getUidSync(uin) {
     if (uin === undefined || uin === null) return "";
     const str = String(uin).trim();
+    if (!str || str === "0") return "";
     if (str.startsWith("u_")) return str;
     return this.uinToUid.get(str) || "";
   }
@@ -450,17 +722,18 @@ class UinUidStore {
   getUinSync(uid) {
     if (uid === undefined || uid === null) return "";
     const str = String(uid).trim();
+    if (!str || str === "0") return "";
     if (/^\d+$/.test(str) && Number(str) > 0) return str;
     return this.uidToUin.get(str) || "";
   }
 
   async resolveUid(uin, invokeNt) {
     const str = String(uin ?? "").trim();
-    if (!str) return "";
+    if (!str || str === "0") return "";
     if (str.startsWith("u_")) return str;
     const cached = this.getUidSync(str);
     if (cached) return cached;
-    if (typeof invokeNt === "function" && /^\d+$/.test(str)) {
+    if (typeof invokeNt === "function" && /^\d+$/.test(str) && Number(str) > 0) {
       const extractUid = (mapOrObj) => {
         if (mapOrObj instanceof Map) {
           return mapOrObj.get(str) || mapOrObj.get(Number(str)) || "";
@@ -477,7 +750,7 @@ class UinUidStore {
           [[str]]
         );
         const resolved = extractUid(res?.uidInfo || res);
-        if (resolved) {
+        if (resolved && String(resolved).trim() !== "0") {
           this.remember(str, resolved);
           return String(resolved);
         }
@@ -489,7 +762,7 @@ class UinUidStore {
           [[str]]
         );
         const resolved2 = extractUid(res2?.uids || res2?.uidInfo || res2);
-        if (resolved2) {
+        if (resolved2 && String(resolved2).trim() !== "0") {
           this.remember(str, resolved2);
           return String(resolved2);
         }
@@ -500,7 +773,7 @@ class UinUidStore {
 
   async resolveUin(uid, invokeNt) {
     const str = String(uid ?? "").trim();
-    if (!str) return "";
+    if (!str || str === "0") return "";
     if (/^\d+$/.test(str) && Number(str) > 0) return str;
     const cached = this.getUinSync(str);
     if (cached) return cached;
@@ -530,7 +803,7 @@ class UinUidStore {
         const res2 = await invokeNt(
           "nodeIKernelGroupService/getUinByUids",
           { uidList: [str], uids: [str] },
-          [[str]]
+        [[str]]
         );
         const resolved2 = extractUin(res2?.uins || res2?.uinInfo || res2);
         if (resolved2 && /^\d+$/.test(String(resolved2)) && Number(resolved2) > 0) {
@@ -541,6 +814,46 @@ class UinUidStore {
     }
     return "";
   }
+}
+
+function lookupCachedUin(uinUidStore, uid) {
+  if (!uinUidStore || !uid) return 0;
+  const uidStr = String(uid).trim();
+  if (!uidStr || uidStr === "0") return 0;
+  if (typeof uinUidStore.getUinSync === "function") {
+    return uinUidStore.getUinSync(uidStr);
+  }
+  if (typeof uinUidStore.getUin === "function") {
+    return uinUidStore.getUin(uidStr);
+  }
+  if (typeof uinUidStore.resolveUin === "function") {
+    const r = uinUidStore.resolveUin(uidStr);
+    if (r && typeof r.then !== "function") return r;
+  }
+  return 0;
+}
+
+function stripTransientNtMedia(ntMsg) {
+  if (ntMsg && Array.isArray(ntMsg.elements)) {
+    for (const el of ntMsg.elements) {
+      if (!el || typeof el !== "object") continue;
+      if (el.picElement && typeof el.picElement === "object") {
+        try {
+          delete el.picElement.__base64Uri;
+        } catch (_) {
+          el.picElement.__base64Uri = undefined;
+        }
+      }
+      if (el.pttElement && typeof el.pttElement === "object") {
+        try {
+          delete el.pttElement.__base64Uri;
+        } catch (_) {
+          el.pttElement.__base64Uri = undefined;
+        }
+      }
+    }
+  }
+  return ntMsg;
 }
 
 // ============================================================================
@@ -736,6 +1049,16 @@ function buildNtPicUrl(picElement, chatType) {
   return "";
 }
 
+function buildNtRecordUri(pttElement) {
+  if (!pttElement || typeof pttElement !== "object") return "";
+  const params = new URLSearchParams();
+  if (pttElement.fileUuid) params.set("uuid", String(pttElement.fileUuid));
+  if (pttElement.md5HexStr) params.set("md5", String(pttElement.md5HexStr));
+  if (pttElement.fileName) params.set("file", String(pttElement.fileName));
+  const qs = params.toString();
+  return qs ? `ntqq://record?${qs}` : "";
+}
+
 /**
  * Convert NTQQ `ntMsg` (or `{ elements, chatType, peerUid }`) into OneBot v11
  * `{ segments, raw_message }`.
@@ -770,10 +1093,12 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
         });
       } else if (atType === 2) {
         let qq = "";
-        if (te.atUid && /^\d+$/.test(String(te.atUid)) && Number(te.atUid) > 0) {
-          qq = String(te.atUid);
+        const posAtUin = pickPositiveUin(te.atUid);
+        if (posAtUin > 0) {
+          qq = String(posAtUin);
         } else if (uinUidStore && te.atNtUid) {
-          qq = uinUidStore.getUinSync(te.atNtUid);
+          const resolved = pickPositiveUin(lookupCachedUin(uinUidStore, te.atNtUid));
+          if (resolved > 0) qq = String(resolved);
         }
         if (!qq && te.atNtUid) {
           qq = String(te.atNtUid);
@@ -847,12 +1172,24 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
     // 4: pttElement (voice record)
     if (elType === 4 && el.pttElement) {
       const ptt = el.pttElement;
-      const file = String(ptt.fileName || ptt.md5HexStr || ptt.fileUuid || "record.amr");
+      const pttLocal = String(ptt.filePath || ptt.sourcePath || "");
+      let url = "";
+      if (typeof ptt.__base64Uri === "string" && ptt.__base64Uri) {
+        url = ptt.__base64Uri;
+      } else if (pttLocal && fs.existsSync(pttLocal)) {
+        url = pathToFileURL(pttLocal).href;
+      } else {
+        url = buildNtRecordUri(ptt);
+      }
+      const file = String(
+        ptt.fileName || ptt.md5HexStr || ptt.fileUuid || url || "record.amr"
+      );
       segments.push({
         type: "record",
         data: {
           file,
-          ...(ptt.filePath ? { path: String(ptt.filePath), url: `file://${ptt.filePath}` } : {}),
+          ...(pttLocal ? { path: pttLocal } : {}),
+          ...(url ? { url } : {}),
           ...(ptt.fileUuid ? { file_id: String(ptt.fileUuid) } : {}),
           file_size: String(ptt.fileSize || 0),
           magic: ptt.voiceChangeType ? "1" : "0",
@@ -864,12 +1201,20 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
     // 5: videoElement
     if (elType === 5 && el.videoElement) {
       const ve = el.videoElement;
-      const file = String(ve.fileName || ve.videoMd5 || ve.fileUuid || "video.mp4");
+      const veLocal = String(ve.filePath || ve.sourcePath || "");
+      let url = "";
+      if (veLocal && fs.existsSync(veLocal)) {
+        url = pathToFileURL(veLocal).href;
+      }
+      const file = String(
+        ve.fileName || ve.videoMd5 || ve.md5HexStr || ve.fileUuid || "video.mp4"
+      );
       segments.push({
         type: "video",
         data: {
           file,
-          ...(ve.filePath ? { path: String(ve.filePath), url: `file://${ve.filePath}` } : {}),
+          ...(veLocal ? { path: veLocal } : {}),
+          ...(url ? { url } : {}),
           ...(ve.fileUuid ? { file_id: String(ve.fileUuid) } : {}),
           file_size: String(ve.fileSize || 0),
         },
@@ -1532,29 +1877,44 @@ function mapNtRoleToOneBot(roleVal) {
 function parseGrayTipEvent(ntMsg, el, ctx = {}) {
   const gt = el.grayTipElement;
   if (!gt) return null;
-  const selfId = Number(ctx.selfId || 0);
+  const selfId = pickPositiveUin(ctx.selfId);
   const time = Number(ntMsg.msgTime || Math.floor(Date.now() / 1000));
   const isGroup = Number(ntMsg.chatType) === 2;
-  const groupId = isGroup ? Number(ntMsg.peerUid || ntMsg.peerUin || 0) : 0;
+  const groupId = isGroup ? pickPositiveUin(ntMsg.peerUid, ntMsg.peerUin) : 0;
   const uinUidStore = ctx.uinUidStore || null;
   const messageIdStore = ctx.messageIdStore || ctx.msgIdStore || null;
+  const senderUin = pickPositiveUin(
+    ntMsg.senderUin,
+    ntMsg.senderUid ? lookupCachedUin(uinUidStore, ntMsg.senderUid) : 0
+  );
 
   // 1. Revoke / recall
   if (gt.revokeElement) {
     const rev = gt.revokeElement;
-    const opUid = rev.operatorUid || ntMsg.senderUid || "";
-    const origUid = rev.origMsgSenderUid || ntMsg.senderUid || "";
-    const opUin =
-      Number(rev.operatorUin || (uinUidStore ? uinUidStore.getUinSync(opUid) : "") || ntMsg.senderUin || 0);
-    const origUin =
-      Number(rev.origMsgSenderUin || (uinUidStore ? uinUidStore.getUinSync(origUid) : "") || ntMsg.senderUin || opUin || 0);
-    let shortId = 0;
+    let hit = null;
     if (messageIdStore) {
-      const hit =
+      hit =
         messageIdStore.getByMsgId(ntMsg.msgId) ||
-        messageIdStore.getByPeerAndSeq(ntMsg.chatType, ntMsg.peerUid, ntMsg.msgSeq);
-      if (hit) shortId = hit.shortId;
+        (rev.origMsgId ? messageIdStore.getByMsgId(rev.origMsgId) : null) ||
+        messageIdStore.getByPeerAndSeq(
+          ntMsg.chatType,
+          ntMsg.peerUid,
+          rev.origMsgSeq || ntMsg.msgSeq
+        );
     }
+    const operatorId = pickPositiveUin(
+      rev.operatorUin,
+      rev.operatorUid ? lookupCachedUin(uinUidStore, rev.operatorUid) : 0,
+      senderUin
+    );
+    const origSenderUin = pickPositiveUin(
+      rev.origMsgSenderUin,
+      rev.origMsgSenderUid ? lookupCachedUin(uinUidStore, rev.origMsgSenderUid) : 0,
+      hit?.senderUin,
+      hit?.senderUid ? lookupCachedUin(uinUidStore, hit.senderUid) : 0,
+      operatorId
+    );
+    let shortId = hit ? hit.shortId : 0;
     if (!shortId && ntMsg.msgId) {
       shortId = messageIdStore
         ? messageIdStore.register(ntMsg.msgId, { chatType: ntMsg.chatType, peerUid: ntMsg.peerUid }, ntMsg.msgSeq)
@@ -1567,17 +1927,21 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
         post_type: "notice",
         notice_type: "group_recall",
         group_id: groupId,
-        user_id: origUin,
-        operator_id: opUin || origUin,
+        user_id: origSenderUin,
+        operator_id: operatorId || origSenderUin,
         message_id: shortId,
       };
     }
+    const peerUin = pickPositiveUin(
+      ntMsg.peerUin,
+      ntMsg.peerUid ? lookupCachedUin(uinUidStore, ntMsg.peerUid) : 0
+    );
     return {
       time,
       self_id: selfId,
       post_type: "notice",
       notice_type: "friend_recall",
-      user_id: origUin || Number(ntMsg.peerUin || 0),
+      user_id: pickPositiveUin(origSenderUin, peerUin),
       message_id: shortId,
     };
   }
@@ -1585,35 +1949,60 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
   // 2. XML / JSON gray tip (poke, essence, etc.)
   const xmlContent = gt.xmlElement?.content || gt.jsonGrayTipElement?.jsonStr || "";
   const busiId = String(gt.xmlElement?.busiId || gt.jsonGrayTipElement?.busiId || "");
-  const templMap =
-    gt.xmlElement?.templParam instanceof Map
-      ? gt.xmlElement.templParam
-      : gt.jsonGrayTipElement?.xmlToJsonParam?.templParam instanceof Map
-      ? gt.jsonGrayTipElement.xmlToJsonParam.templParam
-      : null;
+  const rawTempl =
+    gt.xmlElement?.templParam ||
+    gt.jsonGrayTipElement?.xmlToJsonParam?.templParam ||
+    null;
+  const getTemplParam = (key) => {
+    if (!rawTempl) return undefined;
+    if (rawTempl instanceof Map) return rawTempl.get(key);
+    if (typeof rawTempl === "object") return rawTempl[key];
+    return undefined;
+  };
+  const isEssenceTip =
+    busiId === "2401" || busiId === "2407" || xmlContent.includes("精华消息");
+  const hasTemplActor =
+    getTemplParam("uin_str1") !== undefined || getTemplParam("uid_str1") !== undefined;
+
   if (
-    busiId === "1061" ||
-    xmlContent.includes("poke") ||
-    xmlContent.includes("戳了戳") ||
-    (templMap && templMap.has("uin_str1"))
+    !isEssenceTip &&
+    (busiId === "1061" ||
+      xmlContent.includes("poke") ||
+      xmlContent.includes("戳了戳") ||
+      hasTemplActor)
   ) {
-    let fromUin = 0;
-    let toUin = 0;
-    if (templMap) {
-      fromUin = Number(templMap.get("uin_str1") || 0);
-      toUin = Number(templMap.get("uin_str2") || 0);
-    }
+    let fromUin = pickPositiveUin(
+      getTemplParam("uin_str1"),
+      getTemplParam("uid_str1") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str1")) : 0
+    );
+    let toUin = pickPositiveUin(
+      getTemplParam("uin_str2"),
+      getTemplParam("uid_str2") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str2")) : 0
+    );
     if (!fromUin || !toUin) {
-      const uinMatches = [...xmlContent.matchAll(/(?:uin|qq|jp)="?(\d{5,12})"?/gi)].map((m) => Number(m[1]));
+      const uinMatches = [...xmlContent.matchAll(/(?:uin|qq|jp)="?(\d{5,12})"?/gi)]
+        .map((m) => pickPositiveUin(m[1]))
+        .filter((n) => n > 0);
       if (uinMatches.length >= 2) {
-        fromUin = uinMatches[0];
-        toUin = uinMatches[1];
+        if (!fromUin) fromUin = uinMatches[0];
+        if (!toUin) toUin = uinMatches[1];
       } else if (uinMatches.length === 1) {
-        fromUin = uinMatches[0];
-        toUin = selfId;
+        if (!fromUin) fromUin = uinMatches[0];
+        if (!toUin) toUin = selfId;
       }
     }
-    if (!fromUin && ntMsg.senderUin) fromUin = Number(ntMsg.senderUin);
+    if ((!fromUin || !toUin) && uinUidStore) {
+      const uidMatches = [...xmlContent.matchAll(/(?:uid|jp|col_uid)="?(u_[A-Za-z0-9_-]+)"?/gi)]
+        .map((m) => pickPositiveUin(lookupCachedUin(uinUidStore, m[1])))
+        .filter((n) => n > 0);
+      if (uidMatches.length >= 2) {
+        if (!fromUin) fromUin = uidMatches[0];
+        if (!toUin) toUin = uidMatches[1];
+      } else if (uidMatches.length === 1) {
+        if (!fromUin) fromUin = uidMatches[0];
+      }
+    }
+    if (!fromUin) fromUin = senderUin;
     if (!toUin) toUin = selfId;
     if (fromUin > 0 && toUin > 0) {
       return {
@@ -1632,7 +2021,17 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
   }
 
   // Essence message grayTip (busiId 2401 / 2407)
-  if ((busiId === "2401" || busiId === "2407" || xmlContent.includes("精华消息")) && isGroup) {
+  if (isEssenceTip && isGroup) {
+    const actor1 = pickPositiveUin(
+      getTemplParam("uin_str1"),
+      getTemplParam("uid_str1") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str1")) : 0
+    );
+    const actor2 = pickPositiveUin(
+      getTemplParam("uin_str2"),
+      getTemplParam("uid_str2") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str2")) : 0
+    );
+    const essOperator = pickPositiveUin(actor1, senderUin);
+    const essSender = pickPositiveUin(actor2, senderUin, essOperator);
     return {
       time,
       self_id: selfId,
@@ -1640,8 +2039,8 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
       notice_type: "essence",
       sub_type: xmlContent.includes("移出") ? "delete" : "add",
       group_id: groupId,
-      sender_id: Number(ntMsg.senderUin || 0),
-      operator_id: Number(ntMsg.senderUin || 0),
+      sender_id: essSender,
+      operator_id: essOperator,
       message_id: Number(ntMsg.msgSeq || 0),
     };
   }
@@ -1650,11 +2049,13 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
   if (gt.groupElement && isGroup) {
     const ge = gt.groupElement;
     const gType = Number(ge.type || 0);
-    const memberUin = Number(
-      ge.memberUin || (uinUidStore && ge.memberUid ? uinUidStore.getUinSync(ge.memberUid) : 0) || 0
+    const memberUin = pickPositiveUin(
+      ge.memberUin,
+      ge.memberUid ? lookupCachedUin(uinUidStore, ge.memberUid) : 0
     );
-    const adminUin = Number(
-      ge.adminUin || (uinUidStore && ge.adminUid ? uinUidStore.getUinSync(ge.adminUid) : 0) || 0
+    const adminUin = pickPositiveUin(
+      ge.adminUin,
+      ge.adminUid ? lookupCachedUin(uinUidStore, ge.adminUid) : 0
     );
     if (gType === 1) {
       return {
@@ -1669,12 +2070,18 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
       };
     }
     if (gType === 2 || gType === 3) {
+      const subType =
+        gType === 3
+          ? selfId > 0 && memberUin > 0 && memberUin === selfId
+            ? "kick_me"
+            : "kick"
+          : "leave";
       return {
         time,
         self_id: selfId,
         post_type: "notice",
         notice_type: "group_decrease",
-        sub_type: memberUin === selfId ? "kick_me" : gType === 3 ? "kick" : "leave",
+        sub_type: subType,
         group_id: groupId,
         operator_id: adminUin || memberUin,
         user_id: memberUin,
@@ -1683,13 +2090,21 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
     if (gType === 4 || gType === 8) {
       const shutUp = ge.shutUp;
       const duration = Number(shutUp?.duration ?? (gType === 8 ? 0 : 1800));
-      const targetUid = shutUp?.member?.uid || ge.memberUid || "";
-      const targetUin = Number(
-        shutUp?.member?.uin || (uinUidStore && targetUid ? uinUidStore.getUinSync(targetUid) : 0) || memberUin || 0
+      const shutMemberUid = String(shutUp?.member?.uid || "").trim();
+      const targetUin = pickPositiveUin(
+        shutUp?.member?.uin,
+        shutMemberUid && shutMemberUid !== "0"
+          ? lookupCachedUin(uinUidStore, shutMemberUid)
+          : 0,
+        !shutUp?.member || shutMemberUid ? memberUin : 0
       );
-      const opUid = shutUp?.admin?.uid || ge.adminUid || "";
-      const opUin = Number(
-        shutUp?.admin?.uin || (uinUidStore && opUid ? uinUidStore.getUinSync(opUid) : 0) || adminUin || 0
+      const shutAdminUid = String(shutUp?.admin?.uid || "").trim();
+      const opUin = pickPositiveUin(
+        shutUp?.admin?.uin,
+        shutAdminUid && shutAdminUid !== "0"
+          ? lookupCachedUin(uinUidStore, shutAdminUid)
+          : 0,
+        adminUin
       );
       return {
         time,
@@ -1704,6 +2119,11 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
       };
     }
     if (gType === 5) {
+      const adminTargetUin = pickPositiveUin(
+        memberUin,
+        ge.adminNotify?.uin,
+        ge.adminNotify?.uid ? lookupCachedUin(uinUidStore, ge.adminNotify.uid) : 0
+      );
       return {
         time,
         self_id: selfId,
@@ -1711,7 +2131,7 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
         notice_type: "group_admin",
         sub_type: ge.isAdmin === false ? "unset" : "set",
         group_id: groupId,
-        user_id: memberUin,
+        user_id: adminTargetUin,
       };
     }
   }
@@ -1723,11 +2143,15 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
       xmlContent.includes("已添加你为好友") ||
       gt.buddyElement)
   ) {
-    const uin = Number(
-      ntMsg.peerUin ||
-        ntMsg.senderUin ||
-        (uinUidStore && ntMsg.peerUid ? uinUidStore.getUinSync(ntMsg.peerUid) : 0) ||
-        0
+    const be = gt.buddyElement || {};
+    const beUid = be.peerUid || be.friendUid || "";
+    const uin = pickPositiveUin(
+      ntMsg.peerUin,
+      be.peerUin,
+      be.friendUin,
+      ntMsg.peerUid ? lookupCachedUin(uinUidStore, ntMsg.peerUid) : 0,
+      beUid ? lookupCachedUin(uinUidStore, beUid) : 0,
+      senderUin
     );
     if (uin > 0) {
       return {
@@ -1749,7 +2173,7 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
  */
 function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
   if (!ntMsg || typeof ntMsg !== "object") return null;
-  const selfId = Number(ctx.selfId || 0);
+  const selfId = pickPositiveUin(ctx.selfId);
   const time = Number(ntMsg.msgTime || Math.floor(Date.now() / 1000));
   const chatType = Number(ntMsg.chatType || 1);
   const isGroup = chatType === 2;
@@ -1768,12 +2192,19 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
     if (revEl) {
       return parseGrayTipEvent(ntMsg, revEl, ctx);
     }
-    const senderUin = Number(
-      ntMsg.senderUin || (uinUidStore && ntMsg.senderUid ? uinUidStore.getUinSync(ntMsg.senderUid) : 0) || 0
+    const hit = messageIdStore
+      ? messageIdStore.getByMsgId(ntMsg.msgId) ||
+        messageIdStore.getByPeerAndSeq(chatType, ntMsg.peerUid, ntMsg.msgSeq)
+      : null;
+    const recalledSenderUin = pickPositiveUin(
+      ntMsg.senderUin,
+      hit?.senderUin,
+      ntMsg.senderUid ? lookupCachedUin(uinUidStore, ntMsg.senderUid) : 0,
+      hit?.senderUid ? lookupCachedUin(uinUidStore, hit.senderUid) : 0
     );
     const shortId = messageIdStore
-      ? (messageIdStore.getByMsgId(ntMsg.msgId)?.shortId ||
-          messageIdStore.register(ntMsg.msgId, { chatType, peerUid: ntMsg.peerUid }, ntMsg.msgSeq))
+      ? hit?.shortId ||
+        messageIdStore.register(ntMsg.msgId, { chatType, peerUid: ntMsg.peerUid }, ntMsg.msgSeq)
       : Number(String(ntMsg.msgId || 1).slice(-9));
     if (isGroup) {
       return {
@@ -1781,18 +2212,22 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
         self_id: selfId,
         post_type: "notice",
         notice_type: "group_recall",
-        group_id: Number(ntMsg.peerUid || ntMsg.peerUin || 0),
-        user_id: senderUin,
-        operator_id: senderUin,
+        group_id: pickPositiveUin(ntMsg.peerUid, ntMsg.peerUin),
+        user_id: recalledSenderUin,
+        operator_id: recalledSenderUin,
         message_id: shortId,
       };
     }
+    const recalledPeerUin = pickPositiveUin(
+      ntMsg.peerUin,
+      ntMsg.peerUid ? lookupCachedUin(uinUidStore, ntMsg.peerUid) : 0
+    );
     return {
       time,
       self_id: selfId,
       post_type: "notice",
       notice_type: "friend_recall",
-      user_id: senderUin || Number(ntMsg.peerUin || 0),
+      user_id: pickPositiveUin(recalledSenderUin, recalledPeerUin),
       message_id: shortId,
     };
   }
@@ -1807,19 +2242,31 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
     }
   }
 
-  let senderUin = String(ntMsg.senderUin || "");
-  if ((!senderUin || senderUin === "0") && uinUidStore && ntMsg.senderUid) {
-    senderUin = uinUidStore.getUinSync(ntMsg.senderUid);
-  }
-  const groupId = isGroup ? String(ntMsg.peerUid || ntMsg.peerUin || "") : "";
+  const senderUinNum = pickPositiveUin(
+    ntMsg.senderUin,
+    ntMsg.senderUid ? lookupCachedUin(uinUidStore, ntMsg.senderUid) : 0
+  );
+  const senderUin = senderUinNum > 0 ? String(senderUinNum) : "";
+  const groupIdNum = isGroup ? pickPositiveUin(ntMsg.peerUid, ntMsg.peerUin) : 0;
+  const groupId = isGroup
+    ? groupIdNum > 0
+      ? String(groupIdNum)
+      : String(ntMsg.peerUid || ntMsg.peerUin || "")
+    : "";
   const peerUid = String(ntMsg.peerUid || (isGroup ? groupId : ntMsg.senderUid || ""));
+  const peerUin = !isGroup
+    ? pickPositiveUin(
+        ntMsg.peerUin,
+        ntMsg.peerUid ? lookupCachedUin(uinUidStore, ntMsg.peerUid) : 0
+      )
+    : 0;
 
   const { segments, raw_message } = ntMsgToOneBotSegments(ntMsg, ctx);
   if (segments.length === 0 && Number(ntMsg.msgType) === 5) {
     return null;
   }
 
-  const isSelf = Boolean(selfId && Number(senderUin) === selfId);
+  const isSelf = Boolean(selfId > 0 && senderUinNum === selfId);
   const senderRole = mapNtRoleToOneBot(
     ntMsg.roleType ??
       ntMsg.senderRole ??
@@ -1830,14 +2277,14 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
 
   const sender = isGroup
     ? {
-        user_id: Number(senderUin || 0),
+        user_id: senderUinNum,
         nickname: String(ntMsg.sendNickName || ""),
         card: String(ntMsg.sendMemberName || ""),
         role: senderRole,
         title: String(ntMsg.sendMemberTitle || ""),
       }
     : {
-        user_id: Number(senderUin || 0),
+        user_id: senderUinNum,
         nickname: String(ntMsg.sendNickName || ""),
         sex: "unknown",
         age: 0,
@@ -1858,6 +2305,10 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
       )
     : Number(String(ntMsg.msgId || 1).slice(-9)) || 1;
 
+  if (messageIdStore && typeof messageIdStore.indexMsgMedia === "function") {
+    messageIdStore.indexMsgMedia(ntMsg, shortId);
+  }
+
   const event = {
     time,
     self_id: selfId,
@@ -1865,8 +2316,12 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
     message_type: isGroup ? "group" : "private",
     sub_type: isGroup ? "normal" : chatType === 100 ? "group" : "friend",
     message_id: shortId,
-    user_id: Number(senderUin || 0),
-    ...(isGroup ? { group_id: Number(groupId || 0), anonymous: null } : {}),
+    user_id: senderUinNum,
+    ...(isGroup
+      ? { group_id: groupIdNum, anonymous: null }
+      : peerUin > 0
+      ? { target_id: peerUin }
+      : {}),
     message:
       ctx.messageFormat === "string" || ctx.postMessageFormat === "string"
         ? raw_message
@@ -1876,11 +2331,6 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
     sender,
   };
 
-  if (messageIdStore) {
-    const entry = messageIdStore.getByShortId(shortId);
-    if (entry) entry.oneBotEvent = event;
-  }
-
   return event;
 }
 
@@ -1888,18 +2338,19 @@ function formatGroupUploadNotice(ntMsg, ctx = {}) {
   if (!ntMsg || Number(ntMsg.chatType) !== 2 || !Array.isArray(ntMsg.elements)) return null;
   const fileEl = ntMsg.elements.find((e) => e?.elementType === 3 && e.fileElement)?.fileElement;
   if (!fileEl) return null;
-  const selfId = Number(ctx.selfId || 0);
+  const selfId = pickPositiveUin(ctx.selfId);
   const time = Number(ntMsg.msgTime || Math.floor(Date.now() / 1000));
   const uinUidStore = ctx.uinUidStore || null;
-  const senderUin = Number(
-    ntMsg.senderUin || (uinUidStore && ntMsg.senderUid ? uinUidStore.getUinSync(ntMsg.senderUid) : 0) || 0
+  const senderUin = pickPositiveUin(
+    ntMsg.senderUin,
+    ntMsg.senderUid ? lookupCachedUin(uinUidStore, ntMsg.senderUid) : 0
   );
   return {
     time,
     self_id: selfId,
     post_type: "notice",
     notice_type: "group_upload",
-    group_id: Number(ntMsg.peerUid || ntMsg.peerUin || 0),
+    group_id: pickPositiveUin(ntMsg.peerUid, ntMsg.peerUin),
     user_id: senderUin,
     file: {
       id: String(fileEl.fileUuid || fileEl.fileBizId || fileEl.fileMd5 || ""),
@@ -1975,6 +2426,8 @@ module.exports = {
   DEFAULT_MAX_MEDIA_BYTES,
   MessageIdStore,
   UinUidStore,
+  pickPositiveUin,
+  stripTransientNtMedia,
   escapeCqText,
   unescapeCqText,
   escapeCqParam,
@@ -1993,6 +2446,7 @@ module.exports = {
   downloadMediaStreamToTempDir,
   resolveMediaSource,
   buildNtPicUrl,
+  buildNtRecordUri,
   ntMsgToOneBotSegments,
   oneBotSegmentsToNtElements,
   formatNtMsgToOneBotEvent,

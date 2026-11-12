@@ -7,6 +7,7 @@ const { formatMetaEvent } = require("../bridge_onebot");
 
 const {
   WS_GUID,
+  DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
   Rfc6455Connection,
   connectReverseWebSocket,
 } = require("./ws_rfc6455");
@@ -29,7 +30,45 @@ const serverRuntimeMixin = {
     });
   },
 
+  _recordListenError(kind, host, port, err) {
+    if (!Array.isArray(this.listenErrors)) {
+      this.listenErrors = [];
+    }
+    const entry = {
+      kind: String(kind || "server"),
+      host: String(host || ""),
+      port: Number(port),
+      code: err?.code || "ERR_LISTEN_FAILED",
+      message: err?.message || String(err),
+      ts: Date.now(),
+    };
+    const dupIdx = this.listenErrors.findIndex(
+      (e) =>
+        e.kind === entry.kind &&
+        e.host === entry.host &&
+        Object.is(e.port, entry.port) &&
+        e.code === entry.code
+    );
+    if (dupIdx !== -1) {
+      this.listenErrors[dupIdx] = entry;
+    } else {
+      if (this.listenErrors.length >= 16) {
+        this.listenErrors.shift();
+      }
+      this.listenErrors.push(entry);
+    }
+    if (!this.config?.quietLogs && process.env.ROSMONTIS_QUIET !== "1") {
+      try {
+        process.stderr.write(
+          `[rosmontis] WARN: Failed to listen (${entry.kind} ${entry.host}:${entry.port}): [${entry.code}] ${entry.message}\n`
+        );
+      } catch (_) {}
+    }
+  },
+
   async startServers() {
+    this.listenErrors = [];
+
     enforceProtectedModeOnServers(
       [...(this.config.httpServers || []), ...(this.config.wsServers || [])],
       this.config,
@@ -141,11 +180,30 @@ const serverRuntimeMixin = {
             }
           }
         });
-        srv.on("error", () => resolve());
-        srv.listen(Number(httpCfg.port ?? 3000), httpCfg.host || "0.0.0.0", () => {
-          this._httpServers.push(srv);
+        const listenPort = Number(httpCfg.port ?? 3000);
+        const listenHost = httpCfg.host || "0.0.0.0";
+        let settled = false;
+        const settleOnce = () => {
+          if (settled) return;
+          settled = true;
           resolve();
+        };
+        srv.on("error", (err) => {
+          this._recordListenError("http", listenHost, listenPort, err);
+          settleOnce();
         });
+        try {
+          srv.listen(listenPort, listenHost, () => {
+            this._httpServers.push(srv);
+            settleOnce();
+          });
+        } catch (syncErr) {
+          this._recordListenError("http", listenHost, listenPort, syncErr);
+          try {
+            srv.close();
+          } catch (_) {}
+          settleOnce();
+        }
       });
     }
 
@@ -204,6 +262,8 @@ const serverRuntimeMixin = {
           const conn = new Rfc6455Connection(socket, {
             isClient: false,
             maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
+            maxSendBufferBytes:
+              this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
             allowUnmaskedClientFrames: Boolean(this.config.allowUnmaskedClientFrames),
           });
           conn.reportSelfMessage = Boolean(wsCfg.reportSelfMessage);
@@ -251,11 +311,30 @@ const serverRuntimeMixin = {
             conn._onData(head);
           }
         });
-        srv.on("error", () => resolve());
-        srv.listen(Number(wsCfg.port ?? 3001), wsCfg.host || "0.0.0.0", () => {
-          this._wsServers.push(srv);
+        const listenPort = Number(wsCfg.port ?? 3001);
+        const listenHost = wsCfg.host || "0.0.0.0";
+        let settled = false;
+        const settleOnce = () => {
+          if (settled) return;
+          settled = true;
           resolve();
+        };
+        srv.on("error", (err) => {
+          this._recordListenError("ws", listenHost, listenPort, err);
+          settleOnce();
         });
+        try {
+          srv.listen(listenPort, listenHost, () => {
+            this._wsServers.push(srv);
+            settleOnce();
+          });
+        } catch (syncErr) {
+          this._recordListenError("ws", listenHost, listenPort, syncErr);
+          try {
+            srv.close();
+          } catch (_) {}
+          settleOnce();
+        }
       });
     }
 
@@ -289,6 +368,50 @@ const serverRuntimeMixin = {
       if (typeof this._heartbeatTimer.unref === "function") {
         this._heartbeatTimer.unref();
       }
+    }
+
+    // 5. Start Periodic WS Liveness Timer
+    const rawPingInterval = this.config?.wsPingIntervalMs ?? 30000;
+    const pingIntervalMs = Number.isFinite(Number(rawPingInterval))
+      ? Number(rawPingInterval)
+      : 30000;
+    if (!this._wsPingTimer && pingIntervalMs > 0) {
+      const rawPongTimeout = Number(this.config?.wsPongTimeoutMs ?? 90000);
+      const pongTimeoutMs = Math.max(
+        pingIntervalMs * 2,
+        Number.isFinite(rawPongTimeout) && rawPongTimeout > 0 ? rawPongTimeout : 90000
+      );
+      this._wsPingTimer = setInterval(() => {
+        const now = Date.now();
+        const serverClients = this._wsServerClients || this.wsClients;
+        if (serverClients) {
+          for (const conn of Array.from(serverClients)) {
+            if (!conn || conn.closed || conn._closed) {
+              serverClients.delete?.(conn);
+              continue;
+            }
+            if (conn._unansweredPingAt > 0 && now - conn._unansweredPingAt > pongTimeoutMs) {
+              serverClients.delete?.(conn);
+              conn.terminate("Pong timeout");
+            } else {
+              conn.ping();
+            }
+          }
+        }
+        const revClients = this._reverseWsClients || this.reverseWsClients;
+        if (Array.isArray(revClients)) {
+          for (const rc of revClients) {
+            const conn = rc?.conn;
+            if (!conn || conn.closed || conn._closed) continue;
+            if (conn._unansweredPingAt > 0 && now - conn._unansweredPingAt > pongTimeoutMs) {
+              conn.terminate("Pong timeout");
+            } else {
+              conn.ping();
+            }
+          }
+        }
+      }, pingIntervalMs);
+      this._wsPingTimer.unref?.();
     }
   },
 
@@ -377,6 +500,8 @@ const serverRuntimeMixin = {
         },
         {
           maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
+          maxSendBufferBytes:
+            this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
         }
       );
     };
@@ -392,6 +517,10 @@ const serverRuntimeMixin = {
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
+    }
+    if (this._wsPingTimer) {
+      clearInterval(this._wsPingTimer);
+      this._wsPingTimer = null;
     }
     for (const rev of this._reverseWsClients) {
       rev.stopped = true;

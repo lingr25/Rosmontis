@@ -184,7 +184,17 @@ class NtqqOneBotBridge extends EventEmitter {
     this._wsServerClients = new Set();
     this._reverseWsClients = [];
     this._wsClientHandles = this._reverseWsClients;
+    this.listenErrors = [];
     this._heartbeatTimer = null;
+    this._wsPingTimer = null;
+  }
+
+  get wsClients() {
+    return this._wsServerClients;
+  }
+
+  get reverseWsClients() {
+    return this._reverseWsClients;
   }
 
   _safeJsJson(val) {

@@ -714,6 +714,7 @@ async function dispatch(action, p, context = {}) {
     case "set_essence_msg":
     case "delete_essence_msg": {
       const entry =
+        this.messageIdStore.resolveByOneBotId?.(p.message_id) ||
         this.messageIdStore.getByShortId(p.message_id) ||
         this.messageIdStore.getByMsgId(p.message_id);
       if (!entry) throw new Error("message not found");
@@ -724,7 +725,7 @@ async function dispatch(action, p, context = {}) {
       await this.invokeNt(cmd, {
         param: {
           groupCode: String(entry.peer?.peerUid || entry.groupId || p.group_id || ""),
-          msgRandom: Number(entry.rawMsg?.msgRandom || 0),
+          msgRandom: Number(entry.rawMsg?.msgRandom ?? entry.msgRandom ?? 0),
           msgSeq: Number(entry.msgSeq || 0),
         },
       });

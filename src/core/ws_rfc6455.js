@@ -12,6 +12,7 @@ const {
 } = require("./transport_security");
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const DEFAULT_MAX_WS_SEND_BUFFER_BYTES = 32 * 1024 * 1024; // 32 MiB
 const MAX_UPGRADE_HEADER_BYTES = 64 * 1024;
 const RESERVED_HANDSHAKE_HEADERS = new Set([
   "host",
@@ -84,58 +85,85 @@ function encodeWsCloseFrame(code = 1000, reason = "", mask = false) {
 }
 
 class Rfc6455Connection extends EventEmitter {
-  constructor(
-    socket,
-    {
-      isClient = false,
-      maxPayloadBytes = DEFAULT_MAX_WS_PAYLOAD_BYTES,
-      allowUnmaskedClientFrames = false,
-    } = {}
-  ) {
+  constructor(socket, options = {}) {
     super();
+    const opts = options && typeof options === "object" ? options : {};
     this.socket = socket;
-    this.isClient = Boolean(isClient);
-    this.allowUnmaskedClientFrames = Boolean(allowUnmaskedClientFrames);
-    const parsedMax = Number(maxPayloadBytes);
+    this.isClient = Boolean(opts.isClient);
+    this.allowUnmaskedClientFrames = Boolean(opts.allowUnmaskedClientFrames);
+    const parsedMax = Number(opts.maxPayloadBytes);
     this.maxPayloadBytes =
       Number.isFinite(parsedMax) && parsedMax > 0
         ? Math.floor(parsedMax)
         : DEFAULT_MAX_WS_PAYLOAD_BYTES;
+    const parsedMaxSendBuf = Number(opts.maxSendBufferBytes);
+    this.maxSendBufferBytes =
+      Number.isFinite(parsedMaxSendBuf) && parsedMaxSendBuf > 0
+        ? Math.floor(parsedMaxSendBuf)
+        : DEFAULT_MAX_WS_SEND_BUFFER_BYTES;
+
+    const now = Date.now();
+    this._lastActivityAt = now;
+    this._lastPongAt = now;
+    this._unansweredPingAt = 0;
 
     this.closed = false;
+    this._closing = false;
+    this._closeEmitted = false;
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
     this._fragmentsBytes = 0;
     this._fragmentOpcode = 0;
 
     this._boundOnData = (chunk) => this._onData(chunk);
-    socket.on("data", this._boundOnData);
-    socket.on("close", () => {
-      if (!this.closed) {
-        this.closed = true;
-        this._buffer = Buffer.alloc(0);
-        this._fragments = [];
-        this._fragmentsBytes = 0;
-        this.emit("close", 1006, "");
-      }
-    });
-    socket.on("error", (err) => {
-      if (this.listenerCount("error") > 0) {
-        this.emit("error", err);
-      }
-      if (!this.closed) {
-        this.closed = true;
-        this._buffer = Buffer.alloc(0);
-        this._fragments = [];
-        this._fragmentsBytes = 0;
-        this.emit("close", 1006, "");
-      }
-    });
+    if (socket && typeof socket.on === "function") {
+      socket.on("data", this._boundOnData);
+      socket.on("close", () => {
+        if (!this.closed) {
+          this.closed = true;
+          this._closing = true;
+          this._buffer = Buffer.alloc(0);
+          this._fragments = [];
+          this._fragmentsBytes = 0;
+          this._fragmentOpcode = 0;
+          this._emitCloseOnce(1006, "");
+        }
+      });
+      socket.on("error", (err) => {
+        if (this.listenerCount("error") > 0) {
+          this.emit("error", err);
+        }
+        if (!this.closed) {
+          this.closed = true;
+          this._closing = true;
+          this._buffer = Buffer.alloc(0);
+          this._fragments = [];
+          this._fragmentsBytes = 0;
+          this._fragmentOpcode = 0;
+          this._emitCloseOnce(1006, "");
+        }
+      });
+    }
+  }
+
+  get _closed() {
+    return Boolean(this.closed);
+  }
+
+  set _closed(val) {
+    this.closed = Boolean(val);
+  }
+
+  _emitCloseOnce(code, reason) {
+    if (this._closeEmitted) return;
+    this._closeEmitted = true;
+    this.emit("close", code, reason);
   }
 
   _terminateWithProtocolClose(code, reason) {
     if (this.closed) return;
     this.closed = true;
+    this._closing = true;
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
     this._fragmentsBytes = 0;
@@ -191,11 +219,12 @@ class Rfc6455Connection extends EventEmitter {
     err.wsCloseCode = code;
     err.code = code === 1009 ? "ERR_WS_PAYLOAD_TOO_LARGE" : "ERR_WS_PROTOCOL_ERROR";
     this.emit("protocol_error", err, code, reason);
-    this.emit("close", code, reason);
+    this._emitCloseOnce(code, reason);
   }
 
   _onData(chunk) {
     if (this.closed || !chunk || chunk.length === 0) return;
+    this._lastActivityAt = Date.now();
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 
     // Guard against pre-concat memory spike if a partial header (<14 bytes) is followed by a huge chunk
@@ -337,11 +366,17 @@ class Rfc6455Connection extends EventEmitter {
         this._buffer = this._buffer.subarray(offset + payloadLen);
       }
 
+      if (opcode === 0x8 && payload.length === 1) {
+        this._terminateWithProtocolClose(1002, "Protocol error: invalid 1-byte close payload");
+        return;
+      }
+
+      const frameNow = Date.now();
+      this._lastActivityAt = frameNow;
+      this._lastPongAt = frameNow;
+      this._unansweredPingAt = 0;
+
       if (opcode === 0x8) {
-        if (payload.length === 1) {
-          this._terminateWithProtocolClose(1002, "Protocol error: invalid 1-byte close payload");
-          return;
-        }
         let closeCode = 1005;
         let closeReason = "";
         if (payload.length >= 2) {
@@ -350,6 +385,7 @@ class Rfc6455Connection extends EventEmitter {
         }
         if (!this.closed) {
           this.closed = true;
+          this._closing = true;
           this._buffer = Buffer.alloc(0);
           this._fragments = [];
           this._fragmentsBytes = 0;
@@ -364,7 +400,7 @@ class Rfc6455Connection extends EventEmitter {
               if (typeof this.socket.end === "function") this.socket.end();
             }
           } catch (_) {}
-          this.emit("close", closeCode, closeReason);
+          this._emitCloseOnce(closeCode, closeReason);
         }
         return;
       }
@@ -423,6 +459,16 @@ class Rfc6455Connection extends EventEmitter {
     if (this.closed || !this.socket || this.socket.destroyed) return false;
     try {
       const frame = encodeWsFrame(opcode, payload, this.isClient);
+      const buffered =
+        typeof this.socket?.writableLength === "number" ? this.socket.writableLength : 0;
+      if (
+        this.maxSendBufferBytes > 0 &&
+        buffered > 0 &&
+        buffered + frame.length > this.maxSendBufferBytes
+      ) {
+        this.terminate("Send buffer overflow");
+        return false;
+      }
       this.socket.write(frame);
       return true;
     } catch (_) {
@@ -438,13 +484,44 @@ class Rfc6455Connection extends EventEmitter {
     return this.sendText(JSON.stringify(obj));
   }
 
-  ping() {
-    return this._sendRawFrame(0x9, Buffer.from("ping"));
+  ping(payload = Buffer.alloc(0)) {
+    if (this.closed) return false;
+    if (this._unansweredPingAt === 0) {
+      this._unansweredPingAt = Date.now();
+    }
+    const buf = Buffer.isBuffer(payload)
+      ? payload
+      : Buffer.from(String(payload || ""), "utf8");
+    return this._sendRawFrame(0x9, buf.length > 125 ? buf.subarray(0, 125) : buf);
+  }
+
+  terminate(reason = "terminated") {
+    if (this.closed) return;
+    this.closed = true;
+    this._closing = true;
+    this._buffer = Buffer.alloc(0);
+    this._fragments = [];
+    this._fragmentsBytes = 0;
+    this._fragmentOpcode = 0;
+    try {
+      if (typeof this.socket?.removeListener === "function" && this._boundOnData) {
+        this.socket.removeListener("data", this._boundOnData);
+      }
+    } catch (_) {}
+    try {
+      if (typeof this.socket?.destroy === "function") {
+        this.socket.destroy();
+      } else if (typeof this.socket?.end === "function") {
+        this.socket.end();
+      }
+    } catch (_) {}
+    this._emitCloseOnce(1006, String(reason || ""));
   }
 
   close(code = 1000, reason = "") {
     if (this.closed) return;
     this.closed = true;
+    this._closing = true;
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
     this._fragmentsBytes = 0;
@@ -459,7 +536,7 @@ class Rfc6455Connection extends EventEmitter {
         if (typeof this.socket.end === "function") this.socket.end();
       }
     } catch (_) {}
-    this.emit("close", code ?? 1005, String(reason || ""));
+    this._emitCloseOnce(code ?? 1005, String(reason || ""));
   }
 }
 
@@ -595,6 +672,7 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
     wsConn = new Rfc6455Connection(socket, {
       isClient: true,
       maxPayloadBytes: opts.maxPayloadBytes,
+      maxSendBufferBytes: opts.maxSendBufferBytes,
     });
     wsConn.on("message", (msg) => {
       if (onMessage) onMessage(msg, wsConn);
@@ -623,6 +701,22 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
   });
 
   return {
+    get conn() {
+      return wsConn;
+    },
+    ping(payload) {
+      return wsConn ? wsConn.ping(payload) : false;
+    },
+    terminate(reason = "terminated") {
+      if (wsConn) {
+        wsConn.terminate(reason);
+      } else {
+        try {
+          if (typeof socket?.destroy === "function") socket.destroy();
+        } catch (_) {}
+        notifyCloseOnce(new Error(String(reason || "terminated")));
+      }
+    },
     close() {
       if (wsConn) wsConn.close();
       else socket.destroy();
@@ -632,8 +726,11 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
 
 module.exports = {
   WS_GUID,
+  DEFAULT_MAX_WS_PAYLOAD_BYTES,
+  DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
   encodeWsFrame,
   encodeWsCloseFrame,
   Rfc6455Connection,
+  WsConnection: Rfc6455Connection,
   connectReverseWebSocket,
 };

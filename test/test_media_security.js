@@ -888,6 +888,496 @@ async function runMediaSecurityTests() {
     }
   });
 
+  await check("Suite 8: get_image / get_record / get_file enforce LFI & SSRF blocks without leaking paths to downloadRichMedia, and resolve standard OneBot tokens via lookupMedia", async () => {
+    const { NtqqOneBotBridge, loadBridgeConfig } = require("../src/bridge_main.js");
+    const restoreEnv = saveEnvVars([
+      "ROSMONTIS_TEMP_DIR",
+      "ONEBOT_TEMP_DIR",
+      "XIAO_BRIDGE_TEMP_DIR",
+      "ROSMONTIS_ALLOW_ARBITRARY_LOCAL_FILES",
+      "ONEBOT_ALLOW_ARBITRARY_LOCAL_FILES",
+      "XIAO_BRIDGE_ALLOW_ARBITRARY_LOCAL_FILES",
+      "ROSMONTIS_ALLOW_PRIVATE_URLS",
+      "ROSMONTIS_ALLOWED_FILE_DIRS",
+      "ONEBOT_ALLOWED_FILE_DIRS",
+      "XIAO_BRIDGE_ALLOWED_FILE_DIRS",
+    ]);
+    const suiteTmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rosmontis_s8_bridge_"));
+
+    const buf1 = ONE_BY_ONE_PNG_BUF;
+    const md5_1 = crypto.createHash("md5").update(buf1).digest("hex");
+    const kernelSourcePath1 = path.join(suiteTmpDir, "kernel_pic_1.png");
+
+    const buf2 = Buffer.concat([ONE_BY_ONE_PNG_BUF, Buffer.from("ntqq-uri-pic-2")]);
+    const md5_2 = crypto.createHash("md5").update(buf2).digest("hex");
+    const kernelDestPath2 = path.join(suiteTmpDir, "kernel_pic_2.png");
+
+    const downloadRichMediaCalls = [];
+    const downloadElementCalls = [];
+    let bridge = null;
+
+    try {
+      process.env.ROSMONTIS_TEMP_DIR = suiteTmpDir;
+      delete process.env.ONEBOT_TEMP_DIR;
+      delete process.env.XIAO_BRIDGE_TEMP_DIR;
+      delete process.env.ROSMONTIS_ALLOW_ARBITRARY_LOCAL_FILES;
+      delete process.env.ONEBOT_ALLOW_ARBITRARY_LOCAL_FILES;
+      delete process.env.XIAO_BRIDGE_ALLOW_ARBITRARY_LOCAL_FILES;
+      delete process.env.ROSMONTIS_ALLOW_PRIVATE_URLS;
+      delete process.env.ROSMONTIS_ALLOWED_FILE_DIRS;
+      delete process.env.ONEBOT_ALLOWED_FILE_DIRS;
+      delete process.env.XIAO_BRIDGE_ALLOWED_FILE_DIRS;
+
+      bridge = new NtqqOneBotBridge({
+        config: {
+          ...loadBridgeConfig(suiteTmpDir),
+          tempDir: suiteTmpDir,
+          allowPrivateMediaUrls: false,
+          allowPrivateUrls: false,
+          allowArbitraryLocalFiles: false,
+          cleanupTempImmediately: true,
+        },
+        rendererExecute: async (cmd, args) => {
+          const payload = Array.isArray(args) ? args[0] : args;
+          if (cmd === "nodeIKernelMsgService/downloadRichMedia") {
+            const getReq = payload?.getReq || {};
+            downloadRichMediaCalls.push(getReq);
+            if (getReq.msgId === "740001") {
+              await fs.promises.writeFile(kernelSourcePath1, buf1);
+              return { filePath: kernelSourcePath1 };
+            }
+            if (getReq.msgId === "740002") {
+              await fs.promises.writeFile(kernelDestPath2, buf2);
+              return { filePath: kernelDestPath2 };
+            }
+          }
+          return {};
+        },
+      });
+
+      const origDownloadElement = bridge._downloadRichMediaElement.bind(bridge);
+      bridge._downloadRichMediaElement = async (opts) => {
+        downloadElementCalls.push(opts);
+        return origDownloadElement(opts);
+      };
+
+      // 1. LFI blocking across get_image, get_record, and get_file
+      const pkgJsonFileUrl = pathToFileURL(path.resolve(__dirname, "..", "package.json")).href;
+      const lfiPayloads = [
+        "package.json",
+        "./README.md",
+        path.resolve(__filename),
+        "/etc/passwd",
+        pkgJsonFileUrl,
+      ];
+      for (const action of ["get_image", "get_record", "get_file"]) {
+        for (const badFile of lfiPayloads) {
+          await assert.rejects(
+            () => bridge._dispatchAction(action, { file: badFile }),
+            (err) => err && err.code === "ERR_LFI_BLOCKED",
+            `Expected ${action} to reject LFI payload ${badFile} with ERR_LFI_BLOCKED`
+          );
+          const res = await bridge.handleOneBotAction(action, { file: badFile });
+          assert.strictEqual(res.status, "failed");
+          assert.notStrictEqual(res.retcode, 0);
+          assert.match(res.message, /Blocked/i);
+        }
+      }
+      assert.strictEqual(
+        downloadRichMediaCalls.length,
+        0,
+        "downloadRichMedia must NEVER be called with caller-supplied LFI paths"
+      );
+      assert.strictEqual(downloadElementCalls.length, 0);
+
+      // 2. SSRF blocking on get_image with loopback URL (default allowPrivateMediaUrls: false)
+      const ssrfUrl = "http://127.0.0.1:65500/secret.png";
+      await assert.rejects(
+        () => bridge._dispatchAction("get_image", { file: ssrfUrl }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+      const ssrfRes = await bridge.handleOneBotAction("get_image", { file: ssrfUrl });
+      assert.strictEqual(ssrfRes.status, "failed");
+      assert.notStrictEqual(ssrfRes.retcode, 0);
+      assert.match(ssrfRes.message, /Blocked|private|reserved|SSRF/i);
+      assert.strictEqual(downloadRichMediaCalls.length, 0);
+
+      // 3. Legitimate standard OneBot token lookup (<md5>.jpg and ntqq://pic?...) without msg_id
+      bridge.messageIdStore.register(
+        "740001",
+        { chatType: 2, peerUid: "880001", guildId: "" },
+        "101",
+        {
+          rawMsg: {
+            msgId: "740001",
+            chatType: 2,
+            peerUid: "880001",
+            elements: [
+              {
+                elementId: "el_pic_1",
+                elementType: 2,
+                picElement: {
+                  md5HexStr: md5_1,
+                  fileUuid: "uuid_pic_1",
+                  fileName: `${md5_1}.png`,
+                  sourcePath: kernelSourcePath1,
+                  originImageUrl: "",
+                  fileSize: buf1.length,
+                },
+              },
+            ],
+          },
+        }
+      );
+      bridge.messageIdStore.register(
+        "740002",
+        { chatType: 1, peerUid: "u_friend_2", guildId: "" },
+        "102",
+        {
+          rawMsg: {
+            msgId: "740002",
+            chatType: 1,
+            peerUid: "u_friend_2",
+            elements: [
+              {
+                elementId: "el_pic_2",
+                elementType: 2,
+                picElement: {
+                  md5HexStr: md5_2,
+                  fileUuid: "uuid_pic_2",
+                  fileName: `${md5_2}.png`,
+                  sourcePath: "",
+                  originImageUrl: "",
+                  fileSize: buf2.length,
+                },
+              },
+            ],
+          },
+        }
+      );
+
+      const callerToken1 = `${md5_1}.jpg`;
+      const callerToken2 = `ntqq://pic?md5=${md5_2}&uuid=uuid_pic_2`;
+      assert.ok(bridge.messageIdStore.lookupMedia(callerToken1));
+      assert.ok(bridge.messageIdStore.lookupMedia(callerToken2));
+      assert.strictEqual(fs.existsSync(kernelSourcePath1), false);
+      assert.strictEqual(fs.existsSync(kernelDestPath2), false);
+
+      const okRes1 = await bridge.handleOneBotAction("get_image", {
+        file: callerToken1,
+        base64: true,
+      });
+      assert.strictEqual(okRes1.retcode, 0);
+      assert.strictEqual(downloadElementCalls.length, 1);
+      assert.strictEqual(downloadElementCalls[0].filePath, kernelSourcePath1);
+      assert.notStrictEqual(downloadElementCalls[0].filePath, callerToken1);
+      assert.strictEqual(downloadRichMediaCalls.length, 1);
+      assert.strictEqual(downloadRichMediaCalls[0].filePath, kernelSourcePath1);
+      assert.strictEqual(okRes1.data.file, kernelSourcePath1);
+      assert.strictEqual(okRes1.data.url, pathToFileURL(kernelSourcePath1).href);
+      assert.ok(okRes1.data.url.startsWith("file:///"));
+      assert.strictEqual(okRes1.data.file_size, String(buf1.length));
+      assert.strictEqual(okRes1.data.base64, buf1.toString("base64"));
+
+      const okRes2 = await bridge.handleOneBotAction("get_image", {
+        file: callerToken2,
+        base64: true,
+      });
+      assert.strictEqual(okRes2.retcode, 0);
+      assert.strictEqual(downloadElementCalls.length, 2);
+      assert.strictEqual(downloadElementCalls[1].filePath, "");
+      assert.notStrictEqual(downloadElementCalls[1].filePath, callerToken2);
+      assert.strictEqual(downloadRichMediaCalls.length, 2);
+      assert.strictEqual(downloadRichMediaCalls[1].filePath, "");
+      assert.strictEqual(okRes2.data.file, kernelDestPath2);
+      assert.strictEqual(okRes2.data.url, pathToFileURL(kernelDestPath2).href);
+      assert.ok(okRes2.data.url.startsWith("file:///"));
+      assert.strictEqual(okRes2.data.file_size, String(buf2.length));
+      assert.strictEqual(okRes2.data.base64, buf2.toString("base64"));
+
+      const okResNoB64 = await bridge.handleOneBotAction("get_image", { file: callerToken1 });
+      assert.strictEqual(okResNoB64.retcode, 0);
+      assert.strictEqual(okResNoB64.data.base64, undefined);
+    } finally {
+      if (bridge && typeof bridge.stopServers === "function") {
+        await bridge.stopServers();
+      }
+      restoreEnv();
+      await fs.promises.rm(suiteTmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await check("Suite 9: web_http.js & qzone_actions.js enforce SSRF defense, redirect allowPrivateUrls/protocol downgrade protection, linear cookie redirects, and JSONP/gate helpers", async () => {
+    const https = require("https");
+    const { EventEmitter } = require("events");
+    const webHttp = require("../src/core/web_http.js");
+    const qzoneActions = require("../src/core/qzone_actions.js");
+
+    const restoreEnv = saveEnvVars([
+      "ROSMONTIS_ALLOW_PRIVATE_URLS",
+      "ROSMONTIS_ENABLE_WEB_CREDENTIAL_API",
+      "ONEBOT_ENABLE_WEB_CREDENTIAL_API",
+      "XIAO_BRIDGE_ENABLE_WEB_CREDENTIAL_API",
+    ]);
+    const servers = [];
+    const listenLocal = async (handler) => {
+      const s = http.createServer(handler);
+      servers.push(s);
+      await new Promise((resolve) => s.listen(0, "127.0.0.1", resolve));
+      return s.address().port;
+    };
+
+    try {
+      delete process.env.ROSMONTIS_ALLOW_PRIVATE_URLS;
+      delete process.env.ROSMONTIS_ENABLE_WEB_CREDENTIAL_API;
+      delete process.env.ONEBOT_ENABLE_WEB_CREDENTIAL_API;
+      delete process.env.XIAO_BRIDGE_ENABLE_WEB_CREDENTIAL_API;
+
+      // 1. Literal private / loopback / cloud metadata IPs blocked with ERR_SSRF_BLOCKED
+      const blockedLiteralUrls = [
+        "http://127.0.0.1:12345/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]:12345/",
+      ];
+      for (const u of blockedLiteralUrls) {
+        await assert.rejects(
+          () => webHttp.httpRequestText(u),
+          (err) => err && err.code === "ERR_SSRF_BLOCKED"
+        );
+        await assert.rejects(
+          () => webHttp.httpGetJson(u),
+          (err) => err && err.code === "ERR_SSRF_BLOCKED"
+        );
+        await assert.rejects(
+          () => webHttp.httpsGetCookies(u),
+          (err) => err && err.code === "ERR_SSRF_BLOCKED"
+        );
+      }
+
+      // 2. DNS rebinding protection via custom dnsLookup returning 127.0.0.1 for qzone.qq.com
+      let rebindLookups = 0;
+      const rebindDnsLookup = (_hostname, opts, cb) => {
+        rebindLookups += 1;
+        const done = typeof opts === "function" ? opts : cb;
+        process.nextTick(() => done(null, "127.0.0.1", 4));
+      };
+      await assert.rejects(
+        () =>
+          webHttp.httpRequestText("https://qzone.qq.com/cgi-bin/rebind", "GET", "", {}, 4, {
+            dnsLookup: rebindDnsLookup,
+          }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+      await assert.rejects(
+        () => webHttp.httpGetJson("https://qzone.qq.com/cgi-bin/rebind", { dnsLookup: rebindDnsLookup }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+      await assert.rejects(
+        () => webHttp.httpsGetCookies("https://qzone.qq.com/cgi-bin/rebind", { dnsLookup: rebindDnsLookup }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+      assert.strictEqual(rebindLookups, 3);
+
+      // 3. Cross-host redirect drops allowPrivateUrls (127.0.0.1 -> localhost blocked with ERR_SSRF_BLOCKED)
+      let srvBHits = 0;
+      const portB = await listenLocal((_req, res) => {
+        srvBHits += 1;
+        res.writeHead(200);
+        res.end("secret");
+      });
+      const portA = await listenLocal((_req, res) => {
+        res.writeHead(302, { Location: `http://localhost:${portB}/secret` });
+        res.end();
+      });
+      const localLookup = (_host, opts, cb) => {
+        const done = typeof opts === "function" ? opts : cb;
+        process.nextTick(() => done(null, "127.0.0.1", 4));
+      };
+      await assert.rejects(
+        () =>
+          webHttp.httpRequestText(`http://127.0.0.1:${portA}/start`, "GET", "", {}, 4, {
+            allowPrivateUrls: true,
+            allowAnyRedirectHost: true,
+            dnsLookup: localLookup,
+          }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+      await assert.rejects(
+        () =>
+          webHttp.httpsGetCookies(`http://127.0.0.1:${portA}/start`, {
+            allowPrivateUrls: true,
+            allowAnyRedirectHost: true,
+            dnsLookup: localLookup,
+          }),
+        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+      );
+      assert.strictEqual(srvBHits, 0, "Cross-host redirect target must never be reached");
+
+      // 4a. Untrusted cross-origin redirect strips Cookie and Authorization headers
+      let hop1Headers = null;
+      let hop2Headers = null;
+      const portOrigin2 = await listenLocal((req, res) => {
+        hop2Headers = req.headers;
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok-origin-2");
+      });
+      const portOrigin1 = await listenLocal((req, res) => {
+        hop1Headers = req.headers;
+        res.writeHead(302, { Location: `http://127.0.0.1:${portOrigin2}/landed` });
+        res.end();
+      });
+      const crossOriginBody = await webHttp.httpRequestText(
+        `http://127.0.0.1:${portOrigin1}/start`,
+        "GET",
+        "",
+        {
+          Cookie: "skey=@secret; p_skey=topsecret",
+          Authorization: "Bearer secret-token",
+          "X-Trace-Id": "preserve-123",
+        },
+        4,
+        { allowPrivateUrls: true }
+      );
+      assert.strictEqual(crossOriginBody, "ok-origin-2");
+      assert.strictEqual(hop1Headers.cookie, "skey=@secret; p_skey=topsecret");
+      assert.strictEqual(hop1Headers.authorization, "Bearer secret-token");
+      assert.strictEqual(hop2Headers.cookie, undefined);
+      assert.strictEqual(hop2Headers.authorization, undefined);
+      assert.strictEqual(hop2Headers["x-trace-id"], "preserve-123");
+
+      // 4b. https: -> http: protocol downgrade rejected in httpsGetCookies & strips credentials in httpRequestText
+      const origHttpsRequest = https.request;
+      try {
+        https.request = (_reqOpts, onResponse) => {
+          const fakeReq = new EventEmitter();
+          fakeReq.write = () => {};
+          fakeReq.destroy = () => {};
+          fakeReq.end = () => {
+            process.nextTick(() => {
+              const fakeRes = new EventEmitter();
+              fakeRes.statusCode = 302;
+              fakeRes.headers = {
+                location: `http://127.0.0.1:${portOrigin2}/downgraded`,
+                "set-cookie": ["skey=@https_secret; Path=/"],
+              };
+              fakeRes.resume = () => {};
+              fakeRes.destroy = () => {};
+              onResponse(fakeRes);
+              fakeRes.emit("end");
+              fakeRes.emit("close");
+            });
+          };
+          return fakeReq;
+        };
+
+        await assert.rejects(
+          () =>
+            webHttp.httpsGetCookies(`https://127.0.0.1:${portOrigin2}/secure`, {
+              allowPrivateUrls: true,
+            }),
+          (err) => err && err.code === "ERR_INSECURE_REDIRECT_DOWNGRADE"
+        );
+
+        hop2Headers = null;
+        const downgradedBody = await webHttp.httpRequestText(
+          `https://127.0.0.1:${portOrigin2}/secure`,
+          "GET",
+          "",
+          {
+            Cookie: "skey=@https_only",
+            Authorization: "Bearer https-secret",
+            "X-Keep-Header": "yes",
+          },
+          4,
+          { allowPrivateUrls: true }
+        );
+        assert.strictEqual(downgradedBody, "ok-origin-2");
+        assert.strictEqual(hop2Headers.cookie, undefined);
+        assert.strictEqual(hop2Headers.authorization, undefined);
+        assert.strictEqual(hop2Headers["x-keep-header"], "yes");
+      } finally {
+        https.request = origHttpsRequest;
+      }
+
+      // 4c. httpsGetCookies 2^N redirect bug fix: 3 chained 302 hops => exact request count === 4 (not 15)
+      let cookieChainHits = 0;
+      const cookieChainPort = await listenLocal((req, res) => {
+        cookieChainHits += 1;
+        if (req.url === "/hop0") {
+          res.writeHead(302, { Location: "/hop1", "Set-Cookie": ["c0=v0; Path=/"] });
+          res.end();
+          return;
+        }
+        if (req.url === "/hop1") {
+          res.writeHead(302, { Location: "/hop2", "Set-Cookie": ["c1=v1; Path=/"] });
+          res.end();
+          return;
+        }
+        if (req.url === "/hop2") {
+          res.writeHead(302, { Location: "/final", "Set-Cookie": ["c2=v2; Path=/"] });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "Set-Cookie": ["c3=v3; Path=/"] });
+        res.end("done");
+      });
+      const mergedCookies = await webHttp.httpsGetCookies(
+        `http://127.0.0.1:${cookieChainPort}/hop0`,
+        { allowPrivateUrls: true }
+      );
+      assert.strictEqual(
+        cookieChainHits,
+        4,
+        `Expected linear 4 requests across 3 chained redirects, got ${cookieChainHits}`
+      );
+      assert.deepStrictEqual(mergedCookies, { c0: "v0", c1: "v1", c2: "v2", c3: "v3" });
+
+      // 5. parseJsonpOrJson formats & unified qzone_actions credential gate re-exports
+      assert.deepStrictEqual(webHttp.parseJsonpOrJson('{"ret":0,"msg":"ok"}'), {
+        ret: 0,
+        msg: "ok",
+      });
+      assert.deepStrictEqual(webHttp.parseJsonpOrJson('callback({"ret":0,"items":[1,2]});'), {
+        ret: 0,
+        items: [1, 2],
+      });
+      assert.deepStrictEqual(
+        webHttp.parseJsonpOrJson('_Callback({"code":0,"subcode":0,"data":{"feeds":[]}})'),
+        { code: 0, subcode: 0, data: { feeds: [] } }
+      );
+      assert.deepStrictEqual(webHttp.parseJsonpOrJson('({"ret":0})'), { ret: 0 });
+
+      assert.strictEqual(qzoneActions.isWebCredentialApiEnabled, webHttp.isWebCredentialApiEnabled);
+      assert.strictEqual(
+        qzoneActions.assertWebCredentialApiEnabled,
+        webHttp.assertWebCredentialApiEnabled
+      );
+      assert.strictEqual(qzoneActions.isWebCredentialApiEnabled({}), false);
+      assert.throws(
+        () => qzoneActions.assertWebCredentialApiEnabled({}, "get_cookies"),
+        (err) => err && err.code === "ERR_WEB_CREDENTIAL_API_DISABLED"
+      );
+      assert.strictEqual(
+        qzoneActions.isWebCredentialApiEnabled({ enableWebCredentialApi: true }),
+        true
+      );
+    } finally {
+      restoreEnv();
+      await Promise.all(
+        servers.map(
+          (s) =>
+            new Promise((resolve) => {
+              try {
+                s.close(() => resolve());
+              } catch (_) {
+                resolve();
+              }
+            })
+        )
+      );
+    }
+  });
+
   console.log(`\nALL ${passed} MEDIA SECURITY TEST SUITES PASSED SUCCESSFULLY!`);
 }
 

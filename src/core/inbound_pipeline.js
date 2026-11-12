@@ -1,17 +1,336 @@
 "use strict";
 
 const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
 
+const bridgeOnebot = require("../bridge_onebot");
 const {
   formatNtMsgToOneBotEvent,
   formatGroupUploadNotice,
   formatNoticeEvent,
   formatRequestEvent,
-} = require("../bridge_onebot");
+} = bridgeOnebot;
+
+function _isPositiveUin(v) {
+  return (
+    v != null &&
+    v !== "" &&
+    typeof v !== "boolean" &&
+    !Array.isArray(v) &&
+    Number.isFinite(Number(v)) &&
+    Number(v) > 0
+  );
+}
+
+function _pickPositiveUin(...candidates) {
+  if (typeof bridgeOnebot.pickPositiveUin === "function") {
+    const picked = bridgeOnebot.pickPositiveUin(...candidates);
+    return _isPositiveUin(picked) ? String(picked) : "";
+  }
+  for (const c of candidates) {
+    if (_isPositiveUin(c)) {
+      return String(Math.trunc(Number(c)));
+    }
+  }
+  return "";
+}
+
+function _stripTransientMedia(ntMsg) {
+  if (typeof bridgeOnebot.stripTransientNtMedia === "function") {
+    try {
+      bridgeOnebot.stripTransientNtMedia(ntMsg);
+    } catch (_) {}
+  }
+  if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
+  for (const el of ntMsg.elements) {
+    if (!el || typeof el !== "object") continue;
+    if (el.picElement && "__base64Uri" in el.picElement) {
+      delete el.picElement.__base64Uri;
+    }
+    if (el.pttElement && "__base64Uri" in el.pttElement) {
+      delete el.pttElement.__base64Uri;
+    }
+  }
+}
+
+function _isRecallMsg(ntMsg) {
+  if (!ntMsg || typeof ntMsg !== "object") return false;
+  if (ntMsg.recallTime && String(ntMsg.recallTime) !== "0" && Number(ntMsg.recallTime) > 0) {
+    return true;
+  }
+  if (
+    Number(ntMsg.msgType) === 5 &&
+    Array.isArray(ntMsg.elements) &&
+    ntMsg.elements.some((e) => Boolean(e?.grayTipElement?.revokeElement))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function _statPositiveFile(filePath) {
+  if (!filePath) return null;
+  try {
+    const st = await fs.promises.stat(String(filePath));
+    if (st.isFile() && st.size > 0) {
+      return st;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function _collectTemplParamUids(templParam, out) {
+  if (!templParam) return;
+  const checkPair = (k, v) => {
+    const keyStr = String(k || "");
+    if ((keyStr === "uid_str1" || keyStr === "uid_str2") && v != null && v !== "") {
+      out.push(String(v));
+    }
+  };
+  if (templParam instanceof Map) {
+    for (const [k, v] of templParam.entries()) {
+      checkPair(k, v);
+    }
+  } else if (Array.isArray(templParam)) {
+    for (const entry of templParam) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        checkPair(entry[0], entry[1]);
+      } else if (entry && typeof entry === "object") {
+        checkPair(entry.key ?? entry.k ?? entry.name, entry.value ?? entry.v ?? entry.val);
+      }
+    }
+  } else if (typeof templParam === "object") {
+    for (const [k, v] of Object.entries(templParam)) {
+      checkPair(k, v);
+    }
+  }
+}
 
 const inboundPipelineMixin = {
+  _isPositiveUin(v) {
+    return _isPositiveUin(v);
+  },
+
+  _isNtReady() {
+    if (this.dispatcher !== undefined) {
+      return Boolean(this.dispatcher?.ready);
+    }
+    if (typeof this.rendererExecute === "function") return true;
+    if (
+      typeof this._canInvokeRenderer === "function" &&
+      this._canInvokeRenderer(this.activeWebContents)
+    ) {
+      return true;
+    }
+    if (this.capturedServices) {
+      const cs = this.capturedServices;
+      if (
+        cs.ntApi ||
+        cs.wrapperSession ||
+        cs.ntStore?.wrapperSession ||
+        cs.ntStore?.session ||
+        cs.ntSessionManager?.ntStore?.wrapperSession ||
+        cs.ntSessionManager?.ntStore?.session
+      ) {
+        return true;
+      }
+    }
+    if (typeof this.ntCall === "function") return true;
+    if (
+      typeof this.invokeNt === "function" &&
+      (!this.capturedServices || Object.prototype.hasOwnProperty.call(this, "invokeNt"))
+    ) {
+      return true;
+    }
+    return false;
+  },
+
+  _dispatchInboundEvent(ev) {
+    if (!ev) return;
+    if (typeof this.broadcastOneBotEvent === "function") {
+      this.broadcastOneBotEvent(ev);
+    } else if (typeof this._dispatchEvent === "function") {
+      this._dispatchEvent(ev);
+    }
+  },
+
+  async _ensureUinForUid(uid) {
+    const uidStr = uid != null ? String(uid).trim() : "";
+    if (!uidStr || uidStr === "0" || uidStr === "all") return "";
+    if (/^\d+$/.test(uidStr) && _isPositiveUin(uidStr)) return uidStr;
+    if (!this.uinUidStore) return "";
+
+    const cached = this.uinUidStore.getUinSync?.(uidStr) || "";
+    if (_isPositiveUin(cached)) return String(cached);
+
+    if (typeof this.uinUidStore.resolveUin === "function") {
+      const invoker =
+        typeof this.invokeNt === "function"
+          ? this.invokeNt.bind(this)
+          : typeof this.ntCall === "function"
+          ? (cmd, payload) => {
+              const [service, method] = String(cmd).split("/");
+              return this.ntCall(service, method, [payload]);
+            }
+          : undefined;
+      try {
+        const resolved = await this.uinUidStore.resolveUin(uidStr, invoker);
+        if (_isPositiveUin(resolved)) {
+          return String(resolved);
+        }
+      } catch (_) {}
+    }
+    return "";
+  },
+
+  async _resolveNtMsgUids(ntMsg) {
+    if (!ntMsg || typeof ntMsg !== "object") return;
+    this.uinUidStore?.rememberFromNtMsg?.(ntMsg);
+
+    const pendingByUid = new Map();
+    let mutated = false;
+
+    const queueUid = (rawUid, onResolved) => {
+      const uidStr = rawUid != null ? String(rawUid).trim() : "";
+      if (!uidStr || uidStr === "0" || uidStr === "all") return;
+      if (/^\d+$/.test(uidStr) && _isPositiveUin(uidStr)) {
+        if (onResolved) {
+          onResolved(uidStr);
+          mutated = true;
+        }
+        return;
+      }
+      const cached = this.uinUidStore?.getUinSync?.(uidStr) || "";
+      if (_isPositiveUin(cached)) {
+        if (onResolved) {
+          onResolved(String(cached));
+          mutated = true;
+        }
+        return;
+      }
+      if (!pendingByUid.has(uidStr)) {
+        pendingByUid.set(uidStr, []);
+      }
+      if (onResolved) {
+        pendingByUid.get(uidStr).push(onResolved);
+      }
+    };
+
+    if (!_isPositiveUin(ntMsg.senderUin) && ntMsg.senderUid) {
+      queueUid(ntMsg.senderUid, (uin) => {
+        ntMsg.senderUin = String(uin);
+      });
+    }
+
+    if (Number(ntMsg.chatType) === 1 && !_isPositiveUin(ntMsg.peerUin) && ntMsg.peerUid) {
+      queueUid(ntMsg.peerUid, (uin) => {
+        ntMsg.peerUin = String(uin);
+      });
+    }
+
+    if (Array.isArray(ntMsg.elements)) {
+      for (const el of ntMsg.elements) {
+        if (!el || typeof el !== "object") continue;
+
+        if (el.textElement) {
+          const te = el.textElement;
+          if (Number(te.atType) === 2 && te.atNtUid && !_isPositiveUin(te.atUid)) {
+            queueUid(te.atNtUid, (uin) => {
+              te.atUid = String(uin);
+            });
+          }
+        }
+
+        if (Number(el.elementType) === 8 || el.grayTipElement) {
+          const gt = el.grayTipElement;
+          if (!gt || typeof gt !== "object") continue;
+
+          if (gt.revokeElement && typeof gt.revokeElement === "object") {
+            const rev = gt.revokeElement;
+            if (rev.operatorUid && !_isPositiveUin(rev.operatorUin)) {
+              queueUid(rev.operatorUid, (uin) => {
+                rev.operatorUin = String(uin);
+              });
+            }
+            if (rev.origMsgSenderUid && !_isPositiveUin(rev.origMsgSenderUin)) {
+              queueUid(rev.origMsgSenderUid, (uin) => {
+                rev.origMsgSenderUid = String(uin);
+              });
+            }
+          }
+
+          if (gt.groupElement && typeof gt.groupElement === "object") {
+            const ge = gt.groupElement;
+            if (ge.memberUid && !_isPositiveUin(ge.memberUin)) {
+              queueUid(ge.memberUid, (uin) => {
+                ge.memberUin = String(uin);
+              });
+            }
+            if (ge.adminUid && !_isPositiveUin(ge.adminUin)) {
+              queueUid(ge.adminUid, (uin) => {
+                ge.adminUin = String(uin);
+              });
+            }
+            if (ge.shutUp?.member?.uid && !_isPositiveUin(ge.shutUp.member.uin)) {
+              queueUid(ge.shutUp.member.uid, (uin) => {
+                ge.shutUp.member.uin = String(uin);
+              });
+            }
+            if (ge.shutUp?.admin?.uid && !_isPositiveUin(ge.shutUp.admin.uin)) {
+              queueUid(ge.shutUp.admin.uid, (uin) => {
+                ge.shutUp.admin.uin = String(uin);
+              });
+            }
+          }
+
+          if (gt.buddyElement && typeof gt.buddyElement === "object") {
+            const be = gt.buddyElement;
+            const buddyUid = be.peerUid || ntMsg.peerUid;
+            if (buddyUid && !_isPositiveUin(be.peerUin)) {
+              queueUid(buddyUid, (uin) => {
+                be.peerUin = String(uin);
+              });
+            }
+          }
+
+          const templUids = [];
+          _collectTemplParamUids(gt.xmlElement?.templParam, templUids);
+          _collectTemplParamUids(gt.jsonGrayTipElement?.templParam, templUids);
+          _collectTemplParamUids(gt.jsonGrayTipElement?.xmlToJsonParam?.templParam, templUids);
+          const rawTipBody = `${gt.xmlElement?.content || ""}\n${gt.jsonGrayTipElement?.jsonStr || ""}`;
+          if (rawTipBody.includes("u_")) {
+            for (const m of rawTipBody.matchAll(/(?:uid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi)) {
+              if (m[1]) templUids.push(m[1]);
+            }
+          }
+          for (const uidVal of templUids) {
+            queueUid(uidVal, null);
+          }
+        }
+      }
+    }
+
+    if (pendingByUid.size > 0) {
+      await Promise.all(
+        Array.from(pendingByUid.entries()).map(async ([uidStr, callbacks]) => {
+          const resolvedUin = await this._ensureUinForUid(uidStr);
+          if (_isPositiveUin(resolvedUin)) {
+            const uinStr = String(resolvedUin);
+            for (const cb of callbacks) {
+              cb(uinStr);
+            }
+            if (callbacks.length > 0) {
+              mutated = true;
+            }
+          }
+        })
+      );
+    }
+
+    if (mutated) {
+      this.uinUidStore?.rememberFromNtMsg?.(ntMsg);
+    }
+  },
+
   async _handleKernelEvent(_listenerName, eventName, args) {
     const firstArg = args && args.length > 0 ? args[0] : undefined;
 
@@ -37,20 +356,27 @@ const inboundPipelineMixin = {
         }
         this._matchSendEcho(ntMsg);
         this.uinUidStore.rememberFromNtMsg(ntMsg);
-        const ev = formatNtMsgToOneBotEvent(ntMsg, {
-          selfId: this.selfUin,
-          uinUidStore: this.uinUidStore,
-          messageIdStore: this.messageIdStore,
-          reportSelfMessage: false,
-        });
-        if (ev && ev.post_type === "message_sent") {
-          this.broadcastOneBotEvent(ev);
+        try {
+          const ev = formatNtMsgToOneBotEvent(ntMsg, {
+            selfId: this.selfUin,
+            uinUidStore: this.uinUidStore,
+            messageIdStore: this.messageIdStore,
+            reportSelfMessage: false,
+          });
+          if (ev && ev.message_id !== undefined) {
+            this.messageIdStore?.indexMsgMedia?.(ntMsg, ev.message_id);
+          }
+          if (ev && ev.post_type === "message_sent") {
+            this._dispatchInboundEvent(ev);
+          }
+        } finally {
+          _stripTransientMedia(ntMsg);
         }
       }
       return;
     }
 
-    // 3. Message updates (recalls, PTT transcription completion, emoji likes)
+    // 3. Message updates (recalls, PTT transcription completion, emoji likes, async media updates)
     if (eventName === "onMsgInfoListUpdate") {
       const msgList = Array.isArray(firstArg)
         ? firstArg
@@ -70,18 +396,66 @@ const inboundPipelineMixin = {
           }
         }
 
-        // Check message recall
-        if (ntMsg.recallTime && String(ntMsg.recallTime) !== "0" && Number(ntMsg.recallTime) > 0) {
-          const dedupKey = `recall:${ntMsg.msgId}:${ntMsg.recallTime}`;
+        if (_isRecallMsg(ntMsg)) {
+          const recallTag =
+            ntMsg.recallTime && String(ntMsg.recallTime) !== "0"
+              ? String(ntMsg.recallTime)
+              : "revoke";
+          const dedupKey = `recall:${ntMsg.msgId}:${recallTag}`;
           if (!this._isDuplicateEvent(dedupKey)) {
-            const ev = formatNtMsgToOneBotEvent(ntMsg, {
-              selfId: this.selfUin,
-              uinUidStore: this.uinUidStore,
-              messageIdStore: this.messageIdStore,
-            });
-            if (ev && ev.post_type === "notice") {
-              this.broadcastOneBotEvent(ev);
+            await this._resolveNtMsgUids(ntMsg);
+            try {
+              const ev = formatNtMsgToOneBotEvent(ntMsg, {
+                selfId: this.selfUin,
+                uinUidStore: this.uinUidStore,
+                messageIdStore: this.messageIdStore,
+              });
+              if (ev && ev.post_type === "notice") {
+                this._dispatchInboundEvent(ev);
+              }
+            } finally {
+              _stripTransientMedia(ntMsg);
             }
+          }
+        } else {
+          await this._resolveNtMsgUids(ntMsg);
+          try {
+            const hit =
+              this.messageIdStore?.resolveByNtKey?.(ntMsg.chatType, ntMsg.peerUid, ntMsg.msgId) ||
+              (ntMsg.msgId ? this.messageIdStore?.getByMsgId?.(ntMsg.msgId) : null) ||
+              (ntMsg.peerUid && ntMsg.msgSeq
+                ? this.messageIdStore?.getByPeerAndSeq?.(
+                    ntMsg.chatType,
+                    ntMsg.peerUid,
+                    ntMsg.msgSeq
+                  )
+                : null);
+            if (hit) {
+              if (hit.rawMsg !== null && hit.rawMsg !== undefined) {
+                hit.rawMsg = ntMsg;
+              } else {
+                this.messageIdStore?.register?.(
+                  ntMsg.msgId,
+                  {
+                    chatType: Number(ntMsg.chatType || 1),
+                    peerUid: String(ntMsg.peerUid || ""),
+                    guildId: String(ntMsg.guildId || ""),
+                  },
+                  ntMsg.msgSeq,
+                  {
+                    ...(ntMsg.senderUin ? { senderUin: String(ntMsg.senderUin) } : {}),
+                    ...(ntMsg.senderUid ? { senderUid: String(ntMsg.senderUid) } : {}),
+                    rawMsg: ntMsg,
+                  }
+                );
+              }
+              const oneBotId = hit.oneBotId ?? hit.shortId;
+              this.messageIdStore?.indexMsgMedia?.(ntMsg, oneBotId);
+            } else {
+              this.messageIdStore?.indexMsgMedia?.(ntMsg);
+            }
+          } finally {
+            _stripTransientMedia(ntMsg);
           }
         }
       }
@@ -106,13 +480,34 @@ const inboundPipelineMixin = {
         const flag = seq ? `${seq}:${notifyType}:${groupId}` : "";
         if (flag) this._setBoundedMap(this._groupNotifiesCache, flag, item);
 
+        if (item.user1?.uid && _isPositiveUin(item.user1?.uin)) {
+          this.uinUidStore?.remember?.(item.user1.uin, item.user1.uid, {
+            nickname: item.user1.nickName || "",
+          });
+        }
+        if (item.user2?.uid && _isPositiveUin(item.user2?.uin)) {
+          this.uinUidStore?.remember?.(item.user2.uin, item.user2.uid, {
+            nickname: item.user2.nickName || "",
+          });
+        }
+
         // status === 1 means pending approval
         if (status === 1 && (notifyType === 1 || notifyType === 2 || notifyType === 7)) {
           const dedupKey = `group_req:${flag}`;
           if (this._isDuplicateEvent(dedupKey)) continue;
           const userUid = item.user1?.uid || "";
-          const userUin =
-            Number(item.user1?.uin || (await this.uinUidStore.resolveUin(userUid, this.invokeNt.bind(this))) || 0);
+          const resolvedUser1Uin =
+            _pickPositiveUin(item.user1?.uin) || (await this._ensureUinForUid(userUid));
+          if (_isPositiveUin(resolvedUser1Uin) && item.user1) {
+            item.user1.uin = String(resolvedUser1Uin);
+          }
+          if (item.user2?.uid && !_isPositiveUin(item.user2?.uin)) {
+            const resolvedUser2Uin = await this._ensureUinForUid(item.user2.uid);
+            if (_isPositiveUin(resolvedUser2Uin)) {
+              item.user2.uin = String(resolvedUser2Uin);
+            }
+          }
+          const userUin = _isPositiveUin(resolvedUser1Uin) ? Number(resolvedUser1Uin) : 0;
           const ev = formatRequestEvent(
             "group",
             {
@@ -124,7 +519,7 @@ const inboundPipelineMixin = {
             },
             { selfId: this.selfUin }
           );
-          this.broadcastOneBotEvent(ev);
+          this._dispatchInboundEvent(ev);
         }
       }
       return;
@@ -140,15 +535,25 @@ const inboundPipelineMixin = {
       for (const req of reqs) {
         if (!req || typeof req !== "object") continue;
         if (req.isDecide || Number(req.reqType) !== 1) continue;
-        const friendUid = String(req.friendUid || req.friendUin || "");
+        const rawFriendUid = String(req.friendUid || "");
+        const positiveReqUin = _pickPositiveUin(req.friendUin);
+        const friendUid = rawFriendUid || positiveReqUin;
         const reqExtra = String(req.reqTime || req.flag || req.postscript || req.extWords || "0");
         const flag = `${friendUid}:${reqExtra}`;
         this._setBoundedMap(this._buddyReqsCache, flag, req);
         const dedupKey = `friend_req:${friendUid}:${req.reqTime || req.flag || req.postscript || req.extWords || ""}`;
         if (this._isDuplicateEvent(dedupKey)) continue;
-        const userUin = Number(
-          req.friendUin || (await this.uinUidStore.resolveUin(friendUid, this.invokeNt.bind(this))) || 0
-        );
+        const resolvedUin =
+          positiveReqUin || (await this._ensureUinForUid(rawFriendUid || friendUid));
+        if (_isPositiveUin(resolvedUin)) {
+          req.friendUin = String(resolvedUin);
+          if (rawFriendUid) {
+            this.uinUidStore?.remember?.(resolvedUin, rawFriendUid, {
+              nickname: req.friendNick || "",
+            });
+          }
+        }
+        const userUin = _isPositiveUin(resolvedUin) ? Number(resolvedUin) : 0;
         const ev = formatRequestEvent(
           "friend",
           {
@@ -158,7 +563,7 @@ const inboundPipelineMixin = {
           },
           { selfId: this.selfUin }
         );
-        this.broadcastOneBotEvent(ev);
+        this._dispatchInboundEvent(ev);
       }
       return;
     }
@@ -196,7 +601,8 @@ const inboundPipelineMixin = {
       for (const [uidKey, info] of entries) {
         if (!info || typeof info !== "object") continue;
         const core = info.coreInfo || info.baseInfo || info;
-        this.uinUidStore.remember(core.uin || info.uin, core.uid || info.uid || uidKey, {
+        const uin = _pickPositiveUin(core.uin, info.uin);
+        this.uinUidStore.remember(uin, core.uid || info.uid || uidKey, {
           nickname: core.nick || info.nick || "",
           remark: core.remark || info.remark || "",
         });
@@ -210,16 +616,40 @@ const inboundPipelineMixin = {
       const elId = String(info.msgElementId || info.elementId || "");
       const filePath = String(info.filePath || "");
       const keys = [`${msgId}:${elId}`, `${msgId}:0`, filePath].filter(Boolean);
+      const toInvoke = new Set();
       for (const k of keys) {
-        const set = this._richMediaWaiters.get(k);
-        if (set) {
-          this._richMediaWaiters.delete(k);
-          for (const resolve of set) {
-            try {
-              resolve(filePath);
-            } catch (_) {}
+        const set = this._richMediaWaiters?.get(k);
+        if (!set) continue;
+        for (const waiter of Array.from(set)) {
+          if (typeof waiter === "function") {
+            set.delete(waiter);
+            toInvoke.add(waiter);
+          } else if (waiter && typeof waiter.resolve === "function") {
+            const specificElMismatch =
+              elId &&
+              elId !== "0" &&
+              waiter.elementId &&
+              waiter.elementId !== "0" &&
+              waiter.elementId !== elId &&
+              (!filePath || !waiter.targetPath || filePath !== waiter.targetPath);
+            if (!specificElMismatch) {
+              set.delete(waiter);
+              toInvoke.add(waiter);
+            }
           }
         }
+        if (set.size === 0) {
+          this._richMediaWaiters.delete(k);
+        }
+      }
+      for (const waiter of toInvoke) {
+        try {
+          if (typeof waiter === "function") {
+            waiter(filePath);
+          } else {
+            waiter.resolve(filePath);
+          }
+        } catch (_) {}
       }
       return;
     }
@@ -298,7 +728,7 @@ const inboundPipelineMixin = {
     if (eventName === "onKickedOffLine") {
       this.online = false;
       this._resetHumanSessionState({ resetRenderer: true });
-      this.broadcastOneBotEvent(
+      this._dispatchInboundEvent(
         formatNoticeEvent(
           "bot_offline",
           {
@@ -312,176 +742,314 @@ const inboundPipelineMixin = {
     }
   },
 
-  async _hydrateNtMsgMedia(ntMsg) {
-    if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
-    const maxBytes = 10 * 1024 * 1024;
-    for (const el of ntMsg.elements) {
-      if (!el || Number(el.elementType) !== 2 || !el.picElement) continue;
-      const pe = el.picElement;
-      if (pe.__base64Uri) continue;
-      const origin = String(pe.originImageUrl || "").trim();
-      if (origin && origin.includes("rkey=")) continue;
-      if (origin && /^https?:\/\//i.test(origin) && !origin.includes("multimedia.nt.qq.com.cn/download")) {
-        continue;
-      }
-      if (Number(pe.fileSize || 0) > maxBytes) continue;
-
-      let localPath = String(pe.sourcePath || "").trim();
-      const hasValidFile = (p) => {
-        try {
-          if (!p || !fs.existsSync(p)) return false;
-          const st = fs.statSync(p);
-          return st.isFile() && st.size > 0 && st.size <= maxBytes;
-        } catch (_) {
-          return false;
-        }
-      };
-
-      if (!localPath && pe.md5HexStr) {
-        try {
-          const pathInfo = {
-            md5HexStr: String(pe.md5HexStr),
-            fileName: String(pe.fileName || `${pe.md5HexStr}.jpg`),
-            elementType: 2,
-            elementSubType: Number(pe.picSubType || 0),
-            thumbSize: 0,
-            needCreate: true,
-            downloadType: 1,
-            file_uuid: String(pe.fileUuid || ""),
-          };
-          const pathRes = await this.invokeNt(
-            "nodeIKernelMsgService/getRichMediaFilePathForGuild",
-            { path_info: pathInfo },
-            [pathInfo]
-          );
-          const resolvedPath = typeof pathRes === "string" ? pathRes : pathRes?.path || "";
-          if (resolvedPath) localPath = String(resolvedPath);
-        } catch (_) {}
-      }
-
-      const runDownloadAttempt = async (downloadType, thumbSize, targetPath, timeoutMs) => {
-        const waitKeys = [
-          `${ntMsg.msgId}:${el.elementId || "0"}`,
-          `${ntMsg.msgId}:0`,
-          targetPath || "",
-        ].filter(Boolean);
-        let timer = null;
-        let pollTimer = null;
-        let onDone = null;
-        const cleanupWaiter = () => {
-          if (timer) clearTimeout(timer);
-          if (pollTimer) clearInterval(pollTimer);
-          if (onDone) {
-            for (const k of waitKeys) {
-              const set = this._richMediaWaiters.get(k);
-              if (set) {
-                set.delete(onDone);
-                if (set.size === 0) this._richMediaWaiters.delete(k);
-              }
-            }
-          }
-        };
-        const waitDownload = new Promise((resolve) => {
-          let settled = false;
-          const finish = (candidate) => {
-            if (settled) return;
-            settled = true;
-            cleanupWaiter();
-            resolve(candidate || targetPath);
-          };
-          onDone = (downloadedPath) => finish(downloadedPath || targetPath);
-          for (const k of waitKeys) {
-            if (!this._richMediaWaiters.has(k)) {
-              this._richMediaWaiters.set(k, new Set());
-            }
-            this._richMediaWaiters.get(k).add(onDone);
-          }
-          if (targetPath) {
-            pollTimer = setInterval(() => {
-              if (hasValidFile(targetPath)) {
-                finish(targetPath);
-              }
-            }, 200);
-            if (typeof pollTimer.unref === "function") pollTimer.unref();
-          }
-          timer = setTimeout(() => finish(targetPath), timeoutMs);
-          if (typeof timer.unref === "function") timer.unref();
-        });
-
-        try {
-          const getReq = {
-            downSourceType: 0,
-            downloadSourceType: 0,
-            fileModelId: "0",
-            triggerType: 1,
-            msgId: String(ntMsg.msgId),
-            chatType: Number(ntMsg.chatType || 1),
-            peerUid: String(ntMsg.peerUid),
-            elementId: String(el.elementId || "0"),
-            thumbSize,
-            downloadType,
-            filePath: targetPath,
-          };
-          const dlRes = await this.invokeNt(
-            "nodeIKernelMsgService/downloadRichMedia",
-            { getReq },
-            [getReq]
-          );
-          if (dlRes?.filePath && hasValidFile(dlRes.filePath)) {
-            return String(dlRes.filePath);
-          }
-          const waitedPath = await waitDownload;
-          if (waitedPath && hasValidFile(waitedPath)) {
-            return String(waitedPath);
-          }
-        } catch (_) {
-        } finally {
-          cleanupWaiter();
-        }
-        return "";
-      };
-
-      if (!hasValidFile(localPath) && ntMsg.msgId && ntMsg.peerUid) {
-        const downloadedOrig = await runDownloadAttempt(1, 0, localPath, 8000);
-        if (downloadedOrig) {
-          localPath = downloadedOrig;
-        }
-      }
-
-      if (!hasValidFile(localPath)) {
-        const thumbs =
-          pe.thumbPath instanceof Map
-            ? Array.from(pe.thumbPath.values())
-            : pe.thumbPath && typeof pe.thumbPath === "object"
-            ? Object.values(pe.thumbPath)
-            : [];
-        for (const tp of thumbs) {
-          if (hasValidFile(String(tp || ""))) {
-            localPath = String(tp);
-            break;
-          }
-        }
-        if (!hasValidFile(localPath) && ntMsg.msgId && ntMsg.peerUid) {
-          const fallbackThumbPath = thumbs.length > 0 ? String(thumbs[0] || "") : "";
-          const downloadedThumb = await runDownloadAttempt(2, 720, fallbackThumbPath, 5000);
-          if (downloadedThumb) {
-            localPath = downloadedThumb;
-          }
-        }
-      }
-
-      if (hasValidFile(localPath)) {
-        try {
-          const b64 = fs.readFileSync(localPath).toString("base64");
-          Object.defineProperty(pe, "__base64Uri", {
-            value: `base64://${b64}`,
-            enumerable: false,
-            configurable: true,
-            writable: true,
-          });
-        } catch (_) {}
+  async _downloadRichMediaElement({
+    msgId,
+    chatType,
+    peerUid,
+    elementId,
+    downloadType = 1,
+    thumbSize = 0,
+    filePath = "",
+    timeoutMs = 8000,
+  } = {}) {
+    const targetPath = filePath ? String(filePath).trim() : "";
+    if (targetPath) {
+      const existingStat = await _statPositiveFile(targetPath);
+      if (existingStat) {
+        return targetPath;
       }
     }
+    if (!this._isNtReady()) return "";
+    if (!msgId || !peerUid) return "";
+
+    const msgIdStr = String(msgId);
+    const elIdStr = String(elementId || "0");
+    const effectiveTimeout = Math.max(100, Number(timeoutMs) || 8000);
+    if (!this._richMediaWaiters) {
+      this._richMediaWaiters = new Map();
+    }
+    const waitKeys = [`${msgIdStr}:${elIdStr}`, `${msgIdStr}:0`, targetPath].filter(Boolean);
+
+    let timer = null;
+    let pollTimer = null;
+    let waiterEntry = null;
+    const cleanupWaiter = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (waiterEntry && this._richMediaWaiters) {
+        for (const k of waitKeys) {
+          const set = this._richMediaWaiters.get(k);
+          if (set) {
+            set.delete(waiterEntry);
+            if (set.size === 0) {
+              this._richMediaWaiters.delete(k);
+            }
+          }
+        }
+      }
+    };
+
+    const waitDownload = new Promise((resolve) => {
+      let settled = false;
+      let polling = false;
+      const finish = (candidate) => {
+        if (settled) return;
+        settled = true;
+        cleanupWaiter();
+        resolve(candidate || targetPath);
+      };
+      waiterEntry = {
+        msgId: msgIdStr,
+        elementId: elIdStr,
+        targetPath,
+        resolve: (downloadedPath) => finish(downloadedPath || targetPath),
+      };
+      for (const k of waitKeys) {
+        if (!this._richMediaWaiters.has(k)) {
+          this._richMediaWaiters.set(k, new Set());
+        }
+        this._richMediaWaiters.get(k).add(waiterEntry);
+      }
+      if (targetPath) {
+        pollTimer = setInterval(async () => {
+          if (polling || settled) return;
+          polling = true;
+          try {
+            const st = await _statPositiveFile(targetPath);
+            if (st) {
+              finish(targetPath);
+            }
+          } finally {
+            polling = false;
+          }
+        }, 200);
+        pollTimer.unref?.();
+      }
+      timer = setTimeout(() => finish(targetPath), effectiveTimeout);
+      timer.unref?.();
+    });
+
+    try {
+      const getReq = {
+        downSourceType: 0,
+        downloadSourceType: 0,
+        fileModelId: "0",
+        triggerType: 1,
+        msgId: msgIdStr,
+        chatType: Number(chatType || 1),
+        peerUid: String(peerUid),
+        elementId: elIdStr,
+        thumbSize: Number(thumbSize || 0),
+        downloadType: Number(downloadType ?? 1),
+        filePath: targetPath,
+      };
+      const dlRes =
+        typeof this.invokeNt === "function"
+          ? await this.invokeNt(
+              "nodeIKernelMsgService/downloadRichMedia",
+              { getReq },
+              [getReq]
+            )
+          : typeof this.ntCall === "function"
+          ? await this.ntCall("nodeIKernelMsgService", "downloadRichMedia", [{ getReq }])
+          : null;
+      const directPath =
+        typeof dlRes === "string" ? dlRes : dlRes?.filePath ? String(dlRes.filePath) : "";
+      if (directPath && (await _statPositiveFile(directPath))) {
+        return directPath;
+      }
+      const waitedPath = await waitDownload;
+      if (waitedPath && (await _statPositiveFile(waitedPath))) {
+        return String(waitedPath);
+      }
+    } catch (_) {
+    } finally {
+      cleanupWaiter();
+    }
+    return "";
+  },
+
+  async _hydrateNtMsgMedia(ntMsg) {
+    if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
+    const maxPicBytes = 10 * 1024 * 1024;
+    const maxPttBytes = 2 * 1024 * 1024;
+    const hydrationTimeout = Math.max(
+      500,
+      Number(
+        this.config?.mediaHydrationTimeoutMs ??
+          this.config?.richMediaDownloadTimeoutMs ??
+          8000
+      ) || 8000
+    );
+
+    for (const el of ntMsg.elements) {
+      if (!el || typeof el !== "object") continue;
+      const elType = Number(el.elementType);
+
+      if (elType === 2 && el.picElement) {
+        const pe = el.picElement;
+        if (pe.__base64Uri) continue;
+        const origin = String(pe.originImageUrl || "").trim();
+        if (origin && origin.includes("rkey=")) continue;
+        if (
+          origin &&
+          /^https?:\/\//i.test(origin) &&
+          !origin.includes("multimedia.nt.qq.com.cn/download")
+        ) {
+          continue;
+        }
+        if (Number(pe.fileSize || 0) > maxPicBytes) continue;
+
+        let localPath = String(pe.sourcePath || "").trim();
+        let st = await _statPositiveFile(localPath);
+
+        if (!st && !localPath && pe.md5HexStr && this._isNtReady()) {
+          try {
+            const pathInfo = {
+              md5HexStr: String(pe.md5HexStr),
+              fileName: String(pe.fileName || `${pe.md5HexStr}.jpg`),
+              elementType: 2,
+              elementSubType: Number(pe.picSubType || 0),
+              thumbSize: 0,
+              needCreate: true,
+              downloadType: 1,
+              file_uuid: String(pe.fileUuid || ""),
+            };
+            const pathRes = await this.invokeNt(
+              "nodeIKernelMsgService/getRichMediaFilePathForGuild",
+              { path_info: pathInfo },
+              [pathInfo]
+            );
+            const resolvedPath = typeof pathRes === "string" ? pathRes : pathRes?.path || "";
+            if (resolvedPath) {
+              localPath = String(resolvedPath);
+              st = await _statPositiveFile(localPath);
+            }
+          } catch (_) {}
+        }
+
+        if (!st && ntMsg.msgId && ntMsg.peerUid) {
+          const downloadedOrig = await this._downloadRichMediaElement({
+            msgId: ntMsg.msgId,
+            chatType: ntMsg.chatType || 1,
+            peerUid: ntMsg.peerUid,
+            elementId: el.elementId || "0",
+            downloadType: 1,
+            thumbSize: 0,
+            filePath: localPath,
+            timeoutMs: Math.min(hydrationTimeout, 8000),
+          });
+          if (downloadedOrig) {
+            const dlStat = await _statPositiveFile(downloadedOrig);
+            if (dlStat && dlStat.size <= maxPicBytes) {
+              localPath = downloadedOrig;
+              st = dlStat;
+            }
+          }
+        }
+
+        if (!st) {
+          const thumbs =
+            pe.thumbPath instanceof Map
+              ? Array.from(pe.thumbPath.values())
+              : pe.thumbPath && typeof pe.thumbPath === "object"
+              ? Object.values(pe.thumbPath)
+              : [];
+          for (const tp of thumbs) {
+            const candidate = String(tp || "").trim();
+            const tpStat = await _statPositiveFile(candidate);
+            if (tpStat && tpStat.size <= maxPicBytes) {
+              localPath = candidate;
+              st = tpStat;
+              break;
+            }
+          }
+          if (!st && ntMsg.msgId && ntMsg.peerUid) {
+            const fallbackThumbPath = thumbs.length > 0 ? String(thumbs[0] || "") : "";
+            const downloadedThumb = await this._downloadRichMediaElement({
+              msgId: ntMsg.msgId,
+              chatType: ntMsg.chatType || 1,
+              peerUid: ntMsg.peerUid,
+              elementId: el.elementId || "0",
+              downloadType: 2,
+              thumbSize: 720,
+              filePath: fallbackThumbPath,
+              timeoutMs: Math.min(hydrationTimeout, 5000),
+            });
+            if (downloadedThumb) {
+              const dlThumbStat = await _statPositiveFile(downloadedThumb);
+              if (dlThumbStat && dlThumbStat.size <= maxPicBytes) {
+                localPath = downloadedThumb;
+                st = dlThumbStat;
+              }
+            }
+          }
+        }
+
+        if (st && st.size > 0 && localPath) {
+          pe.sourcePath = localPath;
+          if (st.size <= maxPicBytes) {
+            try {
+              const buf = await fs.promises.readFile(localPath);
+              Object.defineProperty(pe, "__base64Uri", {
+                value: `base64://${buf.toString("base64")}`,
+                enumerable: false,
+                configurable: true,
+                writable: true,
+              });
+            } catch (_) {}
+          }
+        }
+        continue;
+      }
+
+      if (elType === 4 && el.pttElement) {
+        const ptt = el.pttElement;
+        if (ptt.__base64Uri) continue;
+        let localPath = String(ptt.filePath || ptt.sourcePath || "").trim();
+        let st = await _statPositiveFile(localPath);
+
+        if (!st && this._isNtReady() && ntMsg.msgId && ntMsg.peerUid && el.elementId) {
+          const downloadedPtt = await this._downloadRichMediaElement({
+            msgId: ntMsg.msgId,
+            chatType: ntMsg.chatType || 1,
+            peerUid: ntMsg.peerUid,
+            elementId: el.elementId,
+            downloadType: 1,
+            thumbSize: 0,
+            filePath: localPath,
+            timeoutMs: Math.min(hydrationTimeout, 8000),
+          });
+          if (downloadedPtt) {
+            localPath = downloadedPtt;
+            st = await _statPositiveFile(localPath);
+          }
+        }
+
+        if (st && st.size > 0 && localPath) {
+          ptt.filePath = localPath;
+          if (st.size <= maxPttBytes) {
+            try {
+              const buf = await fs.promises.readFile(localPath);
+              Object.defineProperty(ptt, "__base64Uri", {
+                value: `base64://${buf.toString("base64")}`,
+                enumerable: false,
+                configurable: true,
+                writable: true,
+              });
+            } catch (_) {}
+          }
+        }
+      }
+    }
+
+    this.messageIdStore?.indexMsgMedia?.(ntMsg);
   },
 
   async _processIncomingNtMessage(ntMsg) {
@@ -491,52 +1059,31 @@ const inboundPipelineMixin = {
       return;
     }
 
-    this.uinUidStore.rememberFromNtMsg(ntMsg);
-    if ((!ntMsg.senderUin || String(ntMsg.senderUin) === "0") && ntMsg.senderUid) {
-      const resolvedUin = await this.uinUidStore.resolveUin(
-        ntMsg.senderUid,
-        this.invokeNt.bind(this)
-      );
-      if (resolvedUin) {
-        ntMsg.senderUin = resolvedUin;
-      }
-    }
-
-    // Also resolve any @ mentioned UIDs that don't have UIN cached yet
-    if (Array.isArray(ntMsg.elements)) {
-      for (const el of ntMsg.elements) {
-        if (
-          el?.elementType === 1 &&
-          el.textElement?.atType === 2 &&
-          el.textElement.atNtUid &&
-          (!el.textElement.atUid || !/^\d+$/.test(String(el.textElement.atUid)))
-        ) {
-          const uin = await this.uinUidStore.resolveUin(
-            el.textElement.atNtUid,
-            this.invokeNt.bind(this)
-          );
-          if (uin) el.textElement.atUid = uin;
-        }
-      }
-    }
-
+    await this._resolveNtMsgUids(ntMsg);
     await this._hydrateNtMsgMedia(ntMsg);
 
-    const ev = formatNtMsgToOneBotEvent(ntMsg, {
-      selfId: this.selfUin,
-      uinUidStore: this.uinUidStore,
-      messageIdStore: this.messageIdStore,
-    });
-    if (ev) {
-      this.broadcastOneBotEvent(ev);
-    }
+    try {
+      const ev = formatNtMsgToOneBotEvent(ntMsg, {
+        selfId: this.selfUin,
+        uinUidStore: this.uinUidStore,
+        messageIdStore: this.messageIdStore,
+      });
+      if (ev && ev.message_id !== undefined) {
+        this.messageIdStore?.indexMsgMedia?.(ntMsg, ev.message_id);
+      }
+      if (ev) {
+        this._dispatchInboundEvent(ev);
+      }
 
-    const uploadNotice = formatGroupUploadNotice(ntMsg, {
-      selfId: this.selfUin,
-      uinUidStore: this.uinUidStore,
-    });
-    if (uploadNotice) {
-      this.broadcastOneBotEvent(uploadNotice);
+      const uploadNotice = formatGroupUploadNotice(ntMsg, {
+        selfId: this.selfUin,
+        uinUidStore: this.uinUidStore,
+      });
+      if (uploadNotice) {
+        this._dispatchInboundEvent(uploadNotice);
+      }
+    } finally {
+      _stripTransientMedia(ntMsg);
     }
 
     const autoReadAndType =
@@ -577,4 +1124,5 @@ const inboundPipelineMixin = {
 
 module.exports = {
   inboundPipelineMixin,
+  _isPositiveUin,
 };

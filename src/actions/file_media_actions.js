@@ -1,8 +1,155 @@
 "use strict";
 
+const fs = require("fs");
 const path = require("path");
+const { pathToFileURL } = require("url");
 
-const { resolveMediaSource } = require("../bridge_onebot");
+const { resolveMediaSource } = require("../core/media_security");
+
+function resolveStoreEntry(store, id) {
+  if (!store || id === undefined || id === null || id === "") return null;
+  if (typeof store.resolveByOneBotId === "function") {
+    const hit = store.resolveByOneBotId(id);
+    if (hit) return hit;
+  }
+  if (typeof store.getByShortId === "function") {
+    const hit = store.getByShortId(id);
+    if (hit) return hit;
+  }
+  if (typeof store.getByMsgId === "function") {
+    const hit = store.getByMsgId(id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function statNonEmptyFile(candidatePath) {
+  if (!candidatePath || typeof candidatePath !== "string") return null;
+  try {
+    const st = await fs.promises.stat(candidatePath);
+    if (st.isFile() && st.size > 0) return st;
+  } catch (_) {}
+  return null;
+}
+
+function elementToMediaDesc(el, ntMsgId, chatType, peerUid) {
+  if (!el || typeof el !== "object") return null;
+  const elementId = String(el.elementId || "");
+  const t = Number(el.elementType || 0);
+  if (t === 2 && el.picElement) {
+    const pe = el.picElement;
+    let sourcePath = String(pe.sourcePath || "");
+    if (!sourcePath && pe.thumbPath) {
+      const thumbs =
+        pe.thumbPath instanceof Map
+          ? Array.from(pe.thumbPath.values())
+          : typeof pe.thumbPath === "object"
+          ? Object.values(pe.thumbPath)
+          : [];
+      sourcePath = String(thumbs[0] || "");
+    }
+    return {
+      ntMsgId: String(ntMsgId || ""),
+      chatType: Number(chatType || 1),
+      peerUid: String(peerUid || ""),
+      elementId,
+      elementType: 2,
+      md5: String(pe.md5HexStr || "").toLowerCase(),
+      fileUuid: String(pe.fileUuid || ""),
+      fileName: String(pe.fileName || ""),
+      sourcePath,
+      url: String(pe.originImageUrl || ""),
+      fileSize: Number(pe.fileSize || 0),
+    };
+  }
+  if (t === 3 && el.fileElement) {
+    const fe = el.fileElement;
+    return {
+      ntMsgId: String(ntMsgId || ""),
+      chatType: Number(chatType || 1),
+      peerUid: String(peerUid || ""),
+      elementId,
+      elementType: 3,
+      md5: String(fe.fileMd5 || "").toLowerCase(),
+      fileUuid: String(fe.fileUuid || ""),
+      fileName: String(fe.fileName || ""),
+      sourcePath: String(fe.filePath || fe.sourcePath || ""),
+      url: "",
+      fileSize: Number(fe.fileSize || 0),
+    };
+  }
+  if (t === 4 && el.pttElement) {
+    const ptt = el.pttElement;
+    return {
+      ntMsgId: String(ntMsgId || ""),
+      chatType: Number(chatType || 1),
+      peerUid: String(peerUid || ""),
+      elementId,
+      elementType: 4,
+      md5: String(ptt.md5HexStr || "").toLowerCase(),
+      fileUuid: String(ptt.fileUuid || ""),
+      fileName: String(ptt.fileName || ""),
+      sourcePath: String(ptt.filePath || ptt.sourcePath || ""),
+      url: "",
+      fileSize: Number(ptt.fileSize || 0),
+    };
+  }
+  if (t === 5 && el.videoElement) {
+    const ve = el.videoElement;
+    return {
+      ntMsgId: String(ntMsgId || ""),
+      chatType: Number(chatType || 1),
+      peerUid: String(peerUid || ""),
+      elementId,
+      elementType: 5,
+      md5: String(ve.videoMd5 || "").toLowerCase(),
+      fileUuid: String(ve.fileUuid || ""),
+      fileName: String(ve.fileName || ""),
+      sourcePath: String(ve.filePath || ve.sourcePath || ""),
+      url: "",
+      fileSize: Number(ve.fileSize || 0),
+    };
+  }
+  return null;
+}
+
+function selectMediaDescFromRawMsg(rawMsg, entry, action, rawFile, rawFileId, elementIdHint) {
+  if (!rawMsg || !Array.isArray(rawMsg.elements)) return null;
+  const ntMsgId = String(rawMsg.msgId || entry?.msgId || entry?.ntMsgId || "");
+  const chatType = Number(rawMsg.chatType || entry?.peer?.chatType || entry?.chatType || 1);
+  const peerUid = String(rawMsg.peerUid || entry?.peer?.peerUid || entry?.peerUid || "");
+  const descs = rawMsg.elements
+    .map((el) => elementToMediaDesc(el, ntMsgId, chatType, peerUid))
+    .filter(Boolean);
+  if (descs.length === 0) return null;
+
+  if (elementIdHint && String(elementIdHint) !== "0") {
+    const byElId = descs.find((d) => d.elementId === String(elementIdHint));
+    if (byElId) return byElId;
+  }
+
+  const tokens = [rawFile, rawFileId]
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+  for (const tok of tokens) {
+    const cleanHex = tok.replace(/^\{|\}$/g, "").replace(/-/g, "").split(".")[0].toLowerCase();
+    const hit = descs.find(
+      (d) =>
+        (d.fileUuid && d.fileUuid === tok) ||
+        (d.fileName && d.fileName === tok) ||
+        (d.md5 && (d.md5 === tok.toLowerCase() || d.md5 === cleanHex))
+    );
+    if (hit) return hit;
+  }
+
+  if (action === "get_image") {
+    return descs.find((d) => d.elementType === 2) || descs[0];
+  }
+  if (action === "get_record") {
+    return descs.find((d) => d.elementType === 4) || descs[0];
+  }
+  return descs.find((d) => d.elementType === 3 || d.elementType === 5) || descs[0];
+}
 
 const {
   computeBkn,
@@ -215,6 +362,7 @@ async function dispatch(action, p, context = {}) {
 
     case "upload_group_file": {
       const groupId = Number(p.group_id || 0);
+      const folder = String(p.folder || p.folder_id || "/").trim();
       const peer = { chatType: 2, peerUid: String(groupId), guildId: "" };
       const sent = await this._sendMessageToPeer(peer, [
         {
@@ -222,11 +370,50 @@ async function dispatch(action, p, context = {}) {
           data: {
             file: p.file,
             name: p.name || undefined,
-            folder: p.folder || p.folder_id || "/",
+            folder: folder || "/",
           },
         },
       ]);
-      return { file_id: String(sent.real_id || sent.message_id) };
+      const entry = resolveStoreEntry(this.messageIdStore, sent.message_id);
+      let fileUuid = String(
+        entry?.rawMsg?.elements?.find((e) => e?.fileElement)?.fileElement?.fileUuid || ""
+      );
+      if (
+        !fileUuid &&
+        sent.real_id &&
+        !/^(sent_|fwd_|echo_timeout_)/.test(String(sent.real_id))
+      ) {
+        try {
+          const res = await this.invokeNt(
+            "nodeIKernelMsgService/getMsgsByMsgId",
+            { peer, msgIds: [String(sent.real_id)] },
+            [peer, [String(sent.real_id)]]
+          );
+          const fetched = res?.msgList?.[0];
+          fileUuid = String(
+            fetched?.elements?.find((e) => e?.fileElement)?.fileElement?.fileUuid || ""
+          );
+        } catch (_) {}
+      }
+      if (folder && folder !== "/" && fileUuid) {
+        try {
+          await this.invokeNt(
+            "nodeIKernelRichMediaService/moveGroupFile",
+            {
+              groupId: String(groupId),
+              busIdList: [Number(p.busid || 102)],
+              fileIdList: [String(fileUuid)],
+              curFolderId: "/",
+              dstFolderId: folder,
+            },
+            [String(groupId), [String(fileUuid)], "/", folder]
+          );
+        } catch (_) {}
+      }
+      return {
+        file_id: String(fileUuid || sent.real_id || sent.message_id),
+        message_id: sent.message_id,
+      };
     }
 
     case "upload_private_file": {
@@ -240,7 +427,31 @@ async function dispatch(action, p, context = {}) {
           },
         },
       ]);
-      return { file_id: String(sent.real_id || sent.message_id) };
+      const entry = resolveStoreEntry(this.messageIdStore, sent.message_id);
+      let fileUuid = String(
+        entry?.rawMsg?.elements?.find((e) => e?.fileElement)?.fileElement?.fileUuid || ""
+      );
+      if (
+        !fileUuid &&
+        sent.real_id &&
+        !/^(sent_|fwd_|echo_timeout_)/.test(String(sent.real_id))
+      ) {
+        try {
+          const res = await this.invokeNt(
+            "nodeIKernelMsgService/getMsgsByMsgId",
+            { peer, msgIds: [String(sent.real_id)] },
+            [peer, [String(sent.real_id)]]
+          );
+          const fetched = res?.msgList?.[0];
+          fileUuid = String(
+            fetched?.elements?.find((e) => e?.fileElement)?.fileElement?.fileUuid || ""
+          );
+        } catch (_) {}
+      }
+      return {
+        file_id: String(fileUuid || sent.real_id || sent.message_id),
+        message_id: sent.message_id,
+      };
     }
 
     case "create_group_file_folder": {
@@ -322,31 +533,297 @@ async function dispatch(action, p, context = {}) {
     case "get_image":
     case "get_record":
     case "get_file": {
-      const fileId = String(p.file || p.file_id || "");
-      const getReq = {
-        downSourceType: 0,
-        fileModelId: "0",
-        downloadSourceType: 0,
-        triggerType: 1,
-        msgId: String(p.msg_id || "0"),
-        chatType: Number(p.chat_type || 1),
-        peerUid: String(p.peer_uid || ""),
-        elementId: String(p.element_id || "0"),
-        thumbSize: 0,
-        downloadType: 1,
-        filePath: fileId,
-      };
-      const res = await this.invokeNt(
-        "nodeIKernelMsgService/downloadRichMedia",
-        { getReq },
-        [getReq]
-      );
-      const localPath = res?.filePath || fileId;
+      const rawFile = String(p.file || p.file_id || "").trim();
+      const rawFileId = String(p.file_id || "").trim();
+      const includeB64 = Boolean(p.base64) || Boolean(this.config?.enableLocalFile2Url);
+
+      // Step A: Resolve NTQQ kernel-owned media metadata via msg_id/message_id or lookupMedia
+      let mediaDesc = null;
+      if (p.msg_id || p.message_id) {
+        const entry = resolveStoreEntry(this.messageIdStore, p.msg_id || p.message_id);
+        if (entry) {
+          let rawMsg = entry.rawMsg || null;
+          const ntMsgId = String(entry.msgId || entry.ntMsgId || "");
+          const peer =
+            entry.peer ||
+            (entry.peerUid
+              ? {
+                  chatType: Number(entry.chatType || 1),
+                  peerUid: String(entry.peerUid),
+                  guildId: "",
+                }
+              : null);
+          if (
+            !rawMsg &&
+            ntMsgId &&
+            !/^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) &&
+            peer?.peerUid
+          ) {
+            try {
+              const res = await this.invokeNt(
+                "nodeIKernelMsgService/getMsgsByMsgId",
+                { peer, msgIds: [ntMsgId] },
+                [peer, [ntMsgId]]
+              );
+              rawMsg = res?.msgList?.[0] || null;
+            } catch (_) {
+              rawMsg = null;
+            }
+          }
+          mediaDesc = selectMediaDescFromRawMsg(
+            rawMsg,
+            entry,
+            action,
+            rawFile,
+            rawFileId,
+            p.element_id
+          );
+        }
+      }
+
+      if (!mediaDesc && typeof this.messageIdStore?.lookupMedia === "function") {
+        if (rawFile) {
+          mediaDesc = this.messageIdStore.lookupMedia(rawFile);
+        }
+        if (!mediaDesc && rawFileId && rawFileId !== rawFile) {
+          mediaDesc = this.messageIdStore.lookupMedia(rawFileId);
+        }
+      }
+
+      let kernelLocalPath = mediaDesc?.sourcePath ? String(mediaDesc.sourcePath) : "";
+      let kernelStat = await statNonEmptyFile(kernelLocalPath);
+      let kernelRemoteUrl = "";
+
+      if (mediaDesc && !kernelStat) {
+        const ntMsgId = String(mediaDesc.ntMsgId || "");
+        const chatType = Number(mediaDesc.chatType || 1);
+        const peerUid = String(mediaDesc.peerUid || "");
+        const elementId = String(mediaDesc.elementId || "");
+        const safeTargetPath = mediaDesc.sourcePath ? String(mediaDesc.sourcePath) : "";
+        if (ntMsgId && !/^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) && peerUid && elementId) {
+          if (typeof this._downloadRichMediaElement === "function") {
+            try {
+              const dlPath = await this._downloadRichMediaElement({
+                msgId: ntMsgId,
+                chatType,
+                peerUid,
+                elementId,
+                downloadType: 1,
+                thumbSize: 0,
+                filePath: safeTargetPath,
+                timeoutMs: 8000,
+              });
+              const candidate = String(dlPath || safeTargetPath || "");
+              const st = await statNonEmptyFile(candidate);
+              if (st) {
+                kernelLocalPath = candidate;
+                kernelStat = st;
+              }
+            } catch (_) {}
+          } else {
+            try {
+              const getReq = {
+                downSourceType: 0,
+                fileModelId: "0",
+                downloadSourceType: 0,
+                triggerType: 1,
+                msgId: ntMsgId,
+                chatType,
+                peerUid,
+                elementId,
+                thumbSize: 0,
+                downloadType: 1,
+                filePath: safeTargetPath,
+              };
+              const res = await this.invokeNt(
+                "nodeIKernelMsgService/downloadRichMedia",
+                { getReq },
+                [getReq]
+              );
+              const candidate = String(res?.filePath || safeTargetPath || "");
+              const st = await statNonEmptyFile(candidate);
+              if (st) {
+                kernelLocalPath = candidate;
+                kernelStat = st;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+
+      if (action === "get_file" && !kernelStat) {
+        const groupCode = String(
+          p.group_id || (Number(mediaDesc?.chatType) === 2 ? mediaDesc.peerUid : "") || ""
+        );
+        const knownUuid = String(
+          mediaDesc?.fileUuid ||
+            (p.group_id && rawFileId
+              ? rawFileId
+              : p.group_id &&
+                rawFile &&
+                !rawFile.includes("..") &&
+                !/^(?:file|base64|https?):\/\//i.test(rawFile) &&
+                !/^[a-zA-Z]:[\\/]/.test(rawFile) &&
+                !/^\/(?:etc|proc|sys|root|home|var|usr|opt|tmp)\b/i.test(rawFile)
+              ? rawFile
+              : "") ||
+            ""
+        ).trim();
+        if (knownUuid && (groupCode || mediaDesc?.peerUid)) {
+          const busId = Number(p.busid || 102);
+          const filePeer = groupCode
+            ? { chatType: 2, peerUid: groupCode, guildId: "" }
+            : {
+                chatType: Number(mediaDesc.chatType || 1),
+                peerUid: String(mediaDesc.peerUid),
+                guildId: "",
+              };
+          const attempts = [
+            ...(groupCode
+              ? [
+                  [
+                    "nodeIKernelRichMediaService/downloadFileForModelId",
+                    { peer: filePeer, modelIdList: [knownUuid], downSourceType: 0 },
+                    [filePeer, [knownUuid], ""],
+                  ],
+                ]
+              : []),
+            [
+              "nodeIKernelRichMediaService/downloadFileForFileUuid",
+              {
+                peer: filePeer,
+                fileUuid: knownUuid,
+                httpsUrl: "",
+                fileName: String(mediaDesc?.fileName || ""),
+                fileSize: String(mediaDesc?.fileSize || 0),
+                busId,
+              },
+              [filePeer, knownUuid, ""],
+            ],
+            ...(groupCode
+              ? [
+                  [
+                    "nodeIKernelRichMediaService/getGroupFileDownloadUrl",
+                    { groupId: groupCode, fileId: knownUuid, busId },
+                    [groupCode, knownUuid, busId],
+                  ],
+                ]
+              : []),
+          ];
+          for (const [cmd, payload, posArgs] of attempts) {
+            try {
+              const res = await this.invokeNt(cmd, payload, posArgs);
+              const candidatePath =
+                res && typeof res === "object" && res.filePath ? String(res.filePath) : "";
+              if (candidatePath) {
+                const st = await statNonEmptyFile(candidatePath);
+                if (st) {
+                  kernelLocalPath = candidatePath;
+                  kernelStat = st;
+                  break;
+                }
+              }
+              const candidateUrl =
+                typeof res === "string"
+                  ? res
+                  : String(res?.url || res?.downloadUrl || res?.httpsUrl || "");
+              if (/^https?:\/\//i.test(candidateUrl)) {
+                kernelRemoteUrl = candidateUrl;
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+
+      if (kernelStat) {
+        return {
+          file: kernelLocalPath,
+          url: pathToFileURL(kernelLocalPath).href,
+          file_size: String(kernelStat.size),
+          file_name: String(mediaDesc?.fileName || path.basename(kernelLocalPath)),
+          ...(includeB64
+            ? { base64: (await fs.promises.readFile(kernelLocalPath)).toString("base64") }
+            : {}),
+        };
+      }
+
+      if (kernelRemoteUrl || (mediaDesc?.url && /^https?:\/\//i.test(String(mediaDesc.url)))) {
+        const remoteUrl = String(kernelRemoteUrl || mediaDesc.url);
+        let urlName = "";
+        try {
+          urlName = path.basename(new URL(remoteUrl).pathname);
+        } catch (_) {}
+        const fileName = String(mediaDesc?.fileName || urlName || "file");
+        return {
+          file: fileName,
+          url: remoteUrl,
+          file_size: String(mediaDesc?.fileSize || 0),
+          file_name: fileName,
+        };
+      }
+
+      // Step B: Validate direct URI / local path via resolveMediaSource (never trust raw caller path)
+      const directFile = p.file !== undefined && p.file !== null ? String(p.file).trim() : "";
+      if (!directFile) {
+        throw new Error("Media file not found or not accessible");
+      }
+      const hasExplicitSchemeOrAbs =
+        /^(?:file|base64|https?):\/\//i.test(directFile) ||
+        /^data:[^;]+;base64,/i.test(directFile) ||
+        path.isAbsolute(directFile);
+      if (!hasExplicitSchemeOrAbs) {
+        const err = new Error(`Blocked relative or unverified local media path: ${directFile}`);
+        err.code = "ERR_LFI_BLOCKED";
+        throw err;
+      }
+
+      let resolved;
+      try {
+        resolved = await resolveMediaSource(directFile, this._mediaSecurityOptions());
+      } catch (err) {
+        if (
+          err &&
+          (err.code === "ERR_LFI_BLOCKED" ||
+            err.code === "ERR_SSRF_BLOCKED" ||
+            err.code === "ERR_MEDIA_TOO_LARGE")
+        ) {
+          throw err;
+        }
+        const notFound = new Error("Media file not found or not accessible");
+        if (err && err.code) notFound.code = err.code;
+        throw notFound;
+      }
+
+      if (resolved.isTempFile) {
+        if (typeof this.tempFileCleaner?.track === "function") {
+          this.tempFileCleaner.track(resolved.localPath);
+        } else if (
+          !this.config?.cleanupTempImmediately &&
+          typeof this._scheduleMediaCleanup === "function"
+        ) {
+          this._scheduleMediaCleanup(resolved);
+        }
+      }
+
+      let st;
+      try {
+        st = await fs.promises.stat(resolved.localPath);
+      } catch (_) {
+        throw new Error("Media file not found or not accessible");
+      }
+      if (!st.isFile()) {
+        throw new Error("Media file not found or not accessible");
+      }
+
       return {
-        file: localPath,
-        url: localPath.startsWith("http") ? localPath : `file://${localPath}`,
-        file_size: String(res?.fileSize || 0),
-        file_name: path.basename(localPath),
+        file: resolved.localPath,
+        url: pathToFileURL(resolved.localPath).href,
+        file_size: String(st.size),
+        file_name: String(resolved.fileName || path.basename(resolved.localPath)),
+        ...(includeB64
+          ? { base64: (await fs.promises.readFile(resolved.localPath)).toString("base64") }
+          : {}),
       };
     }
 
@@ -386,12 +863,33 @@ async function dispatch(action, p, context = {}) {
     case "fetch_ptt_text":
     case "get_ptt_text":
     case "get_record_text": {
-      const entry =
-        this.messageIdStore.getByShortId(p.message_id) ||
-        this.messageIdStore.getByMsgId(p.message_id);
+      const entry = resolveStoreEntry(this.messageIdStore, p.message_id);
       if (!entry) throw new Error("message not found");
-      const pttEl = Array.isArray(entry.rawMsg?.elements)
-        ? entry.rawMsg.elements.find((e) => e?.elementType === 4 && e.pttElement)
+      let rawMsg = entry.rawMsg || null;
+      const ntMsgId = String(entry.msgId || entry.ntMsgId || "");
+      const peer =
+        entry.peer ||
+        (entry.peerUid
+          ? {
+              chatType: Number(entry.chatType || 1),
+              peerUid: String(entry.peerUid),
+              guildId: "",
+            }
+          : null);
+      if (!rawMsg && ntMsgId && !/^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) && peer?.peerUid) {
+        try {
+          const msgRes = await this.invokeNt(
+            "nodeIKernelMsgService/getMsgsByMsgId",
+            { peer, msgIds: [ntMsgId] },
+            [peer, [ntMsgId]]
+          );
+          rawMsg = msgRes?.msgList?.[0] || null;
+        } catch (_) {
+          rawMsg = null;
+        }
+      }
+      const pttEl = Array.isArray(rawMsg?.elements)
+        ? rawMsg.elements.find((e) => e?.elementType === 4 && e.pttElement)
         : null;
       if (pttEl?.pttElement?.text) {
         return { text: String(pttEl.pttElement.text) };
@@ -399,27 +897,33 @@ async function dispatch(action, p, context = {}) {
       let pttTimer = null;
       const waitPromise = new Promise((resolve) => {
         pttTimer = setTimeout(() => {
-          this._pttTextWaiters.delete(String(entry.msgId));
+          this._pttTextWaiters.delete(ntMsgId);
           resolve("");
         }, 10000);
         if (typeof pttTimer.unref === "function") pttTimer.unref();
-        this._pttTextWaiters.set(String(entry.msgId), (txt) => {
+        this._pttTextWaiters.set(ntMsgId, (txt) => {
           if (pttTimer) clearTimeout(pttTimer);
           resolve(txt);
         });
       });
-      const res = await this.invokeNt("nodeIKernelMsgService/translatePtt2Text", {
-        msgId: String(entry.msgId),
-        peer: entry.peer,
-        msgElement: pttEl || { elementType: 4, elementId: "" },
-      });
-      if (res?.text) {
+      try {
+        const res = await this.invokeNt("nodeIKernelMsgService/translatePtt2Text", {
+          msgId: ntMsgId,
+          peer,
+          msgElement: pttEl || { elementType: 4, elementId: "" },
+        });
+        if (res?.text) {
+          if (pttTimer) clearTimeout(pttTimer);
+          this._pttTextWaiters.delete(ntMsgId);
+          return { text: String(res.text) };
+        }
+        const waitedText = await waitPromise;
+        return { text: String(waitedText || "") };
+      } catch (err) {
         if (pttTimer) clearTimeout(pttTimer);
-        this._pttTextWaiters.delete(String(entry.msgId));
-        return { text: String(res.text) };
+        this._pttTextWaiters.delete(ntMsgId);
+        throw err;
       }
-      const waitedText = await waitPromise;
-      return { text: String(waitedText || "") };
     }
 
     case "set_qq_profile": {
