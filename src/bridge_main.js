@@ -104,6 +104,9 @@ class NtqqOneBotBridge extends EventEmitter {
     this.selfUin = String(options.selfUin || this.config.selfUin || "");
     this.selfUid = String(options.selfUid || "");
     this.selfNickname = String(options.selfNickname || this.config.selfNickname || "QQBot");
+    this.startedAtMs = Number.isFinite(Number(options.startedAtMs))
+      ? Number(options.startedAtMs)
+      : Date.now();
     const isLiveElectron = Boolean(
       process.versions &&
         process.versions.electron &&

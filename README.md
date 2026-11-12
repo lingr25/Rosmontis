@@ -45,16 +45,16 @@
 ## 架构概览
 
 ```text
-  OneBot v11 Clients (NoneBot2 / Koishi / AstrBot / Custom Agent)
+  OneBot v11 Clients (NoneBot2 / Koishi / AstrBot / SnowLuma / Custom Agent)
           ▲                     ▲                     │
           │ HTTP (:3000)        │ Forward WS (:3001)  │ Reverse WS Client
           ▼                     ▼                     ▼
 +-------------------------------------------------------------------------+
-| Rosmontis Main Coordinator (src/bridge_main.js + src/bridge_onebot.js)  |
-|  - 65+ OneBot v11 Actions / Send Echo msgId Correlator / Media Hydrator |
+| Rosmontis Main Coordinator (src/bridge_main.js + src/core/* + actions/*)|
+|  - 75+ OneBot v11 Actions / Send Echo msgId Correlator / Media Hydrator |
 |  - Ephemeral DI Capture (restores native Map.prototype.set once ready)  |
 +-------------------------------------------------------------------------+
-          │ executeJavaScript                          ▲
+          │ Structured CMD/ACK IPC                     ▲
           ▼                                            │ Kernel Events
 +-------------------------------------------------------------------------+
 | Rosmontis Renderer Bridge (src/bridge_renderer.js in BrowserWindow)     |
@@ -136,27 +136,38 @@ Rosmontis 支持**零配置开箱即用**、**环境变量配置**与 **JSON 配
 | `ROSMONTIS_REVERSE_WS_URL` / `ONEBOT_REVERSE_WS_URL` | *(空)* | 反向 WebSocket 目标地址（如 `ws://127.0.0.1:8080/onebot/v11/ws`） |
 | `ROSMONTIS_ACCESS_TOKEN` / `ONEBOT_ACCESS_TOKEN` | *(非回环自动生成)* | Bearer 鉴权 Token（绑定非回环地址且留空时，Protected Mode 自动生成 256-bit 随机 Token 并输出至日志） |
 | `ROSMONTIS_HOST` / `ONEBOT_HOST` | `0.0.0.0` | HTTP / 正向 WS 绑定地址（宿主机单机部署推荐 `127.0.0.1`） |
+| `ROSMONTIS_COMPAT_PROFILE` / `ONEBOT_COMPAT_PROFILE` | `rosmontis` | 下游兼容画像（可选 `snowluma` / `napcat`，亦可在各网络端点单独配置 `compatProfile`） |
 | `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API` | `0` | 设为 `1` 时显式开启 `get_cookies` / `get_clientkey` / QZone 等高敏凭据接口（默认关闭） |
 | `ROSMONTIS_CONFIG_DIR` | `/app/data/config` | 配置文件搜索目录（详见 [`config/rosmontis.example.json`](./config/rosmontis.example.json)） |
 | `ROSMONTIS_DISABLE` | `0` | 设为 `1` 时一键跳过桥接器加载，原样启动官方 QQ |
 
+### 下游框架与插件兼容
+
+Rosmontis 默认原生兼容 **NoneBot2**、**Koishi**、**AstrBot** 等标准 OneBot v11 框架（内置 `.handle_quick_operation` / `.handle_quick_operation_async` 快速操作、单端点 `messageFormat: "array" | "string"` 切换、消息段顶层简写、动画表情 `resultId` 往返、直传 `node` 合并转发及群务扩展字段）。
+
+针对部分在握手或插件启动时硬编码校验 `get_version_info.app_name` 的特定生态 SDK（如 **SnowLuma** 插件生态或基于 **NapCat** 专属适配器的插件），可通过环境变量 `ROSMONTIS_COMPAT_PROFILE` 或在 `rosmontis.json` 的全局 / 单个网络端点上按需开启兼容画像（响应中仍保留 `bridge_name: "Rosmontis"` 供运维识别）：
+
+- `rosmontis`（默认）：返回标准身份 `app_name: "Rosmontis"`
+- `snowluma`：对齐 SnowLuma 插件生态身份与状态结构（`app_name: "SnowLuma"`）
+- `napcat`：对齐 NapCat 下游适配器版本标识（`app_name: "NapCat.Onebot"`）
+
 ---
 
-## 已实现的 OneBot v11 接口（65+ Actions）
+## 已实现的 OneBot v11 接口（75+ Actions）
 
 - **账号、登录与诊断**：`get_login_info`, `get_status`, `get_version_info`, `get_login_qrcode`, `quick_login`, `can_send_image`, `can_send_record`, `clean_cache`, `set_online_status`, `set_diy_online_status`, `set_qq_profile`, `set_self_longnick`
-- **消息收发与富媒体**：`send_private_msg`, `send_group_msg`, `send_msg`, `delete_msg`, `get_msg`, `get_group_msg_history`, `get_friend_msg_history`, `get_forward_msg`, `send_group_forward_msg`, `send_private_forward_msg`, `forward_friend_single_msg`, `forward_group_single_msg`（完整支持文本、表情、`@`、回复、图片 `base64://`/`file://`/`http(s)://`、语音、视频、文件、JSON 卡片与合并转发）
-- **拟人交互与表态**：`mark_msg_as_read`, `mark_private_msg_as_read`, `mark_group_msg_as_read`, `set_input_status`, `send_poke`, `group_poke`, `friend_poke`, `set_msg_emoji_like`, `fetch_custom_face`
-- **好友与群组信息**：`get_friend_list`, `get_stranger_info`, `send_like`, `delete_friend`, `get_group_list`, `get_group_info`, `get_group_member_info`, `get_group_member_list`, `get_group_honor_info`, `get_group_at_all_remain`, `get_group_shut_list`
-- **群务管理与申请处理**：`set_group_ban`, `set_group_whole_ban`, `set_group_kick`, `set_group_leave`, `set_group_name`, `set_group_card`, `set_group_special_title`, `set_group_admin`, `_send_group_notice`, `_get_group_notice`, `set_essence_msg`, `delete_essence_msg`, `get_essence_msg_list`, `get_group_system_msg`, `get_doubt_friends_add_request`, `set_group_add_request`, `set_friend_add_request`, `set_doubt_friends_add_request`
-- **群文件与私聊文件**：`get_group_root_files`, `get_group_files_by_folder`, `get_group_file_system_info`, `get_group_file_url`, `get_private_file_url`, `upload_group_file`, `upload_private_file`, `create_group_file_folder`, `delete_group_file`, `delete_group_folder`, `move_group_file`
-- **Web 凭据与空间扩展（默认关闭，需显式开启 `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API=1`）**：`get_cookies`, `get_csrf_token`, `get_credentials`, `get_clientkey`, `send_qzone_msg`, `delete_qzone_msg`, `like_qzone`, `comment_qzone`
+- **消息收发与富媒体**：`send_private_msg`, `send_group_msg`, `send_msg`, `delete_msg`, `get_msg`, `.handle_quick_operation`, `get_group_msg_history`, `get_friend_msg_history`, `get_forward_msg`, `send_group_forward_msg`, `send_private_forward_msg`, `forward_friend_single_msg`, `forward_group_single_msg`（完整支持文本、表情与动画 `resultId`、`@`、回复、图片 `base64://`/`file://`/`http(s)://`、语音、视频、文件、链接分享 `share`、JSON 卡片简写与合并转发）
+- **拟人交互与表态**：`mark_msg_as_read`, `mark_private_msg_as_read`, `mark_group_msg_as_read`, `set_input_status`, `send_poke`, `group_poke`, `friend_poke`, `set_msg_emoji_like`, `get_msg_emoji_likes`, `fetch_custom_face`
+- **好友与群组信息**：`get_friend_list`, `get_stranger_info`, `send_like`, `delete_friend`, `get_group_list`, `get_group_info`, `get_group_info_ex`, `get_group_share_link`, `get_group_member_info`, `get_group_member_list`, `get_group_honor_info`, `get_group_at_all_remain`, `get_group_shut_list`
+- **群务管理与申请处理**：`set_group_ban`, `set_group_whole_ban`, `set_group_kick`, `set_group_leave`, `set_group_name`, `set_group_remark`, `set_group_card`, `set_group_special_title`, `set_group_admin`, `_send_group_notice`, `_get_group_notice`, `set_essence_msg`, `delete_essence_msg`, `get_essence_msg_list`, `get_group_system_msg`, `get_doubt_friends_add_request`, `set_group_add_request`, `set_friend_add_request`, `set_doubt_friends_add_request`
+- **群文件与私聊文件**：`get_group_root_files`, `get_group_files_by_folder`, `get_group_file_system_info`, `get_group_file_url`, `get_private_file_url`, `upload_group_file`, `upload_private_file`, `create_group_file_folder`, `delete_group_file`, `delete_group_folder`, `move_group_file`, `rename_group_file`, `rename_group_file_folder`
+- **Web 凭据与空间扩展（默认关闭，需显式开启 `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API=1`）**：`get_cookies`, `get_csrf_token`, `get_credentials`, `get_clientkey`, `get_qzone_msg_list`, `get_qzone_feeds`, `send_qzone_msg`, `delete_qzone_msg`, `like_qzone`, `unlike_qzone`, `comment_qzone`
 
 ---
 
 ## 开发与测试
 
-本项目包含完整的协议契约、安全边界与模拟 Electron 渲染窗口/主进程的端到端测试套件（33 组测试，零外部依赖）：
+本项目包含完整的协议契约、安全边界与模拟 Electron 渲染窗口/主进程的端到端测试套件（34 组测试，零外部依赖）：
 
 ```bash
 npm test

@@ -8,6 +8,7 @@
   "focusIdleBlurMs": 300000,
   "sendEchoTimeoutMs": 3000,
   "richMediaEchoTimeoutMs": 15000,
+  "compatProfile": "rosmontis",
   "enableWebCredentialApi": false,
   "allowedOrigins": [],
   "networks": {
@@ -19,6 +20,7 @@
         "port": 3000,
         "accessToken": "",
         "messageFormat": "array",
+        "compatProfile": "rosmontis",
         "reportSelfMessage": false
       }
     ],

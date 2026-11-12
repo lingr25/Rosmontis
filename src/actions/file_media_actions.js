@@ -35,6 +35,8 @@ const HANDLED_ACTIONS = new Set([
   "delete_group_file_folder",
   "delete_group_file",
   "move_group_file",
+  "rename_group_file",
+  "rename_group_file_folder",
   "trans_group_file",
   "get_image",
   "get_record",
@@ -284,6 +286,26 @@ async function dispatch(action, p, context = {}) {
         fileIdList: [String(p.file_id || "")],
         curFolderId: String(p.parent_directory || "/"),
         dstFolderId: String(p.target_directory || "/"),
+      });
+      return {};
+    }
+
+    case "rename_group_file": {
+      await this.invokeNt("nodeIKernelRichMediaService/renameGroupFile", {
+        groupId: String(p.group_id),
+        busId: Number(p.busid || 102),
+        fileId: String(p.file_id || ""),
+        parentFolderId: String(p.current_parent_directory || p.parent_directory || "/"),
+        newFileName: String(p.new_name || p.name || ""),
+      });
+      return {};
+    }
+
+    case "rename_group_file_folder": {
+      await this.invokeNt("nodeIKernelRichMediaService/renameGroupFolder", {
+        groupId: String(p.group_id),
+        folderId: String(p.folder_id || ""),
+        newFolderName: String(p.new_folder_name || p.new_name || p.name || ""),
       });
       return {};
     }

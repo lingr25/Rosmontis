@@ -106,6 +106,9 @@ const serverRuntimeMixin = {
                 : params;
             const reply = await this.handleOneBotAction(act, actParams, params.echo, {
               messageFormat: endpointMsgFormat,
+              compatProfile: httpCfg.compatProfile || httpCfg.compat_profile,
+              compatAppName: httpCfg.compatAppName || httpCfg.compat_app_name,
+              compatAppVersion: httpCfg.compatAppVersion || httpCfg.compat_app_version,
             });
             if (!res.writableEnded) {
               res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
@@ -233,7 +236,12 @@ const serverRuntimeMixin = {
                   payload.action,
                   actParams,
                   payload.echo,
-                  { messageFormat: conn._messageFormat || "array" }
+                  {
+                    messageFormat: conn._messageFormat || "array",
+                    compatProfile: wsCfg.compatProfile || wsCfg.compat_profile,
+                    compatAppName: wsCfg.compatAppName || wsCfg.compat_app_name,
+                    compatAppVersion: wsCfg.compatAppVersion || wsCfg.compat_app_version,
+                  }
                 );
                 conn.sendJson(reply);
               }
@@ -264,7 +272,14 @@ const serverRuntimeMixin = {
           formatMetaEvent(
             "heartbeat",
             {
-              status: { online: this.online, good: this.online },
+              status: {
+                online: this.online,
+                good: this.online,
+                time: Math.max(
+                  0,
+                  Math.floor((Date.now() - (this.startedAtMs || Date.now())) / 1000)
+                ),
+              },
               interval: this.config.heartbeatIntervalMs,
             },
             { selfId: this.selfUin }
@@ -332,7 +347,12 @@ const serverRuntimeMixin = {
                 payload.action,
                 actParams,
                 payload.echo,
-                { messageFormat: entry.messageFormat || "array" }
+                {
+                  messageFormat: entry.messageFormat || "array",
+                  compatProfile: clientCfg.compatProfile || clientCfg.compat_profile,
+                  compatAppName: clientCfg.compatAppName || clientCfg.compat_app_name,
+                  compatAppVersion: clientCfg.compatAppVersion || clientCfg.compat_app_version,
+                }
               );
               conn.sendJson(reply);
             }

@@ -634,28 +634,38 @@ function parseCqCodeToSegments(raw, autoEscape = false) {
   return segments;
 }
 
+function normalizeSegmentObject(item) {
+  const type = String(item.type).trim();
+  const topLevel = {};
+  for (const [k, v] of Object.entries(item)) {
+    if (k !== "type" && k !== "data" && v !== undefined) {
+      topLevel[k] = v;
+    }
+  }
+  if (type.toLowerCase() === "json" && typeof item.data === "string") {
+    return { type, data: { ...topLevel, data: item.data } };
+  }
+  const nested =
+    item.data && typeof item.data === "object" && !Array.isArray(item.data)
+      ? item.data
+      : {};
+  return { type, data: { ...topLevel, ...nested } };
+}
+
 function normalizeOneBotMessage(message, autoEscape = false) {
   if (Array.isArray(message)) {
     const out = [];
     for (const item of message) {
       if (typeof item === "string") {
         out.push(...parseCqCodeToSegments(item, autoEscape));
-      } else if (item && typeof item === "object" && item.type) {
-        out.push({
-          type: String(item.type),
-          data: item.data && typeof item.data === "object" ? { ...item.data } : {},
-        });
+      } else if (item && typeof item === "object" && !Array.isArray(item) && item.type) {
+        out.push(normalizeSegmentObject(item));
       }
     }
     return out;
   }
-  if (message && typeof message === "object" && message.type) {
-    return [
-      {
-        type: String(message.type),
-        data: message.data && typeof message.data === "object" ? { ...message.data } : {},
-      },
-    ];
+  if (message && typeof message === "object" && !Array.isArray(message) && message.type) {
+    return [normalizeSegmentObject(message)];
   }
   if (typeof message === "string") {
     return parseCqCodeToSegments(message, autoEscape);
@@ -891,9 +901,16 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
           data: { result: String(face.resultId || "1") },
         });
       } else {
+        const hasResultId =
+          face.resultId !== undefined &&
+          face.resultId !== null &&
+          String(face.resultId) !== "";
         segments.push({
           type: "face",
-          data: { id: String(idx) },
+          data: {
+            id: String(idx),
+            ...(hasResultId ? { resultId: String(face.resultId) } : {}),
+          },
         });
       }
       continue;
@@ -996,6 +1013,21 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
   };
 }
 
+function pickMediaSource(data) {
+  const file = String(data.file ?? "").trim();
+  const url = String(data.url ?? "").trim();
+  const fallback =
+    file || url || String(data.path ?? "").trim() || String(data.media ?? "").trim();
+  if (!file) return fallback;
+  if (/^(base64:\/\/|data:|https?:\/\/|file:\/\/)/i.test(file) || /[\\/]/.test(file)) {
+    return file;
+  }
+  if (/^(https?:\/\/|base64:\/\/|data:|file:\/\/)/i.test(url)) {
+    return url;
+  }
+  return fallback;
+}
+
 /**
  * Convert OneBot v11 message (array of segments or CQ-code string) into NTQQ
  * `msgElements` array ready for `nodeIKernelMsgService/sendMsg`.
@@ -1025,7 +1057,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
   }
 
   for (const seg of segments) {
-    const type = String(seg.type || "");
+    const type = String(seg.type || "").toLowerCase();
     const data = seg.data && typeof seg.data === "object" ? seg.data : {};
 
     if (type === "text") {
@@ -1131,19 +1163,27 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
 
     if (type === "face") {
       const faceIndex = Number(data.id ?? 0);
+      const rawResultId = data.resultId ?? data.result_id;
+      const hasResultId =
+        rawResultId !== undefined && rawResultId !== null && String(rawResultId) !== "";
+      const isLarge =
+        data.large === true ||
+        data.large === "true" ||
+        data.large === 1 ||
+        data.large === "1";
       elements.push({
         elementType: 6,
         elementId: "",
         faceElement: {
           faceIndex,
-          faceType: faceIndex >= 1000 ? 2 : 1,
+          faceType: isLarge || hasResultId ? 3 : faceIndex >= 1000 ? 2 : 1,
           faceText: data.text ? String(data.text) : "",
           imageType: 0,
-          packId: "0",
+          packId: hasResultId ? "1" : "0",
           stickerId: "0",
-          sourceType: 0,
-          stickerType: 0,
-          resultId: "",
+          sourceType: hasResultId ? 1 : 0,
+          stickerType: hasResultId ? 2 : isLarge ? 1 : 0,
+          resultId: hasResultId ? String(rawResultId) : "",
           surpriseId: "",
           randomType: 1,
         },
@@ -1193,7 +1233,26 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
     }
 
     if (type === "image") {
-      const src = data.file || data.url || data.path;
+      const imgEmojiId = String(data.emoji_id ?? "").trim();
+      if (imgEmojiId) {
+        elements.push({
+          elementType: 11,
+          elementId: "",
+          marketFaceElement: {
+            itemType: 6,
+            faceInfo: 1,
+            emojiPackageId: Number(data.emoji_package_id || data.tab_id || 0),
+            subType: 3,
+            faceName: String(data.summary || data.name || "[商城表情]"),
+            emojiId: imgEmojiId,
+            key: String(data.key || ""),
+            staticFacePath: "",
+            dynamicFacePath: "",
+          },
+        });
+        continue;
+      }
+      const src = pickMediaSource(data);
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "image" })
@@ -1256,7 +1315,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
     }
 
     if (type === "record") {
-      const src = data.file || data.url || data.path;
+      const src = pickMediaSource(data);
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "record", preferredExt: ".amr" })
@@ -1304,7 +1363,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
     }
 
     if (type === "video") {
-      const src = data.file || data.url || data.path;
+      const src = pickMediaSource(data);
       const media =
         typeof ctx.resolveMediaSource === "function"
           ? await ctx.resolveMediaSource(src, { kind: "video", preferredExt: ".mp4" })
@@ -1347,7 +1406,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
     }
 
     if (type === "file") {
-      const src = data.file || data.url || data.path;
+      const src = pickMediaSource(data);
       const preferredName = data.name || data.file_name || undefined;
       const media =
         typeof ctx.resolveMediaSource === "function"
@@ -1390,9 +1449,48 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
       continue;
     }
 
+    if (type === "share") {
+      const shareUrl = String(data.url ?? "").trim();
+      const shareTitle = String(data.title ?? shareUrl).trim();
+      const shareContent = String(data.content ?? "");
+      const shareImage = String(data.image ?? "");
+      if (shareUrl) {
+        elements.push({
+          elementType: 10,
+          elementId: "",
+          arkElement: {
+            bytesData: JSON.stringify({
+              app: "com.tencent.structmsg",
+              view: "news",
+              prompt: shareTitle,
+              meta: {
+                news: {
+                  title: shareTitle,
+                  desc: shareContent,
+                  jumpUrl: shareUrl,
+                  preview: shareImage,
+                },
+              },
+            }),
+            linkInfo: null,
+            subElementType: null,
+          },
+        });
+      }
+      continue;
+    }
+
     if (type === "json") {
-      const jsonStr =
-        typeof data.data === "string" ? data.data : JSON.stringify(data.data || {});
+      let jsonStr;
+      if (typeof data.data === "string") {
+        jsonStr = data.data;
+      } else if (data.data && typeof data.data === "object" && !Array.isArray(data.data)) {
+        jsonStr = JSON.stringify(data.data);
+      } else if (data.data === undefined && Object.keys(data).length > 0) {
+        jsonStr = JSON.stringify(data);
+      } else {
+        jsonStr = JSON.stringify(data.data || {});
+      }
       elements.push({
         elementType: 10,
         elementId: "",

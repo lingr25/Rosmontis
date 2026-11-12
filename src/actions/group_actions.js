@@ -12,8 +12,13 @@ const { isWebCredentialApiEnabled } = require("../core/qzone_actions");
 const HANDLED_ACTIONS = new Set([
   "get_group_list",
   "get_group_info",
+  "get_group_info_ex",
+  "get_group_detail_info",
+  "get_group_share_link",
   "get_group_member_list",
   "get_group_member_info",
+  "get_group_at_all_remain",
+  "get_group_shut_list",
   "set_group_kick",
   "set_group_ban",
   "set_group_whole_ban",
@@ -21,6 +26,7 @@ const HANDLED_ACTIONS = new Set([
   "set_group_card",
   "set_group_special_title",
   "set_group_name",
+  "set_group_remark",
   "set_group_leave",
   "set_group_add_request",
   "get_group_system_msg",
@@ -89,19 +95,28 @@ async function dispatch(action, p, context = {}) {
       return rawGroups.map((g) => {
         const gid = Number(g.groupCode || g.groupUin || g.group_id || 0);
         if (gid > 0) this._setBoundedMap(this._groupListCache, String(gid), g);
+        const allShut =
+          Number(g.shutUpAllTimestamp || g.info?.shutUpAllTimestamp || 0) > 0 ||
+          Boolean(g.isAllShut || g.shutUpAll)
+            ? -1
+            : 0;
         return {
           group_id: gid,
           group_name: String(g.groupName || g.info?.groupName || ""),
+          group_remark: String(g.remarkName || g.groupRemark || g.info?.remarkName || ""),
           member_count: Number(g.memberCount || g.info?.memberCount || 0),
           max_member_count: Number(g.maxMember || g.info?.memberMax || 0),
           group_create_time: Number(g.createTime || g.info?.createdTime || 0),
           group_level: Number(g.groupLevel || 0),
           group_memo: String(g.richFingerMemo || g.info?.announcement || ""),
+          group_all_shut: allShut,
         };
       });
     }
 
-    case "get_group_info": {
+    case "get_group_info":
+    case "get_group_info_ex":
+    case "get_group_detail_info": {
       const groupId = Number(p.group_id || 0);
       try {
         const res = await this.invokeNt(
@@ -111,14 +126,18 @@ async function dispatch(action, p, context = {}) {
         );
         const d = res?.groupInfo || res?.detail || res || {};
         if (d.groupName || d.memberCount || d.maxMember) {
+          const allShut =
+            Number(d.shutUpAllTimestamp || 0) > 0 || Boolean(d.isAllShut || d.shutUpAll) ? -1 : 0;
           return {
             group_id: groupId,
             group_name: String(d.groupName || ""),
+            group_remark: String(d.remarkName || d.groupRemark || ""),
             member_count: Number(d.memberCount || 0),
             max_member_count: Number(d.maxMember || d.maxMemberCount || 0),
             group_create_time: Number(d.createTime || 0),
             group_level: Number(d.groupLevel || 0),
             group_memo: String(d.richFingerMemo || d.groupMemo || ""),
+            group_all_shut: allShut,
           };
         }
       } catch (_) {}
@@ -127,13 +146,132 @@ async function dispatch(action, p, context = {}) {
         list.find((g) => g.group_id === groupId) || {
           group_id: groupId,
           group_name: "",
+          group_remark: "",
           member_count: 0,
           max_member_count: 0,
           group_create_time: 0,
           group_level: 0,
           group_memo: "",
+          group_all_shut: 0,
         }
       );
+    }
+
+    case "get_group_share_link": {
+      const groupCode = String(p.group_id || "").trim();
+      if (!groupCode) throw new Error("group_id is required");
+      try {
+        const res = await this.invokeNt(
+          "nodeIKernelGroupService/getGroupRecommendContactArkJson",
+          { groupCode },
+          [groupCode]
+        );
+        const rawArk = String(res?.arkJson || res?.arkMsg || (typeof res === "string" ? res : "") || "");
+        if (rawArk) {
+          try {
+            const parsed = JSON.parse(rawArk);
+            const jumpUrl =
+              parsed?.meta?.contact?.jumpUrl ||
+              parsed?.meta?.news?.jumpUrl ||
+              parsed?.meta?.detail_1?.qqdocurl ||
+              "";
+            if (typeof jumpUrl === "string" && /^https?:\/\//i.test(jumpUrl)) {
+              return { url: jumpUrl };
+            }
+          } catch (_) {
+            const m = /https?:\/\/(?:qm\.qq\.com|qun\.qq\.com)\/[^\s"'\\]+/i.exec(rawArk);
+            if (m) return { url: m[0] };
+          }
+        }
+      } catch (_) {}
+      return { url: `https://qun.qq.com/join.html?group_id=${encodeURIComponent(groupCode)}` };
+    }
+
+    case "get_group_at_all_remain": {
+      const groupCode = String(p.group_id || "").trim();
+      if (!groupCode) throw new Error("group_id is required");
+      try {
+        const res = await this.invokeNt(
+          "nodeIKernelGroupService/getGroupRemainAtTimes",
+          { groupCode },
+          [groupCode]
+        );
+        const info = res?.atInfo || res || {};
+        return {
+          can_at_all: Boolean(info.canAtAll ?? true),
+          remain_at_all_count_for_group: Number(info.RemainAtAllCountForGroup ?? info.remainAtAllCountForGroup ?? 10),
+          remain_at_all_count_for_uin: Number(info.RemainAtAllCountForUin ?? info.remainAtAllCountForUin ?? 10),
+        };
+      } catch (_) {
+        return {
+          can_at_all: true,
+          remain_at_all_count_for_group: 10,
+          remain_at_all_count_for_uin: 10,
+        };
+      }
+    }
+
+    case "get_group_shut_list": {
+      const groupId = Number(p.group_id || 0);
+      const groupCode = String(groupId);
+      const nowSec = Math.floor(Date.now() / 1000);
+      let rawMembers = [];
+      try {
+        const allRes = await this.invokeNt(
+          "nodeIKernelGroupService/getAllMemberList",
+          { groupCode, force_fetch: true, forceFetch: true },
+          [groupCode, true]
+        );
+        const infos = allRes?.result?.infos || allRes?.infos || allRes;
+        rawMembers =
+          infos instanceof Map
+            ? [...infos.values()]
+            : Array.isArray(infos)
+            ? infos
+            : infos && typeof infos === "object"
+            ? Object.values(infos)
+            : [];
+      } catch (_) {}
+      this.uinUidStore.rememberFromGroupMemberList(groupCode, rawMembers);
+      return rawMembers
+        .filter((m) => m && Number(m.shutUpTime || 0) > nowSec)
+        .map((m) => {
+          const uin =
+            Number(m.uin || m.user_id || 0) ||
+            Number((m.uid ? this.uinUidStore.getUinSync(m.uid) : 0) || 0);
+          const roleNum = m.role ?? m.permission;
+          const role =
+            typeof roleNum === "string"
+              ? roleNum
+              : roleNum === 4 || roleNum === 1
+              ? "owner"
+              : roleNum === 3 || roleNum === 2
+              ? "admin"
+              : "member";
+          return {
+            group_id: groupId,
+            user_id: uin,
+            uid: String(m.uid || ""),
+            nickname: String(m.nick ?? m.nickname ?? m.memberName ?? ""),
+            card: String(m.cardName ?? m.card ?? m.memberCard?.memberCard ?? ""),
+            role,
+            shut_up_timestamp: Number(m.shutUpTime || 0),
+          };
+        });
+    }
+
+    case "set_group_remark": {
+      const groupCode = String(p.group_id || "").trim();
+      if (!groupCode) throw new Error("group_id is required");
+      await this.invokeNt(
+        "nodeIKernelGroupService/modifyGroupRemark",
+        {
+          groupCode,
+          remarkName: String(p.remark ?? p.group_remark ?? ""),
+        },
+        [groupCode, String(p.remark ?? p.group_remark ?? "")]
+      );
+      return {};
     }
 
     case "get_group_member_list": {

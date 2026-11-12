@@ -2,10 +2,31 @@
 
 const {
   segmentsToCqCode,
+  parseCqCodeToSegments,
   normalizeOneBotMessage,
   ntMsgToOneBotSegments,
   formatNtMsgToOneBotEvent,
 } = require("../bridge_onebot");
+
+const { resolveCompatVersionInfo } = require("../core/config");
+
+function extractExclusiveForwardNodes(message, autoEscape = false) {
+  if (autoEscape && typeof message === "string") return null;
+  if (message && typeof message === "object" && !Array.isArray(message)) {
+    return String(message.type || "").toLowerCase() === "node" ? [message] : null;
+  }
+  if (!Array.isArray(message) || message.length === 0) return null;
+  const nodes = [];
+  for (const item of message) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const t = String(item.type || "").trim().toLowerCase();
+    if (!t) return null;
+    if (t === "text" && (item.data?.text ?? item.text) === "") continue;
+    if (t !== "node") return null;
+    nodes.push(item);
+  }
+  return nodes.length > 0 ? nodes : null;
+}
 
 const HANDLED_ACTIONS = new Set([
   "get_login_info",
@@ -42,11 +63,16 @@ const HANDLED_ACTIONS = new Set([
   "set_group_reaction",
   "fetch_emoji_like",
   "get_emoji_likes",
+  "get_msg_emoji_likes",
   "send_like",
   "get_profile_like",
   "group_poke",
   "friend_poke",
   "send_poke",
+  ".handle_quick_operation",
+  ".handle_quick_operation_async",
+  "handle_quick_operation",
+  "handle_quick_operation_async",
 ]);
 
 async function dispatch(action, p, context = {}) {
@@ -87,6 +113,10 @@ async function dispatch(action, p, context = {}) {
       return {
         online: Boolean(this.online),
         good: Boolean(this.online),
+        time: Math.max(
+          0,
+          Math.floor((Date.now() - (this.startedAtMs || Date.now())) / 1000)
+        ),
         bridge: {
           invoke: { ...this.invokeStats },
           send_echo: { ...this.sendEchoStats },
@@ -127,11 +157,7 @@ async function dispatch(action, p, context = {}) {
     }
 
     case "get_version_info":
-      return {
-        app_name: "Rosmontis",
-        app_version: "1.0.0",
-        protocol_version: "v11",
-      };
+      return resolveCompatVersionInfo(this.config, context);
 
     case "can_send_image":
     case "can_send_record":
@@ -145,6 +171,14 @@ async function dispatch(action, p, context = {}) {
     case "send_private_msg": {
       const userId = p.user_id;
       if (!userId) throw new Error("user_id is required");
+      const fwdNodes = extractExclusiveForwardNodes(p.message, Boolean(p.auto_escape));
+      if (fwdNodes) {
+        return await this._dispatchAction(
+          "send_private_forward_msg",
+          { ...p, messages: fwdNodes },
+          context
+        );
+      }
       const peer = await this._resolvePeerForUser(userId, p.group_id);
       return await this._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), p.group_id);
     }
@@ -152,6 +186,14 @@ async function dispatch(action, p, context = {}) {
     case "send_group_msg": {
       const groupId = p.group_id;
       if (!groupId) throw new Error("group_id is required");
+      const fwdNodes = extractExclusiveForwardNodes(p.message, Boolean(p.auto_escape));
+      if (fwdNodes) {
+        return await this._dispatchAction(
+          "send_group_forward_msg",
+          { ...p, messages: fwdNodes },
+          context
+        );
+      }
       const peer = { chatType: 2, peerUid: String(groupId), guildId: "" };
       return await this._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), groupId);
     }
@@ -592,7 +634,8 @@ async function dispatch(action, p, context = {}) {
     }
 
     case "fetch_emoji_like":
-    case "get_emoji_likes": {
+    case "get_emoji_likes":
+    case "get_msg_emoji_likes": {
       const entry =
         this.messageIdStore.getByShortId(p.message_id) ||
         this.messageIdStore.getByMsgId(p.message_id);
@@ -691,6 +734,127 @@ async function dispatch(action, p, context = {}) {
     case "send_poke":
       await this._sendPokeInternal(p.group_id, p.user_id || p.target_id);
       return {};
+
+    case ".handle_quick_operation":
+    case ".handle_quick_operation_async":
+    case "handle_quick_operation":
+    case "handle_quick_operation_async": {
+      const ev = p.context;
+      const op = p.operation;
+      if (
+        !ev ||
+        typeof ev !== "object" ||
+        Array.isArray(ev) ||
+        !op ||
+        typeof op !== "object" ||
+        Array.isArray(op)
+      ) {
+        const err = new Error("context and operation are required");
+        err.retcode = 1400;
+        throw err;
+      }
+
+      const postType = String(ev.post_type || "");
+      if (postType === "message") {
+        if (op.reply !== undefined && op.reply !== null && op.reply !== "") {
+          const autoEscape = Boolean(op.auto_escape);
+          if (ev.message_type === "group" && ev.group_id) {
+            let replyMessage = op.reply;
+            let effectiveAutoEscape = autoEscape;
+            if (op.at_sender !== false && ev.user_id) {
+              const atSeg = { type: "at", data: { qq: String(ev.user_id) } };
+              if (typeof op.reply === "string") {
+                const parsed = autoEscape
+                  ? [{ type: "text", data: { text: op.reply } }]
+                  : parseCqCodeToSegments(op.reply, false);
+                replyMessage = [atSeg, ...parsed];
+                effectiveAutoEscape = false;
+              } else if (Array.isArray(op.reply)) {
+                replyMessage = [atSeg, ...op.reply];
+              } else if (op.reply && typeof op.reply === "object") {
+                replyMessage = [atSeg, op.reply];
+              }
+            }
+            await this._dispatchAction(
+              "send_group_msg",
+              {
+                group_id: ev.group_id,
+                message: replyMessage,
+                auto_escape: effectiveAutoEscape,
+              },
+              context
+            );
+          } else if (ev.user_id) {
+            await this._dispatchAction(
+              "send_private_msg",
+              {
+                user_id: ev.user_id,
+                ...(ev.group_id ? { group_id: ev.group_id } : {}),
+                message: op.reply,
+                auto_escape: autoEscape,
+              },
+              context
+            );
+          }
+        }
+
+        if (op.delete && ev.message_id !== undefined && ev.message_id !== null) {
+          await this._dispatchAction("delete_msg", { message_id: ev.message_id }, context);
+        }
+
+        if (op.ban && ev.message_type === "group" && ev.group_id && ev.user_id) {
+          const duration =
+            typeof op.ban_duration === "number" && Number.isFinite(op.ban_duration)
+              ? op.ban_duration
+              : 1800;
+          await this._dispatchAction(
+            "set_group_ban",
+            {
+              group_id: ev.group_id,
+              user_id: ev.user_id,
+              duration,
+            },
+            context
+          );
+        }
+
+        if (op.kick && ev.message_type === "group" && ev.group_id && ev.user_id) {
+          await this._dispatchAction(
+            "set_group_kick",
+            {
+              group_id: ev.group_id,
+              user_id: ev.user_id,
+              reject_add_request: Boolean(op.reject_add_request),
+            },
+            context
+          );
+        }
+      } else if (postType === "request" && op.approve !== undefined) {
+        if (ev.request_type === "friend") {
+          await this._dispatchAction(
+            "set_friend_add_request",
+            {
+              flag: String(ev.flag || ""),
+              approve: Boolean(op.approve),
+              remark: String(op.remark ?? ""),
+            },
+            context
+          );
+        } else if (ev.request_type === "group") {
+          await this._dispatchAction(
+            "set_group_add_request",
+            {
+              flag: String(ev.flag || ""),
+              sub_type: String(ev.sub_type || ev.subType || "add"),
+              approve: Boolean(op.approve),
+              reason: String(op.reason ?? ""),
+            },
+            context
+          );
+        }
+      }
+      return {};
+    }
 
     default:
       throw new Error(`Unsupported OneBot action: ${action}`);

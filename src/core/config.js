@@ -456,6 +456,38 @@ function loadBridgeConfig(customConfigDir) {
       ? "string"
       : "array";
 
+  const envCompatProfile = _pickEnv(
+    "ROSMONTIS_COMPAT_PROFILE",
+    "ONEBOT_COMPAT_PROFILE",
+    "XIAO_BRIDGE_COMPAT_PROFILE"
+  ).toLowerCase();
+  const rawCompatProfile = String(
+    envCompatProfile || loadedRaw.compatProfile || loadedRaw.compat_profile || "rosmontis"
+  )
+    .trim()
+    .toLowerCase();
+  defaultConfig.compatProfile =
+    rawCompatProfile === "snowluma" || rawCompatProfile === "napcat"
+      ? rawCompatProfile
+      : "rosmontis";
+
+  const envCompatAppName = _pickEnv(
+    "ROSMONTIS_COMPAT_APP_NAME",
+    "ONEBOT_COMPAT_APP_NAME",
+    "XIAO_BRIDGE_COMPAT_APP_NAME"
+  );
+  const rawCompatAppName = String(
+    envCompatAppName || loadedRaw.compatAppName || loadedRaw.compat_app_name || ""
+  ).trim();
+  if (rawCompatAppName) {
+    defaultConfig.compatAppName = rawCompatAppName;
+  }
+  if (loadedRaw.compatAppVersion || loadedRaw.compat_app_version) {
+    defaultConfig.compatAppVersion = String(
+      loadedRaw.compatAppVersion || loadedRaw.compat_app_version
+    ).trim();
+  }
+
   const envHttpPort = Number(
     _pickEnv("ROSMONTIS_HTTP_PORT", "ONEBOT_HTTP_PORT", "XIAO_BRIDGE_HTTP_PORT") || 0
   );
@@ -542,7 +574,41 @@ function loadBridgeConfig(customConfigDir) {
   return defaultConfig;
 }
 
+function resolveCompatVersionInfo(config = {}, context = {}) {
+  const appNameOverride = String(
+    context?.compatAppName ?? config?.compatAppName ?? ""
+  ).trim();
+  const profileRaw = String(
+    context?.compatProfile ?? config?.compatProfile ?? "rosmontis"
+  )
+    .trim()
+    .toLowerCase();
+
+  let appName = "Rosmontis";
+  if (appNameOverride) {
+    appName = appNameOverride;
+  } else if (profileRaw === "snowluma") {
+    appName = "SnowLuma";
+  } else if (profileRaw === "napcat") {
+    appName = "NapCat.Onebot";
+  }
+
+  const appVersion =
+    String(context?.compatAppVersion ?? config?.compatAppVersion ?? "1.0.0").trim() ||
+    "1.0.0";
+
+  return {
+    app_name: appName,
+    app_version: appVersion,
+    protocol_version: "v11",
+    ...(appName !== "Rosmontis"
+      ? { bridge_name: "Rosmontis", bridge_version: "1.0.0" }
+      : {}),
+  };
+}
+
 module.exports = {
   filterEnabledEntries,
   loadBridgeConfig,
+  resolveCompatVersionInfo,
 };
