@@ -51,15 +51,16 @@
 
 ## 2. Rosmontis 核心架构
 
-Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个入口模块与 `src/core/` 下的 7 个零外部依赖纯 JavaScript 子模块组成：
+Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个顶层入口模块、`src/core/` 下的 12 个核心子模块与 `src/actions/` 下的 4 个动作域子模块组成（零外部 npm 依赖）：
 
 | 模块 | 职责 |
 | :--- | :--- |
 | `src/app_launcher_index.js` | 纯 JS 引导包装器：在 `major.node` 启动前初始化 `bridge_main.js`，支持 `ROSMONTIS_DISABLE=1` 一键旁路 |
 | `src/bridge_renderer.js` | 渲染层受信任桥接器：闭包隔离 `__ipcToken` 鉴权，监听结构化 `__ROSMONTIS_BRIDGE_CMD__` 指令通道，构造原生 `RM_IPCFROM_RENDERER{windowId}` 帧并驱动会话因果状态机 |
-| `src/bridge_main.js` | 主进程协调器：无痕捕获运行时引用后自动归还原生原型链，实现 65+ OneBot v11 动作与 HTTP / 正向 WS / 反向 WS 服务 |
+| `src/bridge_main.js` | 主进程协调器：组装 `src/core/*` 运行时管线与 `src/actions/*` 动作路由表，统筹生命周期、自动快登与 65+ OneBot v11 动作分发 |
 | `src/bridge_onebot.js` | 协议编解码库：CQ 码/消息段双向转换、富媒体元素组装、LRU 消息短 ID 映射与 UIN/UID 双向索引 |
-| `src/core/*` | 零依赖核心子模块：`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`session_scheduler`（会话亲和互斥锁与切换冷却）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
+| `src/core/*` | 12 个零依赖核心子模块：`nt_capture`（无痕捕获与原生原型链自动归还）、`renderer_ipc`（渲染窗口注入、跨进程 `Map` 保真序列化与三级 `invokeNt` 调度）、`inbound_pipeline`（内核事件监听与富媒体水合）、`outbound_pipeline`（两阶段出站发送与 `onAddSendMsg` 回显关联）、`server_runtime`（HTTP / 正向 WS / 反向 WS 服务运行时）、`session_scheduler`（会话亲和互斥锁与切换冷却）、`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
+| `src/actions/*` | 4 个 OneBot v11 动作域子模块：`message_actions`（登录状态、消息收发、合并转发、历史记录、已读/回应/戳一戳）、`contact_actions`（好友列表、资料、备注与好友申请）、`group_actions`（群信息/成员、群管操作、精华消息与入群申请）、`file_media_actions`（群/私聊文件传输、媒体解析、OCR/语音转文字、个人资料与 Ark 分享） |
 
 ### 2.1 渲染层官方 IPC 帧协议与 Map 跨进程还原
 
