@@ -3,8 +3,8 @@
 /**
  * NTQQ Renderer-Layer Bridge (`bridge_renderer.js`)
  *
- * Injected into `BrowserWindow.webContents` after page load, and also importable
- * in standard Node.js for unit tests.
+ * Self-contained module (zero top-level `require` calls) injected into
+ * `BrowserWindow.webContents` after page load and importable in Node.js tests.
  *
  * Exposes `window.__ROSMONTIS_RENDERER_BRIDGE__`:
  * - Discovers `windowId` (`window.webContentId` / `?webcontentsid=`) and `window.ipcRenderer` / `window.ipcImpl`.
@@ -19,9 +19,9 @@
  * - Supports authenticated IPC command/event envelopes (`__ROSMONTIS_BRIDGE_CMD__`,
  *   `__ROSMONTIS_BRIDGE_CMD_ACK__`, `__ROSMONTIS_BRIDGE_EVENT__`) with `ipcAuthToken`
  *   confined strictly to closure scope (never readable on `window.__ROSMONTIS_RENDERER_BRIDGE__`).
- * - Implements `simulateHumanSessionFlow({ chatType, peerUid, guildId, markRead, sendTyping, readToTypingDelayMs })`
+ * - Implements causal human session simulation (`simulateHumanSessionFlow` / `leaveHumanSessionFlow`)
  *   with session-switch state tracking (`enterType: 2` on old AIO, `enterType: 1` on new AIO)
- *   and 5-second anti-burst deduplication for `setMsgRead` and `sendShowInputStatusReq`.
+ *   and anti-burst deduplication for `setMsgRead` and `sendShowInputStatusReq`.
  */
 
 const DEFAULT_REGISTERED_EVENTS = [
@@ -48,72 +48,238 @@ const KNOWN_MAP_FIELDS = new Set(["msgAttributeInfos", "thumbPath", "picThumbPat
 const BRIDGE_EVENT_CHANNEL = "__ROSMONTIS_BRIDGE_EVENT__";
 const BRIDGE_CMD_CHANNEL = "__ROSMONTIS_BRIDGE_CMD__";
 const BRIDGE_CMD_ACK_CHANNEL = "__ROSMONTIS_BRIDGE_CMD_ACK__";
+const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
+const DEFAULT_BOUNDED_LRU_MAX = 2000;
+const SESSION_STEP_TIMEOUT_MS = 4000;
+const MAX_CODEC_DEPTH = 32;
+
 const _cleanupByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
 const _bootstrapAuthByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
+const _diagSetterByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
 
-function encodeBridgeMaps(val, depth = 0) {
-  if (val === null || val === undefined || depth > 8) return val;
-  if (typeof val === "bigint") return val.toString();
-  if (typeof val !== "object") return val;
-  if (val instanceof Map) {
-    return {
-      __rosmontisMap__: Array.from(val.entries()).map(([k, v]) => [
-        encodeBridgeMaps(k, depth + 1),
-        encodeBridgeMaps(v, depth + 1),
-      ]),
-    };
-  }
-  if (val instanceof Set) {
-    return Array.from(val.values()).map((v) => encodeBridgeMaps(v, depth + 1));
-  }
-  if (val instanceof Uint8Array || ArrayBuffer.isView(val)) {
-    return val;
-  }
-  if (Array.isArray(val)) {
-    return val.map((item) => encodeBridgeMaps(item, depth + 1));
-  }
-  const out = {};
-  for (const [k, v] of Object.entries(val)) {
-    out[k] = encodeBridgeMaps(v, depth + 1);
-  }
-  return out;
+function getObjectTag(val) {
+  return Object.prototype.toString.call(val);
 }
 
-function reviveBridgePayload(val, fieldName = "") {
-  if (val === null || val === undefined || typeof val !== "object") {
+function isMapLike(val) {
+  return val instanceof Map || getObjectTag(val) === "[object Map]";
+}
+
+function isSetLike(val) {
+  return val instanceof Set || getObjectTag(val) === "[object Set]";
+}
+
+function toUint8View(val) {
+  if (val instanceof Uint8Array) return val;
+  if (ArrayBuffer.isView(val)) {
+    return new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
+  }
+  if (getObjectTag(val) === "[object Uint8Array]") {
+    return Uint8Array.from(val);
+  }
+  return null;
+}
+
+function setOwnProp(target, key, value) {
+  if (key === "__proto__") {
+    Object.defineProperty(target, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  } else {
+    target[key] = value;
+  }
+}
+
+function encodeBridgeValue(val, { forJson = false, depth = 0, seen = null } = {}) {
+  if (val === undefined) {
+    return forJson ? { __rosmontisVoid__: true } : undefined;
+  }
+  if (val === null) return null;
+  if (typeof val === "bigint") return val.toString();
+  if (typeof val === "function" || typeof val === "symbol") {
+    return forJson ? { __rosmontisVoid__: true } : undefined;
+  }
+  if (typeof val !== "object") return val;
+
+  const u8 = toUint8View(val);
+  if (u8) {
+    return forJson ? { __rosmontisUint8Array__: Array.from(u8) } : u8;
+  }
+  if (val instanceof Date || getObjectTag(val) === "[object Date]") {
+    return forJson ? val.toISOString() : val;
+  }
+  if (depth > MAX_CODEC_DEPTH) {
     return val;
   }
-  if (val instanceof Map || val instanceof Uint8Array || ArrayBuffer.isView(val)) {
-    return val;
+
+  const ancestors = seen || new Set();
+  if (ancestors.has(val)) {
+    return null;
   }
-  if (Array.isArray(val)) {
-    return val.map((item) => reviveBridgePayload(item));
+  ancestors.add(val);
+
+  try {
+    const nextOpts = { forJson, depth: depth + 1, seen: ancestors };
+
+    if (isMapLike(val)) {
+      return {
+        __rosmontisMap__: Array.from(val.entries(), ([k, v]) => [
+          encodeBridgeValue(k, nextOpts),
+          encodeBridgeValue(v, nextOpts),
+        ]),
+      };
+    }
+    if (isSetLike(val)) {
+      return Array.from(val.values(), (v) => encodeBridgeValue(v, nextOpts));
+    }
+    if (Array.isArray(val)) {
+      return val.map((item) => encodeBridgeValue(item, nextOpts));
+    }
+
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      setOwnProp(out, k, encodeBridgeValue(v, nextOpts));
+    }
+    return out;
+  } finally {
+    ancestors.delete(val);
   }
-  if (Array.isArray(val.__rosmontisMap__) && Object.keys(val).length === 1) {
-    return new Map(
-      val.__rosmontisMap__.map((entry) => [
-        Array.isArray(entry) ? entry[0] : undefined,
-        Array.isArray(entry) ? reviveBridgePayload(entry[1]) : undefined,
-      ])
-    );
-  }
-  if (KNOWN_MAP_FIELDS.has(fieldName)) {
-    return new Map(
-      Object.entries(val).map(([k, v]) => [
-        /^\d+$/.test(k) && fieldName !== "msgAttributeInfos" ? Number(k) : k,
-        reviveBridgePayload(v),
-      ])
-    );
-  }
-  const out = {};
-  for (const [k, v] of Object.entries(val)) {
-    out[k] = reviveBridgePayload(v, k);
-  }
-  return out;
+}
+
+function encodeBridgeMaps(val, depth = 0) {
+  return encodeBridgeValue(val, { forJson: false, depth });
 }
 
 function serializeBridgeResult(val) {
-  return JSON.stringify(val === undefined ? { __rosmontisVoid__: true } : encodeBridgeMaps(val));
+  const encoded = encodeBridgeValue(val, { forJson: true, depth: 0 });
+  return JSON.stringify(encoded, (_key, item) => (typeof item === "bigint" ? item.toString() : item));
+}
+
+function reviveBridgePayload(val, fieldName = "", depth = 0, seen = null) {
+  if (val === null || val === undefined || typeof val !== "object") {
+    return val;
+  }
+
+  const u8 = toUint8View(val);
+  if (u8) return u8;
+
+  if (val instanceof Date || getObjectTag(val) === "[object Date]") {
+    return val;
+  }
+  if (depth > MAX_CODEC_DEPTH) {
+    return val;
+  }
+
+  const ancestors = seen || new Set();
+  if (ancestors.has(val)) {
+    return val;
+  }
+  ancestors.add(val);
+
+  try {
+    if (isMapLike(val)) {
+      const revivedMap = new Map();
+      for (const [k, v] of val.entries()) {
+        revivedMap.set(
+          reviveBridgePayload(k, "", depth + 1, ancestors),
+          reviveBridgePayload(v, "", depth + 1, ancestors)
+        );
+      }
+      return revivedMap;
+    }
+
+    if (Array.isArray(val)) {
+      return val.map((item) => reviveBridgePayload(item, "", depth + 1, ancestors));
+    }
+
+    const keys = Object.keys(val);
+    if (keys.length === 1) {
+      if (val.__rosmontisVoid__ === true) {
+        return undefined;
+      }
+      if (Array.isArray(val.__rosmontisMap__)) {
+        return new Map(
+          val.__rosmontisMap__.map((entry) => [
+            Array.isArray(entry)
+              ? reviveBridgePayload(entry[0], "", depth + 1, ancestors)
+              : undefined,
+            Array.isArray(entry)
+              ? reviveBridgePayload(entry[1], "", depth + 1, ancestors)
+              : undefined,
+          ])
+        );
+      }
+      if (Array.isArray(val.__rosmontisUint8Array__)) {
+        return Uint8Array.from(val.__rosmontisUint8Array__);
+      }
+      if (Array.isArray(val.__rosmontisBytes__)) {
+        return Uint8Array.from(val.__rosmontisBytes__);
+      }
+    } else if (
+      keys.length === 2 &&
+      val.type === "Buffer" &&
+      Array.isArray(val.data) &&
+      val.data.every((b) => typeof b === "number")
+    ) {
+      return Uint8Array.from(val.data);
+    }
+
+    if (KNOWN_MAP_FIELDS.has(fieldName)) {
+      return new Map(
+        Object.entries(val).map(([k, v]) => [
+          /^\d+$/.test(k) && fieldName !== "msgAttributeInfos" ? Number(k) : k,
+          reviveBridgePayload(v, "", depth + 1, ancestors),
+        ])
+      );
+    }
+
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      setOwnProp(out, k, reviveBridgePayload(v, k, depth + 1, ancestors));
+    }
+    return out;
+  } finally {
+    ancestors.delete(val);
+  }
+}
+
+function setBoundedMap(map, key, value, maxEntries = DEFAULT_BOUNDED_LRU_MAX) {
+  if (!isMapLike(map)) return map;
+  if (maxEntries !== undefined && Number(maxEntries) <= 0) {
+    map.clear();
+    return map;
+  }
+  const limit =
+    Number.isFinite(maxEntries) && maxEntries > 0
+      ? Math.floor(maxEntries)
+      : DEFAULT_BOUNDED_LRU_MAX;
+  if (map.has(key)) {
+    map.delete(key);
+  }
+  map.set(key, value);
+  while (map.size > limit) {
+    const oldest = map.keys().next();
+    if (oldest.done) break;
+    map.delete(oldest.value);
+  }
+  return map;
+}
+
+function formatPeerKey(peer) {
+  return `${peer.chatType}:${peer.peerUid}:${peer.guildId}`;
+}
+
+function formatIpcErrorBody(body) {
+  if (body instanceof Error) return body.message;
+  if (typeof body === "string") return body;
+  try {
+    return serializeBridgeResult(body);
+  } catch (_) {
+    return String(body);
+  }
 }
 
 function installRendererBridge(targetWindow, options = {}) {
@@ -122,10 +288,16 @@ function installRendererBridge(targetWindow, options = {}) {
     (typeof window !== "undefined" ? window : typeof globalThis !== "undefined" ? globalThis : {});
 
   if (win.__ROSMONTIS_RENDERER_BRIDGE__ && !options.forceReinstall) {
-    if (options.ipcAuthToken && _bootstrapAuthByWindow && typeof win === "object" && win !== null) {
-      const bootstrapFn = _bootstrapAuthByWindow.get(win);
-      if (typeof bootstrapFn === "function") {
-        bootstrapFn(options.ipcAuthToken);
+    if (typeof win === "object" && win !== null) {
+      if (typeof options.onDiagnostic === "function" && _diagSetterByWindow) {
+        const setDiag = _diagSetterByWindow.get(win);
+        if (typeof setDiag === "function") setDiag(options.onDiagnostic);
+      }
+      if (options.ipcAuthToken && _bootstrapAuthByWindow) {
+        const bootstrapFn = _bootstrapAuthByWindow.get(win);
+        if (typeof bootstrapFn === "function") {
+          bootstrapFn(options.ipcAuthToken);
+        }
       }
     }
     if (options.windowId && !win.__ROSMONTIS_RENDERER_BRIDGE__.windowId) {
@@ -137,12 +309,38 @@ function installRendererBridge(targetWindow, options = {}) {
     return win.__ROSMONTIS_RENDERER_BRIDGE__;
   }
 
+  let diagnosticHandler =
+    typeof options.onDiagnostic === "function" ? options.onDiagnostic : null;
+
+  function reportDiag(scope, err) {
+    if (diagnosticHandler) {
+      try {
+        diagnosticHandler(scope, err);
+      } catch (_) {}
+    }
+    if (win && win.__ROSMONTIS_DEBUG__ === true) {
+      try {
+        if (typeof console !== "undefined" && typeof console.warn === "function") {
+          console.warn(`[Rosmontis:renderer:${scope}]`, err);
+        }
+      } catch (_) {}
+    }
+  }
+
+  if (_diagSetterByWindow && typeof win === "object" && win !== null) {
+    _diagSetterByWindow.set(win, (fn) => {
+      if (typeof fn === "function") diagnosticHandler = fn;
+    });
+  }
+
   if (options.forceReinstall && _cleanupByWindow && typeof win === "object" && win !== null) {
     const prevCleanup = _cleanupByWindow.get(win);
     if (typeof prevCleanup === "function") {
       try {
         prevCleanup();
-      } catch (_) {}
+      } catch (err) {
+        reportDiag("cleanupPrevious", err);
+      }
     }
   }
 
@@ -204,7 +402,9 @@ function installRendererBridge(targetWindow, options = {}) {
           if (m) return Number(m[1]);
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      reportDiag("discoverWindowId.eventNames", err);
+    }
     try {
       const urlParams = new URLSearchParams(win.location ? win.location.search : "");
       const wid = Number(
@@ -214,7 +414,9 @@ function installRendererBridge(targetWindow, options = {}) {
           0
       );
       if (Number.isFinite(wid) && wid > 0) return wid;
-    } catch (_) {}
+    } catch (err) {
+      reportDiag("discoverWindowId.location", err);
+    }
     return 1;
   }
 
@@ -242,16 +444,6 @@ function installRendererBridge(targetWindow, options = {}) {
     sessionState.lastTypingAtByPeer.clear();
   }
 
-  function setBoundedMap(map, key, value, maxEntries = 2000) {
-    if (map.has(key)) map.delete(key);
-    map.set(key, value);
-    while (map.size > maxEntries) {
-      const oldest = map.keys().next().value;
-      if (oldest === undefined) break;
-      map.delete(oldest);
-    }
-  }
-
   function makeCallbackId() {
     try {
       if (win.crypto && typeof win.crypto.randomUUID === "function") {
@@ -276,43 +468,39 @@ function installRendererBridge(targetWindow, options = {}) {
     });
   }
 
-  function forwardToMain(payload) {
+  function sendOverIpcChannel(channel, payload, diagScope) {
     const ipc = resolveIpcRenderer() || ipcRenderer;
     if (!ipc) return;
+    try {
+      if (typeof ipc.send === "function") {
+        ipc.send(channel, payload);
+        return;
+      }
+      if (typeof ipc.invoke === "function") {
+        Promise.resolve(ipc.invoke(channel, payload)).catch((err) => {
+          reportDiag(`${diagScope}.invoke`, err);
+        });
+      }
+    } catch (err) {
+      reportDiag(diagScope, err);
+    }
+  }
+
+  function forwardToMain(payload) {
     const envelope =
       ipcAuthToken && payload && typeof payload === "object" && !Array.isArray(payload)
         ? { ...payload, __ipcToken: ipcAuthToken }
         : payload;
-    const encoded = encodeBridgeMaps(envelope);
-    try {
-      if (typeof ipc.send === "function") {
-        ipc.send(BRIDGE_EVENT_CHANNEL, encoded);
-        return;
-      }
-      if (typeof ipc.invoke === "function") {
-        Promise.resolve(ipc.invoke(BRIDGE_EVENT_CHANNEL, encoded)).catch(() => {});
-      }
-    } catch (_) {}
+    sendOverIpcChannel(BRIDGE_EVENT_CHANNEL, encodeBridgeMaps(envelope), "forwardToMain");
   }
 
   function sendCommandAck(reply) {
-    const ipc = resolveIpcRenderer() || ipcRenderer;
-    if (!ipc) return;
     const replyEnvelope = ipcAuthToken ? { ...reply, __ipcToken: ipcAuthToken } : reply;
-    try {
-      if (typeof ipc.send === "function") {
-        ipc.send(BRIDGE_CMD_ACK_CHANNEL, replyEnvelope);
-        return;
-      }
-      if (typeof ipc.invoke === "function") {
-        Promise.resolve(ipc.invoke(BRIDGE_CMD_ACK_CHANNEL, replyEnvelope)).catch(() => {});
-      }
-    } catch (_) {}
+    sendOverIpcChannel(BRIDGE_CMD_ACK_CHANNEL, replyEnvelope, "sendCommandAck");
   }
 
   function handleIncomingMainIpc(_event, header, body) {
     try {
-      // 1. Resolve or reject any pending invokeNtApi callback if callbackId matches
       if (header && typeof header === "object" && header.callbackId) {
         const pending = pendingCallbacks.get(header.callbackId);
         if (pending) {
@@ -323,13 +511,9 @@ function installRendererBridge(targetWindow, options = {}) {
             header.promiseStatue !== "full" &&
             header.promiseStatue !== "fulfilled"
           ) {
-            const errMsg =
-              body instanceof Error
-                ? body.message
-                : typeof body === "string"
-                ? body
-                : JSON.stringify(body);
-            pending.reject(new Error(`NTQQ IPC error (${pending.cmd}): ${errMsg}`));
+            pending.reject(
+              new Error(`NTQQ IPC error (${pending.cmd}): ${formatIpcErrorBody(body)}`)
+            );
           } else {
             pending.resolve(body);
           }
@@ -337,12 +521,12 @@ function installRendererBridge(targetWindow, options = {}) {
         }
       }
 
-      // 2. Passively forward kernel listener events to main process
+      const eventName = header?.eventName || "ntApi";
       if (body && typeof body === "object" && !Array.isArray(body) && typeof body.cmdName === "string") {
         forwardToMain({
           source: "renderer_ipc",
           windowId,
-          eventName: header?.eventName || "ntApi",
+          eventName,
           cmdName: body.cmdName,
           payload: body.payload,
           timestamp: Date.now(),
@@ -353,17 +537,20 @@ function installRendererBridge(targetWindow, options = {}) {
           forwardToMain({
             source: "renderer_ipc",
             windowId,
-            eventName: header?.eventName || "ntApi",
+            eventName,
             cmdName: first.cmdName,
             payload: first.payload !== undefined ? first.payload : body[1],
             rawBody: body,
             timestamp: Date.now(),
           });
-        } else if (typeof first === "string" && (first.startsWith("nodeIKernel") || first.startsWith("on"))) {
+        } else if (
+          typeof first === "string" &&
+          (first.startsWith("nodeIKernel") || first.startsWith("on"))
+        ) {
           forwardToMain({
             source: "renderer_ipc",
             windowId,
-            eventName: header?.eventName || "ntApi",
+            eventName,
             cmdName: first,
             payload: body[1],
             rawBody: body,
@@ -371,7 +558,14 @@ function installRendererBridge(targetWindow, options = {}) {
           });
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      reportDiag("handleIncomingMainIpc", err);
+    }
+  }
+
+  function decodeCommandField(serializedField, directField) {
+    const raw = typeof serializedField === "string" ? JSON.parse(serializedField) : directField;
+    return reviveBridgePayload(raw);
   }
 
   async function handleBridgeCommand(_eventOrEnvelope, maybeEnvelope) {
@@ -384,19 +578,18 @@ function installRendererBridge(targetWindow, options = {}) {
         ? _eventOrEnvelope
         : null;
 
-    if (!cmdEnvelope || typeof cmdEnvelope !== "object") return;
-    if (!cmdEnvelope.reqId) return;
+    if (!cmdEnvelope || typeof cmdEnvelope !== "object" || !cmdEnvelope.reqId) {
+      return;
+    }
     if (ipcAuthToken && cmdEnvelope.__ipcToken !== ipcAuthToken) {
+      reportDiag("handleBridgeCommand.authRejected", new Error("IPC auth token mismatch"));
       return;
     }
 
     try {
       switch (cmdEnvelope.type) {
         case "invokeNt": {
-          const rawArgs =
-            typeof cmdEnvelope.argsSerialized === "string"
-              ? JSON.parse(cmdEnvelope.argsSerialized)
-              : cmdEnvelope.args;
+          const rawArgs = decodeCommandField(cmdEnvelope.argsSerialized, cmdEnvelope.args);
           const res = await invokeNtApi(
             cmdEnvelope.cmd,
             rawArgs,
@@ -411,10 +604,7 @@ function installRendererBridge(targetWindow, options = {}) {
         }
 
         case "simulateSession": {
-          const opts =
-            typeof cmdEnvelope.optsSerialized === "string"
-              ? JSON.parse(cmdEnvelope.optsSerialized)
-              : cmdEnvelope.opts;
+          const opts = decodeCommandField(cmdEnvelope.optsSerialized, cmdEnvelope.opts);
           const res = await simulateHumanSessionFlow(opts || {});
           sendCommandAck({
             reqId: cmdEnvelope.reqId,
@@ -425,10 +615,7 @@ function installRendererBridge(targetWindow, options = {}) {
         }
 
         case "leaveSession": {
-          const opts =
-            typeof cmdEnvelope.optsSerialized === "string"
-              ? JSON.parse(cmdEnvelope.optsSerialized)
-              : cmdEnvelope.opts;
+          const opts = decodeCommandField(cmdEnvelope.optsSerialized, cmdEnvelope.opts);
           const res = await leaveHumanSessionFlow(opts || {});
           sendCommandAck({
             reqId: cmdEnvelope.reqId,
@@ -439,10 +626,7 @@ function installRendererBridge(targetWindow, options = {}) {
         }
 
         case "syncSession": {
-          const patch =
-            typeof cmdEnvelope.patchSerialized === "string"
-              ? JSON.parse(cmdEnvelope.patchSerialized)
-              : cmdEnvelope.patch;
+          const patch = decodeCommandField(cmdEnvelope.patchSerialized, cmdEnvelope.patch);
           syncSessionState(patch || {});
           sendCommandAck({
             reqId: cmdEnvelope.reqId,
@@ -480,22 +664,41 @@ function installRendererBridge(targetWindow, options = {}) {
         }
       }
     } catch (err) {
+      reportDiag("handleBridgeCommand", err);
       const message = String(err?.message || err || "Renderer command failed");
       const code =
         err?.code !== undefined && err?.code !== null
           ? String(err.code)
-          : message.includes("ROSMONTIS_BRIDGE_UNAVAILABLE")
-          ? "ROSMONTIS_BRIDGE_UNAVAILABLE"
+          : message.includes(BRIDGE_UNAVAILABLE_TAG)
+          ? BRIDGE_UNAVAILABLE_TAG
           : "";
       sendCommandAck({
         reqId: cmdEnvelope.reqId,
         ok: false,
-        error: {
-          message,
-          code,
-        },
+        error: { message, code },
       });
     }
+  }
+
+  function removeChannelHandler(ipc, channel, handler, diagScope) {
+    if (!ipc || !handler) return false;
+    if (typeof ipc.removeListener === "function") {
+      try {
+        ipc.removeListener(channel, handler);
+      } catch (err) {
+        reportDiag(diagScope, err);
+      }
+      return true;
+    }
+    if (typeof ipc.off === "function") {
+      try {
+        ipc.off(channel, handler);
+      } catch (err) {
+        reportDiag(diagScope, err);
+      }
+      return true;
+    }
+    return false;
   }
 
   function attachChannelListener(channel, handler, force = false) {
@@ -504,15 +707,7 @@ function installRendererBridge(targetWindow, options = {}) {
     if (observedChannels.has(channel) && attachedIpcByChannel.get(channel) === ipc) {
       if (!force) return;
       const prevHandler = attachedHandlerByChannel.get(channel) || handler;
-      if (typeof ipc.removeListener === "function") {
-        try {
-          ipc.removeListener(channel, prevHandler);
-        } catch (_) {}
-      } else if (typeof ipc.off === "function") {
-        try {
-          ipc.off(channel, prevHandler);
-        } catch (_) {}
-      } else {
+      if (!removeChannelHandler(ipc, channel, prevHandler, "attachChannelListener.remove")) {
         return;
       }
     }
@@ -521,7 +716,9 @@ function installRendererBridge(targetWindow, options = {}) {
     attachedHandlerByChannel.set(channel, handler);
     try {
       ipc.on(channel, handler);
-    } catch (_) {}
+    } catch (err) {
+      reportDiag("attachChannelListener.on", err);
+    }
   }
 
   function attachPassiveListener(wid, force = false) {
@@ -535,16 +732,7 @@ function installRendererBridge(targetWindow, options = {}) {
   function detachAllListeners() {
     for (const [channel, ipc] of attachedIpcByChannel.entries()) {
       const handler = attachedHandlerByChannel.get(channel);
-      if (!ipc || !handler) continue;
-      if (typeof ipc.removeListener === "function") {
-        try {
-          ipc.removeListener(channel, handler);
-        } catch (_) {}
-      } else if (typeof ipc.off === "function") {
-        try {
-          ipc.off(channel, handler);
-        } catch (_) {}
-      }
+      removeChannelHandler(ipc, channel, handler, "detachAllListeners");
     }
     observedChannels.clear();
     attachedIpcByChannel.clear();
@@ -583,12 +771,12 @@ function installRendererBridge(targetWindow, options = {}) {
         );
       }
       return true;
-    } catch (_) {
+    } catch (err) {
+      reportDiag("registerNtApiListeners", err);
       return false;
     }
   }
 
-  // Attach passive listener on discovered windowId (and fallback 2 when windowId === 1) + command listener
   attachPassiveListener(windowId);
   if (windowId === 1) {
     attachPassiveListener(2);
@@ -613,8 +801,6 @@ function installRendererBridge(targetWindow, options = {}) {
       const globalProps = vueApp.config?.globalProperties || {};
       const router = globalProps.$router;
       const route = globalProps.$route;
-      const pinia = globalProps.$pinia;
-      const store = globalProps.$store;
       return {
         mounted: true,
         currentRoute:
@@ -623,10 +809,11 @@ function installRendererBridge(targetWindow, options = {}) {
           route?.fullPath ||
           route?.path ||
           "",
-        hasPinia: Boolean(pinia),
-        hasVuex: Boolean(store),
+        hasPinia: Boolean(globalProps.$pinia),
+        hasVuex: Boolean(globalProps.$store),
       };
-    } catch (_) {
+    } catch (err) {
+      reportDiag("inspectVueAppState", err);
       return { mounted: false };
     }
   }
@@ -635,7 +822,9 @@ function installRendererBridge(targetWindow, options = {}) {
     const ipc = resolveIpcRenderer();
     if (!ipc || (typeof ipc.send !== "function" && typeof ipc.invoke !== "function")) {
       // Tagged so the main process knows nothing was dispatched and fallback is safe.
-      throw new Error("ROSMONTIS_BRIDGE_UNAVAILABLE: Renderer ipcRenderer (send/invoke) is not available");
+      throw new Error(
+        `${BRIDGE_UNAVAILABLE_TAG}: Renderer ipcRenderer (send/invoke) is not available`
+      );
     }
     attachPassiveListener(windowId);
     attachCommandListener();
@@ -647,15 +836,15 @@ function installRendererBridge(targetWindow, options = {}) {
       eventName: "ntApi",
       peerId: windowId,
     };
-    const rawPayloadList =
-      args === undefined || args === null
+    const revivedArgs = reviveBridgePayload(args);
+    const payloadList =
+      revivedArgs === undefined || revivedArgs === null
         ? [null, null]
-        : Array.isArray(args)
-        ? args.length === 1
-          ? [args[0], null]
-          : [...args]
-        : [args, null];
-    const payloadList = rawPayloadList.map((item) => reviveBridgePayload(item));
+        : Array.isArray(revivedArgs)
+        ? revivedArgs.length === 1
+          ? [revivedArgs[0], null]
+          : [...revivedArgs]
+        : [revivedArgs, null];
     const requestPayload = {
       cmdName: cmd,
       cmdType: "invoke",
@@ -707,18 +896,22 @@ function installRendererBridge(targetWindow, options = {}) {
   }
 
   function rethrowIfBridgeUnavailable(err) {
-    if (err && String(err.message || err).includes("ROSMONTIS_BRIDGE_UNAVAILABLE")) {
+    if (err && String(err.message || err).includes(BRIDGE_UNAVAILABLE_TAG)) {
       throw err;
     }
   }
 
+  function snapshotSessionSummary() {
+    return {
+      activeAioPeer: sessionState.activeAioPeer,
+      activeAioPeerKey: sessionState.activeAioPeerKey,
+      focused: sessionState.focused,
+    };
+  }
+
   function syncSessionState(patch = {}) {
     if (!patch || typeof patch !== "object") {
-      return {
-        activeAioPeer: sessionState.activeAioPeer,
-        activeAioPeerKey: sessionState.activeAioPeerKey,
-        focused: sessionState.focused,
-      };
+      return snapshotSessionSummary();
     }
     if ("activeAioPeer" in patch && patch.activeAioPeer !== undefined) {
       sessionState.activeAioPeer = patch.activeAioPeer || null;
@@ -736,11 +929,139 @@ function installRendererBridge(targetWindow, options = {}) {
       sessionState.lastReadAtByPeer.clear();
       sessionState.lastTypingAtByPeer.clear();
     }
-    return {
-      activeAioPeer: sessionState.activeAioPeer,
-      activeAioPeerKey: sessionState.activeAioPeerKey,
-      focused: sessionState.focused,
-    };
+    return snapshotSessionSummary();
+  }
+
+  async function ensureWindowFocus(steps) {
+    if (sessionState.focused) {
+      steps.setFocusOnBase = true;
+      return;
+    }
+    try {
+      await invokeNtApi(
+        "nodeIKernelMsgService/setFocusOnBase",
+        [{ isFocus: true }, null],
+        SESSION_STEP_TIMEOUT_MS
+      );
+      steps.setFocusOnBase = true;
+      steps.focusActivated = true;
+      sessionState.focused = true;
+    } catch (err) {
+      rethrowIfBridgeUnavailable(err);
+      reportDiag("session.ensureWindowFocus", err);
+    }
+  }
+
+  async function switchActiveAio(peer, peerKey, steps) {
+    if (sessionState.activeAioPeerKey === peerKey) {
+      steps.alreadyInAio = true;
+      steps.enterOrExitAio = true;
+      steps.addActiveChatByUid = true;
+      return;
+    }
+
+    if (sessionState.activeAioPeer && sessionState.activeAioPeerKey) {
+      try {
+        await invokeNtApi(
+          "nodeIKernelMsgService/enterOrExitAio",
+          [{ info: { peer: sessionState.activeAioPeer, enterType: 2 } }, null],
+          SESSION_STEP_TIMEOUT_MS
+        );
+        steps.exitedPreviousAio = true;
+      } catch (err) {
+        rethrowIfBridgeUnavailable(err);
+        reportDiag("session.exitPreviousAio", err);
+      }
+    }
+
+    try {
+      await invokeNtApi(
+        "nodeIKernelMsgService/addActiveChatByUid",
+        [{ peer }, null],
+        SESSION_STEP_TIMEOUT_MS
+      );
+      steps.addActiveChatByUid = true;
+    } catch (err) {
+      rethrowIfBridgeUnavailable(err);
+      reportDiag("session.addActiveChatByUid", err);
+    }
+
+    try {
+      await invokeNtApi(
+        "nodeIKernelMsgService/enterOrExitAio",
+        [{ info: { peer, enterType: 1 } }, null],
+        SESSION_STEP_TIMEOUT_MS
+      );
+      steps.enterOrExitAio = true;
+    } catch (err) {
+      rethrowIfBridgeUnavailable(err);
+      reportDiag("session.enterAio", err);
+    }
+
+    sessionState.activeAioPeer = peer;
+    sessionState.activeAioPeerKey = peerKey;
+  }
+
+  async function applyReadAndTyping(
+    peer,
+    peerKey,
+    { markRead, sendTyping, eventType, dedupeWindowMs, bypassDedupe, readToTypingDelayMs },
+    steps
+  ) {
+    if (markRead) {
+      const lastReadAt = sessionState.lastReadAtByPeer.get(peerKey) || 0;
+      if (bypassDedupe || Date.now() - lastReadAt >= dedupeWindowMs) {
+        try {
+          await invokeNtApi(
+            "nodeIKernelMsgService/setMsgRead",
+            [{ peer }, null],
+            SESSION_STEP_TIMEOUT_MS
+          );
+          steps.markRead = true;
+          setBoundedMap(sessionState.lastReadAtByPeer, peerKey, Date.now());
+        } catch (err) {
+          rethrowIfBridgeUnavailable(err);
+          reportDiag("session.setMsgRead", err);
+        }
+      } else {
+        steps.markReadSkipped = true;
+      }
+    }
+
+    const isPrivateChat = peer.chatType === 1;
+    const pauseMs = Number(readToTypingDelayMs);
+    if (steps.markRead && sendTyping && isPrivateChat && Number.isFinite(pauseMs) && pauseMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    }
+
+    if (sendTyping && isPrivateChat) {
+      const effEventType = Number(eventType ?? 1);
+      const lastTypingAt = sessionState.lastTypingAtByPeer.get(peerKey) || 0;
+      if (bypassDedupe || effEventType !== 1 || Date.now() - lastTypingAt >= dedupeWindowMs) {
+        try {
+          await invokeNtApi(
+            "nodeIKernelMsgService/sendShowInputStatusReq",
+            [
+              {
+                eventType: effEventType,
+                peer: { chatType: 1, peerUid: peer.peerUid, guildId: "" },
+              },
+              null,
+            ],
+            SESSION_STEP_TIMEOUT_MS
+          );
+          steps.sendTyping = true;
+          if (effEventType === 1) {
+            setBoundedMap(sessionState.lastTypingAtByPeer, peerKey, Date.now());
+          }
+        } catch (err) {
+          rethrowIfBridgeUnavailable(err);
+          reportDiag("session.sendShowInputStatusReq", err);
+        }
+      } else {
+        steps.sendTypingSkipped = true;
+      }
+    }
   }
 
   async function leaveHumanSessionFlow({
@@ -756,13 +1077,8 @@ function installRendererBridge(targetWindow, options = {}) {
       focused: knownFocused,
     });
 
-    const result = {
-      exitedAio: false,
-      blurredWindow: false,
-      activeAioPeer: sessionState.activeAioPeer,
-      activeAioPeerKey: sessionState.activeAioPeerKey,
-      focused: sessionState.focused,
-    };
+    let exitedAio = false;
+    let blurredWindow = false;
 
     if (exitAio && sessionState.activeAioPeer && sessionState.activeAioPeerKey) {
       const prevPeer = sessionState.activeAioPeer;
@@ -771,20 +1087,13 @@ function installRendererBridge(targetWindow, options = {}) {
       try {
         await invokeNtApi(
           "nodeIKernelMsgService/enterOrExitAio",
-          [
-            {
-              info: {
-                peer: prevPeer,
-                enterType: 2,
-              },
-            },
-            null,
-          ],
-          4000
+          [{ info: { peer: prevPeer, enterType: 2 } }, null],
+          SESSION_STEP_TIMEOUT_MS
         );
-        result.exitedAio = true;
+        exitedAio = true;
       } catch (err) {
         rethrowIfBridgeUnavailable(err);
+        reportDiag("session.leaveAio", err);
       }
     }
 
@@ -794,18 +1103,20 @@ function installRendererBridge(targetWindow, options = {}) {
         await invokeNtApi(
           "nodeIKernelMsgService/setFocusOnBase",
           [{ isFocus: false }, null],
-          4000
+          SESSION_STEP_TIMEOUT_MS
         );
-        result.blurredWindow = true;
+        blurredWindow = true;
       } catch (err) {
         rethrowIfBridgeUnavailable(err);
+        reportDiag("session.blurWindow", err);
       }
     }
 
-    result.activeAioPeer = sessionState.activeAioPeer;
-    result.activeAioPeerKey = sessionState.activeAioPeerKey;
-    result.focused = sessionState.focused;
-    return result;
+    return {
+      exitedAio,
+      blurredWindow,
+      ...snapshotSessionSummary(),
+    };
   }
 
   async function simulateHumanSessionFlow({
@@ -833,9 +1144,8 @@ function installRendererBridge(targetWindow, options = {}) {
       peerUid: String(peerUid || ""),
       guildId: String(guildId || ""),
     };
-    const vueState = inspectVueAppState();
     const steps = {
-      vueState,
+      vueState: inspectVueAppState(),
       exitedPreviousAio: false,
       alreadyInAio: false,
       enterOrExitAio: false,
@@ -852,157 +1162,17 @@ function installRendererBridge(targetWindow, options = {}) {
       return steps;
     }
 
-    const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId}`;
-    const now = Date.now();
+    const peerKey = formatPeerKey(peer);
+    await ensureWindowFocus(steps);
+    await switchActiveAio(peer, peerKey, steps);
+    await applyReadAndTyping(
+      peer,
+      peerKey,
+      { markRead, sendTyping, eventType, dedupeWindowMs, bypassDedupe, readToTypingDelayMs },
+      steps
+    );
 
-    // 1. Causal step 1: bring window to foreground focus BEFORE touching chat list / AIO
-    if (!sessionState.focused) {
-      try {
-        await invokeNtApi(
-          "nodeIKernelMsgService/setFocusOnBase",
-          [{ isFocus: true }, null],
-          4000
-        );
-        steps.setFocusOnBase = true;
-        steps.focusActivated = true;
-        sessionState.focused = true;
-      } catch (err) {
-        rethrowIfBridgeUnavailable(err);
-      }
-    } else {
-      steps.setFocusOnBase = true;
-    }
-
-    // 2. Causal step 2: leave previous AIO (if any) -> addActiveChatByUid -> enterOrExitAio(1)
-    if (sessionState.activeAioPeerKey !== peerKey) {
-      if (sessionState.activeAioPeer && sessionState.activeAioPeerKey) {
-        try {
-          await invokeNtApi(
-            "nodeIKernelMsgService/enterOrExitAio",
-            [
-              {
-                info: {
-                  peer: sessionState.activeAioPeer,
-                  enterType: 2,
-                },
-              },
-              null,
-            ],
-            4000
-          );
-          steps.exitedPreviousAio = true;
-        } catch (err) {
-          rethrowIfBridgeUnavailable(err);
-        }
-      }
-
-      try {
-        await invokeNtApi(
-          "nodeIKernelMsgService/addActiveChatByUid",
-          [{ peer }, null],
-          4000
-        );
-        steps.addActiveChatByUid = true;
-      } catch (err) {
-        rethrowIfBridgeUnavailable(err);
-      }
-
-      try {
-        await invokeNtApi(
-          "nodeIKernelMsgService/enterOrExitAio",
-          [
-            {
-              info: {
-                peer,
-                enterType: 1,
-              },
-            },
-            null,
-          ],
-          4000
-        );
-        steps.enterOrExitAio = true;
-      } catch (err) {
-        rethrowIfBridgeUnavailable(err);
-      }
-
-      sessionState.activeAioPeer = peer;
-      sessionState.activeAioPeerKey = peerKey;
-    } else {
-      steps.alreadyInAio = true;
-      steps.enterOrExitAio = true;
-      steps.addActiveChatByUid = true;
-    }
-
-    // 3. Causal step 3: mark conversation read
-    if (markRead) {
-      const lastReadAt = sessionState.lastReadAtByPeer.get(peerKey) || 0;
-      if (bypassDedupe || now - lastReadAt >= dedupeWindowMs) {
-        try {
-          await invokeNtApi(
-            "nodeIKernelMsgService/setMsgRead",
-            [{ peer }, null],
-            4000
-          );
-          steps.markRead = true;
-          setBoundedMap(sessionState.lastReadAtByPeer, peerKey, Date.now());
-        } catch (err) {
-          rethrowIfBridgeUnavailable(err);
-        }
-      } else {
-        steps.markReadSkipped = true;
-      }
-    }
-
-    // Optional micro-pause between setMsgRead and sendShowInputStatusReq
-    const pauseMs = Number(readToTypingDelayMs);
-    if (
-      steps.markRead &&
-      sendTyping &&
-      Number(chatType) === 1 &&
-      Number.isFinite(pauseMs) &&
-      pauseMs > 0
-    ) {
-      await new Promise((r) => setTimeout(r, pauseMs));
-    }
-
-    // 4. Causal step 4: show typing indicator in private chat
-    if (sendTyping && Number(chatType) === 1) {
-      const effEventType = Number(eventType ?? 1);
-      const lastTypingAt = sessionState.lastTypingAtByPeer.get(peerKey) || 0;
-      if (bypassDedupe || effEventType !== 1 || Date.now() - lastTypingAt >= dedupeWindowMs) {
-        try {
-          await invokeNtApi(
-            "nodeIKernelMsgService/sendShowInputStatusReq",
-            [
-              {
-                eventType: effEventType,
-                peer: {
-                  chatType: 1,
-                  peerUid: peer.peerUid,
-                  guildId: "",
-                },
-              },
-              null,
-            ],
-            4000
-          );
-          steps.sendTyping = true;
-          if (effEventType === 1) {
-            setBoundedMap(sessionState.lastTypingAtByPeer, peerKey, Date.now());
-          }
-        } catch (err) {
-          rethrowIfBridgeUnavailable(err);
-        }
-      } else {
-        steps.sendTypingSkipped = true;
-      }
-    }
-
-    steps.activeAioPeer = sessionState.activeAioPeer;
-    steps.activeAioPeerKey = sessionState.activeAioPeerKey;
-    steps.focused = sessionState.focused;
-    return steps;
+    return Object.assign(steps, snapshotSessionSummary());
   }
 
   const bridgeApi = {
@@ -1051,12 +1221,26 @@ function installRendererBridge(targetWindow, options = {}) {
 if (typeof window !== "undefined") {
   try {
     installRendererBridge(window, { autoRegisterListeners: true });
-  } catch (_) {}
+  } catch (err) {
+    if (
+      window &&
+      window.__ROSMONTIS_DEBUG__ === true &&
+      typeof console !== "undefined" &&
+      typeof console.warn === "function"
+    ) {
+      console.warn("[Rosmontis:renderer:autoInstall]", err);
+    }
+  }
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     installRendererBridge,
     DEFAULT_REGISTERED_EVENTS,
+    KNOWN_MAP_FIELDS,
+    encodeBridgeMaps,
+    serializeBridgeResult,
+    reviveBridgePayload,
+    setBoundedMap,
   };
 }

@@ -5,8 +5,8 @@ set -euo pipefail
 # Rosmontis Pure-JS Bridge Installer (`scripts/install_bridge.sh`)
 #
 # Installs `bridge_onebot.js`, `bridge_renderer.js`, `bridge_main.js`,
-# `core/*.js`, `actions/*.js`, and `app_launcher_index.js` into
-# `/opt/QQ/resources/app/app_launcher/`, updates
+# `types.js`, `core/*.js`, `onebot/*.js`, `actions/*.js`, and
+# `app_launcher_index.js` into `/opt/QQ/resources/app/app_launcher/`, updates
 # `/opt/QQ/resources/app/package.json` `"main"` -> `"./app_launcher/index.js"`,
 # and verifies that no C++ `.so` memory hook (`LD_PRELOAD`) is active.
 #
@@ -35,8 +35,9 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f \
     "${LAUNCHER_DIR}/bridge_onebot.js" \
     "${LAUNCHER_DIR}/bridge_renderer.js" \
-    "${LAUNCHER_DIR}/bridge_main.js"
-  for subdir in core actions; do
+    "${LAUNCHER_DIR}/bridge_main.js" \
+    "${LAUNCHER_DIR}/types.js"
+  for subdir in core onebot actions; do
     rm -rf "${LAUNCHER_DIR}/${subdir}"
   done
   echo "[rosmontis] Uninstalled cleanly."
@@ -76,7 +77,7 @@ if [[ -f "${PACKAGE_JSON}" ]] && [[ ! -f "${QQ_APP_DIR}/package.orig.json" ]]; t
   echo "[rosmontis] Backed up original package.json -> package.orig.json"
 fi
 
-# 4. Copy pure-JS bridge files and core/*.js + actions/*.js modules into app_launcher/
+# 4. Copy pure-JS bridge files and core/*.js + onebot/*.js + actions/*.js modules into app_launcher/
 cp -f "${SRC_DIR}/bridge_onebot.js" "${LAUNCHER_DIR}/bridge_onebot.js"
 cp -f "${SRC_DIR}/bridge_renderer.js" "${LAUNCHER_DIR}/bridge_renderer.js"
 cp -f "${SRC_DIR}/bridge_main.js" "${LAUNCHER_DIR}/bridge_main.js"
@@ -88,7 +89,12 @@ chmod 644 \
   "${LAUNCHER_DIR}/bridge_main.js" \
   "${LAUNCHER_DIR}/index.js"
 
-for subdir in core actions; do
+if [[ -f "${SRC_DIR}/types.js" ]]; then
+  cp -f "${SRC_DIR}/types.js" "${LAUNCHER_DIR}/types.js"
+  chmod 644 "${LAUNCHER_DIR}/types.js"
+fi
+
+for subdir in core onebot actions; do
   if [[ -d "${SRC_DIR}/${subdir}" ]]; then
     rm -rf "${LAUNCHER_DIR}/${subdir}"
     mkdir -p "${LAUNCHER_DIR}/${subdir}"

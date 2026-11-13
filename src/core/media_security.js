@@ -9,6 +9,16 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { fileURLToPath } = require("url");
+const {
+  pickEnv,
+  pickPrefixedEnv,
+  collectPrefixedEnvValues,
+  isPrefixedEnvFlagOne,
+  getHomeDir,
+  getXdgConfigHome,
+  resolveTempDirFromEnv,
+  resolveConfigDirsFromEnv,
+} = require("./env");
 
 const DEFAULT_MAX_MEDIA_BYTES = 256 * 1024 * 1024;
 const HEADER_PEEK_BYTES = 65536;
@@ -143,9 +153,7 @@ function resolveMaxMediaBytes(options = {}) {
     options.maxMediaBytes !== null &&
     options.maxMediaBytes !== ""
       ? options.maxMediaBytes
-      : process.env.ROSMONTIS_MAX_MEDIA_BYTES ||
-        process.env.ONEBOT_MAX_MEDIA_BYTES ||
-        process.env.XIAO_BRIDGE_MAX_MEDIA_BYTES;
+      : pickPrefixedEnv("MAX_MEDIA_BYTES");
   const num = Number(candidate);
   return Number.isFinite(num) && num > 0 ? Math.floor(num) : DEFAULT_MAX_MEDIA_BYTES;
 }
@@ -375,14 +383,13 @@ function _resolveAllowPrivateUrls(options = {}) {
   if (options && (options.allowPrivateUrls === false || options.allowPrivateMediaUrls === false)) {
     return false;
   }
-  const envVal = String(
-    process.env.ROSMONTIS_ALLOW_PRIVATE_MEDIA_URLS ||
-      process.env.ROSMONTIS_ALLOW_PRIVATE_URLS ||
-      process.env.ONEBOT_ALLOW_PRIVATE_MEDIA_URLS ||
-      process.env.XIAO_BRIDGE_ALLOW_PRIVATE_MEDIA_URLS ||
-      ""
-  ).trim();
-  return envVal === "1" || envVal.toLowerCase() === "true";
+  const envVal = pickEnv(
+    "ROSMONTIS_ALLOW_PRIVATE_MEDIA_URLS",
+    "ROSMONTIS_ALLOW_PRIVATE_URLS",
+    "ONEBOT_ALLOW_PRIVATE_MEDIA_URLS",
+    "XIAO_BRIDGE_ALLOW_PRIVATE_MEDIA_URLS"
+  ).toLowerCase();
+  return envVal === "1" || envVal === "true";
 }
 
 function createSsrfSafeLookup(options = {}, allowPrivateUrls = undefined) {
@@ -640,13 +647,7 @@ async function downloadBufferFromUrl(urlStr, timeoutOrOptions = 20000, redirects
 }
 
 async function downloadMediaStreamToTempDir(urlStr, tempDir, options = {}) {
-  const targetTempDir =
-    tempDir ||
-    options.tempDir ||
-    process.env.ROSMONTIS_TEMP_DIR ||
-    process.env.ONEBOT_TEMP_DIR ||
-    process.env.XIAO_BRIDGE_TEMP_DIR ||
-    path.join(process.env.HOME || os.tmpdir(), ".rosmontis_tmp");
+  const targetTempDir = resolveTempDirFromEnv(tempDir || options?.tempDir);
   await fs.promises.mkdir(targetTempDir, { recursive: true, mode: 0o700 });
 
   const { timeoutMs, redirectsLeft, maxMediaBytes, allowPrivateUrls } = _normalizeDownloadArgs(options);
@@ -944,15 +945,11 @@ async function _expandDirCandidates(rawDirs, preferRealOnly = false) {
 }
 
 function _getConfiguredConfigDirs() {
-  return [
-    process.env.ROSMONTIS_CONFIG_DIR,
-    process.env.ONEBOT_CONFIG_DIR,
-    process.env.XIAO_BRIDGE_CONFIG_DIR,
-  ].filter(Boolean);
+  return resolveConfigDirsFromEnv();
 }
 
 function _getBlacklistedLocalDirs() {
-  const homeDir = process.env.HOME || os.homedir();
+  const homeDir = getHomeDir();
   const sysHome = os.homedir();
   const configuredCfgDirs = _getConfiguredConfigDirs();
   return [
@@ -1084,11 +1081,7 @@ function _splitAllowedDirsList(rawInput) {
 }
 
 function _getWhitelistedLocalDirs(tempDir, options = {}) {
-  const envAllowed = _splitAllowedDirsList([
-    process.env.ROSMONTIS_ALLOWED_FILE_DIRS,
-    process.env.ONEBOT_ALLOWED_FILE_DIRS,
-    process.env.XIAO_BRIDGE_ALLOWED_FILE_DIRS,
-  ]);
+  const envAllowed = _splitAllowedDirsList(collectPrefixedEnvValues("ALLOWED_FILE_DIRS"));
   const optAllowed = _splitAllowedDirsList(options.allowedFileDirs);
   // Note: raw os.tmpdir() and root ~/.config/QQ are intentionally NOT blanket-whitelisted;
   // ~/.config/QQ only permits RichMedia cache subdirectories via _isAllowedQqMediaCachePath().
@@ -1096,9 +1089,9 @@ function _getWhitelistedLocalDirs(tempDir, options = {}) {
 }
 
 function _getQqProfileRoots() {
-  const homeDir = process.env.HOME || os.homedir();
+  const homeDir = getHomeDir();
   const sysHome = os.homedir();
-  const xdgConfig = process.env.XDG_CONFIG_HOME || "";
+  const xdgConfig = getXdgConfigHome();
   return [
     xdgConfig ? path.join(xdgConfig, "QQ") : "",
     homeDir ? path.join(homeDir, ".config/QQ") : "",
@@ -1140,12 +1133,7 @@ async function resolveMediaSource(sourceStr, options = {}) {
     throw new Error("Empty media source");
   }
   const maxMediaBytes = resolveMaxMediaBytes(options);
-  const tempDir =
-    options.tempDir ||
-    process.env.ROSMONTIS_TEMP_DIR ||
-    process.env.ONEBOT_TEMP_DIR ||
-    process.env.XIAO_BRIDGE_TEMP_DIR ||
-    path.join(process.env.HOME || os.tmpdir(), ".rosmontis_tmp");
+  const tempDir = resolveTempDirFromEnv(options?.tempDir);
   await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
   const maxTempFiles = Math.max(8, Number(options.maxTempFiles || 128));
 
@@ -1238,9 +1226,7 @@ async function resolveMediaSource(sourceStr, options = {}) {
 
   const allowArbitraryLocalFiles =
     options.allowArbitraryLocalFiles === true ||
-    process.env.ROSMONTIS_ALLOW_ARBITRARY_LOCAL_FILES === "1" ||
-    process.env.ONEBOT_ALLOW_ARBITRARY_LOCAL_FILES === "1" ||
-    process.env.XIAO_BRIDGE_ALLOW_ARBITRARY_LOCAL_FILES === "1";
+    isPrefixedEnvFlagOne("ALLOW_ARBITRARY_LOCAL_FILES");
 
   const resolvedInput = path.resolve(localPath);
   const configuredCfgDirs =

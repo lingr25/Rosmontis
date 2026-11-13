@@ -5,11 +5,53 @@ const path = require("path");
 const crypto = require("crypto");
 
 const { verifyAccessTokenConstantTime } = require("./transport_security");
+const {
+  safeJsJson,
+  serializeBridgePayload,
+  reviveBridgePayload,
+  setBoundedMap,
+} = require("./primitives");
+const { isQuietLogsEnabled } = require("./env");
 
-function safeJsJson(val) {
-  const raw = JSON.stringify(val);
-  if (typeof raw !== "string") return "undefined";
-  return raw.replace(/[<>&\u2028\u2029]/g, (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+function _reviveUint8Arrays(val) {
+  if (val === null || val === undefined || typeof val !== "object") {
+    return val;
+  }
+  if (
+    val instanceof Uint8Array ||
+    (typeof Buffer !== "undefined" && Buffer.isBuffer(val)) ||
+    ArrayBuffer.isView(val)
+  ) {
+    return val;
+  }
+  if (val instanceof Map) {
+    const out = new Map();
+    for (const [k, v] of val.entries()) {
+      out.set(_reviveUint8Arrays(k), _reviveUint8Arrays(v));
+    }
+    return out;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => _reviveUint8Arrays(item));
+  }
+  if (Array.isArray(val.__rosmontisUint8Array__) && Object.keys(val).length === 1) {
+    return Uint8Array.from(val.__rosmontisUint8Array__);
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(val)) {
+    const nextVal = _reviveUint8Arrays(v);
+    if (k === "__proto__") {
+      Object.defineProperty(out, k, {
+        value: nextVal,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    } else {
+      out[k] = nextVal;
+    }
+  }
+  return out;
 }
 
 const SERVICE_GETTER_MAP = {
@@ -215,7 +257,7 @@ const rendererIpcMixin = {
           val = ack.resultSerialized;
         }
       }
-      pending.resolve(this._reviveBridgePayload(val));
+      pending.resolve(this._reviveBridgeResult(val));
     } else {
       const errMsg = String(ack.error?.message || ack.error || "Renderer bridge command failed");
       const err = new Error(errMsg);
@@ -589,36 +631,16 @@ const rendererIpcMixin = {
     };
   },
 
+  _reviveBridgeResult(val) {
+    return _reviveUint8Arrays(reviveBridgePayload(val));
+  },
+
   _reviveBridgePayload(val) {
-    if (val === null || val === undefined || typeof val !== "object") {
-      return val;
-    }
-    if (val instanceof Map || val instanceof Uint8Array || Buffer.isBuffer(val)) {
-      return val;
-    }
-    if (Array.isArray(val)) {
-      return val.map((item) => this._reviveBridgePayload(item));
-    }
-    if (val.__rosmontisVoid__ === true && Object.keys(val).length === 1) {
-      return undefined;
-    }
-    if (Array.isArray(val.__rosmontisMap__) && Object.keys(val).length === 1) {
-      return new Map(
-        val.__rosmontisMap__.map((entry) => [
-          Array.isArray(entry) ? this._reviveBridgePayload(entry[0]) : undefined,
-          Array.isArray(entry) ? this._reviveBridgePayload(entry[1]) : undefined,
-        ])
-      );
-    }
-    const out = {};
-    for (const [k, v] of Object.entries(val)) {
-      out[k] = this._reviveBridgePayload(v);
-    }
-    return out;
+    return this._reviveBridgeResult(val);
   },
 
   _handleRendererForwardedEvent(rawData) {
-    const data = this._reviveBridgePayload(rawData);
+    const data = this._reviveBridgeResult(rawData);
     if (!data || typeof data !== "object") return;
     const cmdName = String(data.cmdName || "");
     const eventName = String(data.eventName || "");
@@ -634,18 +656,12 @@ const rendererIpcMixin = {
     }
   },
 
+  _serializeBridgeArgs(value) {
+    return serializeBridgePayload(value);
+  },
+
   _serializeBridgePayload(value) {
-    const raw = JSON.stringify(value, (_key, val) => {
-      if (val instanceof Map) {
-        return { __rosmontisMap__: Array.from(val.entries()) };
-      }
-      if (typeof val === "bigint") {
-        return val.toString();
-      }
-      return val;
-    });
-    if (typeof raw !== "string") return "undefined";
-    return raw.replace(/[<>&\u2028\u2029]/g, (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+    return serializeBridgePayload(value);
   },
 
   async _invokeRendererCommand(type, cmdPayload = {}, timeoutMs = 15000) {
@@ -714,7 +730,7 @@ const rendererIpcMixin = {
         const argsJson =
           typeof cmdPayload.argsSerialized === "string"
             ? cmdPayload.argsSerialized
-            : this._serializeBridgePayload(cmdPayload.args ?? [null, null]);
+            : this._serializeBridgeArgs(cmdPayload.args ?? [null, null]);
         const notReady = this._safeJsJson(`${BRIDGE_UNAVAILABLE_TAG}: Renderer bridge not ready`);
         js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized(${cmdJson}, ${argsJson}) : (window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi(${cmdJson}, ${argsJson}) : Promise.reject(new Error(${notReady}))`;
       } else if (type === "simulateSession") {
@@ -734,12 +750,12 @@ const rendererIpcMixin = {
       const rawRes = await wc.executeJavaScript(js, true);
       if (typeof rawRes === "string" && type === "invokeNt") {
         try {
-          return this._reviveBridgePayload(JSON.parse(rawRes));
+          return this._reviveBridgeResult(JSON.parse(rawRes));
         } catch (_) {
           return rawRes;
         }
       }
-      return this._reviveBridgePayload(rawRes);
+      return this._reviveBridgeResult(rawRes);
     }
 
     throw makeBridgeUnavailableError("no live renderer command transport");
@@ -752,25 +768,44 @@ const rendererIpcMixin = {
       stats.degraded += 1;
       stats.lastDegraded = { cmd, tier, at: Date.now() };
       const reason = prevErrors.length > 0 ? String(prevErrors[0]?.message || prevErrors[0]) : "";
-      this._logWarn(
+      this._logInvokeWarning(
         `degrade:${cmd}:${tier}`,
         `invokeNt degraded to Tier ${tier} for ${cmd}${reason ? ` (after: ${reason.slice(0, 200)})` : ""}`
       );
     }
   },
 
-  _logWarn(key, message, intervalMs = 60000) {
-    if (
-      process.env.ROSMONTIS_QUIET === "1" ||
-      process.env.XIAO_BRIDGE_QUIET === "1" ||
-      this.config?.quietLogs
-    ) {
+  _logInvokeWarning(key, message) {
+    if (this.logger && typeof this.logger.warnThrottled === "function") {
+      this.logger.warnThrottled(key, `WARN: ${message}`, 60000);
       return;
     }
+    if (isQuietLogsEnabled(this.config)) return;
     const now = Date.now();
-    const last = this._logThrottle.get(key) || 0;
-    if (now - last < intervalMs) return;
-    this._setBoundedMap(this._logThrottle, key, now, 500);
+    if (!this._logThrottle) {
+      this._logThrottle = new Map();
+    }
+    const last = this._logThrottle.get(key);
+    if (last !== undefined && now - last < 60000) return;
+    setBoundedMap(this._logThrottle, key, now, 500);
+    try {
+      process.stderr.write(`[rosmontis] WARN: ${message}\n`);
+    } catch (_) {}
+  },
+
+  _logWarn(key, message, intervalMs = 60000) {
+    if (this.logger && typeof this.logger.warnThrottled === "function") {
+      this.logger.warnThrottled(key, message, intervalMs);
+      return;
+    }
+    if (isQuietLogsEnabled(this.config)) return;
+    const now = Date.now();
+    if (!this._logThrottle) {
+      this._logThrottle = new Map();
+    }
+    const last = this._logThrottle.get(key);
+    if (last !== undefined && now - last < intervalMs) return;
+    setBoundedMap(this._logThrottle, key, now, 500);
     try {
       process.stderr.write(`[rosmontis] ${message}\n`);
     } catch (_) {}
@@ -793,7 +828,7 @@ const rendererIpcMixin = {
       errors.push(err);
       if (sideEffect && !isBridgeUnavailableError(err)) {
         this.invokeStats.blockedReplays += 1;
-        this._logWarn(
+        this._logInvokeWarning(
           `blocked:${cmd}`,
           `invokeNt not replaying side-effect ${cmd} after dispatched failure: ${String(err?.message || err).slice(0, 200)}`
         );
@@ -807,13 +842,13 @@ const rendererIpcMixin = {
       try {
         const res = await this.rendererExecute(cmd, [payload, null]);
         this._recordInvokeTier(cmd, 1, errors);
-        return this._reviveBridgePayload(res);
+        return this._reviveBridgeResult(res);
       } catch (e) {
         if (stopAfterDispatchedFailure(e)) throw e;
       }
     } else if (this._canInvokeRenderer(this.activeWebContents)) {
       try {
-        const argsSerialized = this._serializeBridgePayload([payload, null]);
+        const argsSerialized = this._serializeBridgeArgs([payload, null]);
         const res = await this._invokeRendererCommand("invokeNt", {
           cmd,
           argsSerialized,

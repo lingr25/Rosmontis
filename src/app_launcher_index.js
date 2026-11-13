@@ -12,13 +12,10 @@
  */
 
 const path = require("path");
+const { isBridgeDisabledFromEnv, isTestModeFromEnv } = require("./core/env");
 
 function bootBridgeMain() {
-  if (
-    process.env.ROSMONTIS_DISABLE === "1" ||
-    process.env.ROSMONTIS_BRIDGE_DISABLE === "1" ||
-    process.env.XIAO_BRIDGE_DISABLE === "1"
-  ) {
+  if (isBridgeDisabledFromEnv()) {
     return null;
   }
   try {
@@ -50,10 +47,7 @@ function loadOfficialInternalIndex(targetModule, majorNodeLoader) {
   return loader.load("internal_index", targetModule || module);
 }
 
-if (
-  process.env.ROSMONTIS_TEST_MODE !== "1" &&
-  process.env.XIAO_BRIDGE_TEST_MODE !== "1"
-) {
+if (!isTestModeFromEnv()) {
   bootBridgeMain();
   loadOfficialInternalIndex(module);
 }

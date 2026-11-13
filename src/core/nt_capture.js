@@ -1,5 +1,7 @@
 "use strict";
 
+const { isPrefixedEnvFlagOne } = require("./env");
+
 // Native `Map.prototype.set`, captured at module load before any bridge hook is installed.
 const NATIVE_MAP_SET = Map.prototype.set;
 
@@ -37,7 +39,10 @@ const ntCaptureMixin = {
         MAP_HOOK_STATE.inspecting = true;
         try {
           owner._inspectMapEntry(this, k, v);
-        } catch (_) {
+        } catch (err) {
+          try {
+            owner.logger?.debug?.("nt_capture", err);
+          } catch (_) {}
         } finally {
           MAP_HOOK_STATE.inspecting = false;
         }
@@ -55,9 +60,8 @@ const ntCaptureMixin = {
 
   _mapHookReleaseDisabled() {
     return (
-      process.env.ROSMONTIS_KEEP_MAP_HOOK === "1" ||
-      process.env.XIAO_BRIDGE_KEEP_MAP_HOOK === "1" ||
-      this.config?.keepMapHook === true
+      Boolean(this.config && this.config.keepMapHook) ||
+      isPrefixedEnvFlagOne("KEEP_MAP_HOOK")
     );
   },
 
@@ -81,7 +85,9 @@ const ntCaptureMixin = {
           (typeof cs.ntApi["nodeIKernelMsgService/sendMsg"] === "function" ||
             (cs.ntApi.invoke && typeof cs.ntApi.invoke["nodeIKernelMsgService/sendMsg"] === "function"))
       );
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
     return hasNtApi && Boolean(cs.ntStore) && Boolean(cs.wrapperSession || cs.ntSessionManager);
   },
 
@@ -119,7 +125,9 @@ const ntCaptureMixin = {
       Map.prototype.set = MAP_HOOK_STATE.orig;
       try {
         delete Map.prototype.__rosmontisBridgeHooked__;
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("nt_capture", err);
+      }
       restored = true;
     }
     // If something wrapped Map.prototype.set on top of us we can not unlink safely; with no
@@ -134,13 +142,14 @@ const ntCaptureMixin = {
     if (!this.capturedServices.ntApi) missing.push("ntApi");
     if (!this.capturedServices.ntStore) missing.push("ntStore");
     if (!this.capturedServices.wrapperSession && !this.capturedServices.ntSessionManager) missing.push("session");
-    this._logWarn(
-      "map-hook-release",
-      `Map.prototype.set hook released (reason=${reason}, restored=${restored}${
-        missing.length ? `, missing=${missing.join("/")}` : ""
-      })`,
-      0
-    );
+    const releaseMsg = `Map.prototype.set hook released (reason=${reason}, restored=${restored}${
+      missing.length ? `, missing=${missing.join("/")}` : ""
+    })`;
+    if (typeof this._logWarn === "function") {
+      this._logWarn("map-hook-release", releaseMsg, 0);
+    } else {
+      this.logger?.warnThrottled?.("map-hook-release", releaseMsg, 0);
+    }
     return restored;
   },
 
@@ -159,7 +168,11 @@ const ntCaptureMixin = {
               self._restoreModuleLoad();
             }
           }
-        } catch (_) {}
+        } catch (err) {
+          try {
+            self.logger?.debug?.("nt_capture", err);
+          } catch (_) {}
+        }
         return exp;
       };
       Object.defineProperty(wrappedLoad, "__rosmontisWrapperHooked__", {
@@ -168,7 +181,9 @@ const ntCaptureMixin = {
       });
       Module._load = wrappedLoad;
       this._moduleLoadHook = { Module, origLoad, wrappedLoad };
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
   },
 
   _restoreModuleLoad() {
@@ -206,7 +221,9 @@ const ntCaptureMixin = {
             };
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("nt_capture", err);
+      }
     }
     return true;
   },
@@ -283,10 +300,16 @@ const ntCaptureMixin = {
           currentCache = newVal;
           try {
             self._inspectInversifyCache(newVal);
-          } catch (_) {}
+          } catch (err) {
+            try {
+              self.logger?.debug?.("nt_capture", err);
+            } catch (_) {}
+          }
         },
       });
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
   },
 
   _updateSelfIdentity({ uin, uid, nick, markOnline = false } = {}) {
@@ -384,10 +407,16 @@ const ntCaptureMixin = {
                   markOnline: true,
                 });
               }
-            } catch (_) {}
+            } catch (err) {
+              try {
+                self.logger?.debug?.("nt_capture", err);
+              } catch (_) {}
+            }
             return origInitPool.apply(this, [authInfo, ...rest]);
           };
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("nt_capture", err);
+        }
       }
     }
 
@@ -430,10 +459,16 @@ const ntCaptureMixin = {
             if (listenerName && emitter) {
               self._attachKernelListenerEmitter(String(listenerName), emitter);
             }
-          } catch (_) {}
+          } catch (err) {
+            try {
+              self.logger?.debug?.("nt_capture", err);
+            } catch (_) {}
+          }
           return res;
         };
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("nt_capture", err);
+      }
     }
     this._maybeScheduleMapHookRelease();
   },
@@ -456,11 +491,17 @@ const ntCaptureMixin = {
             if (typeof k === "string" && v) {
               self._attachKernelListenerEmitter(k, v);
             }
-          } catch (_) {}
+          } catch (err) {
+            try {
+              self.logger?.debug?.("nt_capture", err);
+            } catch (_) {}
+          }
           return res;
         },
       });
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
   },
 
   _attachNtStoreRootEmitter(emitter) {
@@ -480,7 +521,11 @@ const ntCaptureMixin = {
             self._handleKernelEvent(listenerName, shortEvent, args);
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        try {
+          self.logger?.debug?.("nt_capture", err);
+        } catch (_) {}
+      }
       return origEmit.apply(this, [fullEventName, ...args]);
     };
   },
@@ -489,7 +534,9 @@ const ntCaptureMixin = {
     if (!mgr || mgr.__rosmontisHooked__) return;
     try {
       Object.defineProperty(mgr, "__rosmontisHooked__", { value: true, enumerable: false });
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
 
     if (mgr.ntStore) {
       this._inspectNtStore(mgr.ntStore);
@@ -533,7 +580,11 @@ const ntCaptureMixin = {
       emitterOrMap.emit = function (eventName, ...args) {
         try {
           self._handleKernelEvent(listenerName, String(eventName), args);
-        } catch (_) {}
+        } catch (err) {
+          try {
+            self.logger?.debug?.("nt_capture", err);
+          } catch (_) {}
+        }
         return origEmit.apply(this, [eventName, ...args]);
       };
     }

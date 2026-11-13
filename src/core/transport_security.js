@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { isPrefixedEnvFlagOne } = require("./env");
 
 const DEFAULT_MAX_HTTP_BODY_BYTES = 10 * 1024 * 1024; // 10 MiB
 const DEFAULT_MAX_WS_PAYLOAD_BYTES = 16 * 1024 * 1024; // 16 MiB
@@ -119,9 +120,7 @@ function enforceProtectedModeOnServers(serverEntries, globalConfig = {}, onWarn 
   const cfg = globalConfig && typeof globalConfig === "object" ? globalConfig : {};
   const allowUnauthenticatedPublic =
     cfg.allowUnauthenticatedPublicBind === true ||
-    process.env.ROSMONTIS_ALLOW_UNAUTHENTICATED_PUBLIC === "1" ||
-    process.env.ONEBOT_ALLOW_UNAUTHENTICATED_PUBLIC === "1" ||
-    process.env.XIAO_BRIDGE_ALLOW_UNAUTHENTICATED_PUBLIC === "1";
+    isPrefixedEnvFlagOne("ALLOW_UNAUTHENTICATED_PUBLIC");
 
   if (!Array.isArray(serverEntries) || serverEntries.length === 0 || allowUnauthenticatedPublic) {
     return { protectedCount: 0, generatedToken: cfg._generatedProtectedToken || null };

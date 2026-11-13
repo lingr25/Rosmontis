@@ -2,12 +2,17 @@
 
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 
 const {
   normalizeOneBotMessage,
   oneBotSegmentsToNtElements,
 } = require("../bridge_onebot");
+const {
+  EchoCorrelator,
+  _ntElementsSignature,
+  _elementsSignatureMatch,
+  hasRichMediaElements,
+} = require("./echo_correlator");
 
 const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
 
@@ -47,143 +52,29 @@ function isBridgeUnavailableError(err) {
   return Boolean(err && (err.code === BRIDGE_UNAVAILABLE_TAG || err[BRIDGE_UNAVAILABLE_TAG]));
 }
 
-// --------------------------------------------------------------------------
-// Outbound message echo correlation (sendMsg result <-> onAddSendMsg msgRecord)
-//
-// NTQQ `sendMsg` usually resolves with `{ result, errMsg }` only; the real 64-bit msgId of
-// the outgoing message is delivered via `nodeIKernelMsgListener/onAddSendMsg`. Waiters are
-// registered per peer BEFORE dispatching sendMsg (the echo may arrive before sendMsg
-// resolves) and matched FIFO, skipping candidates whose plain text clearly differs.
-// --------------------------------------------------------------------------
-
-function _ntElementsSignature(elements) {
-  const parts = [];
-  let text = "";
-  if (Array.isArray(elements)) {
-    for (const el of elements) {
-      if (!el || typeof el !== "object") continue;
-      const type = Number(el.elementType || 0);
-      if (type === 1 && el.textElement) {
-        const atType = Number(el.textElement.atType || 0);
-        if (atType === 0) {
-          const chunk = String(el.textElement.content || "");
-          if (!chunk) continue;
-          text += chunk;
-          const prev = parts[parts.length - 1];
-          if (prev && prev.kind === "text") {
-            prev.text += chunk;
-          } else {
-            parts.push({ kind: "text", text: chunk });
-          }
-        } else {
-          parts.push({
-            kind: "at",
-            atType,
-            uid: String(el.textElement.atNtUid || ""),
-            uin: String(el.textElement.atUid || ""),
-          });
-        }
-      } else if (type === 2 && el.picElement) {
-        parts.push({
-          kind: "pic",
-          md5: String(el.picElement.md5HexStr || "").toLowerCase(),
-          subType: Number(el.picElement.picSubType || 0),
-          name: String(el.picElement.fileName || ""),
-        });
-      } else if (type === 3 && el.fileElement) {
-        parts.push({
-          kind: "file",
-          md5: String(el.fileElement.fileMd5 || "").toLowerCase(),
-          name: String(el.fileElement.fileName || ""),
-        });
-      } else if (type === 4 && el.pttElement) {
-        parts.push({
-          kind: "ptt",
-          md5: String(el.pttElement.md5HexStr || "").toLowerCase(),
-          name: String(el.pttElement.fileName || ""),
-        });
-      } else if (type === 5 && el.videoElement) {
-        parts.push({
-          kind: "video",
-          md5: String(el.videoElement.videoMd5 || "").toLowerCase(),
-          name: String(el.videoElement.fileName || ""),
-        });
-      } else if (type === 6 && el.faceElement) {
-        parts.push({
-          kind: "face",
-          faceType: Number(el.faceElement.faceType || 0),
-          faceIndex: Number(el.faceElement.faceIndex || 0),
-          pokeType: Number(el.faceElement.pokeType || 0),
-        });
-      } else if (type === 7 && el.replyElement) {
-        parts.push({
-          kind: "reply",
-          msgId: String(el.replyElement.replayMsgId || "0"),
-          msgSeq: String(el.replyElement.replayMsgSeq || "0"),
-        });
-      } else if (type === 10 && el.arkElement) {
-        parts.push({
-          kind: "ark",
-          data: String(el.arkElement.bytesData || ""),
-        });
-      } else if (type === 11 && el.marketFaceElement) {
-        parts.push({
-          kind: "mface",
-          emojiId: String(el.marketFaceElement.emojiId || ""),
-        });
-      } else if (type > 0) {
-        parts.push({ kind: `el:${type}` });
-      }
-    }
-  }
-  return { text: text.trim(), parts };
-}
-
-function _elementsSignatureMatch(expected, actual) {
-  const aList = expected?.parts;
-  const bList = actual?.parts;
-  if (!Array.isArray(aList) || !Array.isArray(bList)) return false;
-  if (aList.length === 0 || aList.length !== bList.length) return false;
-  for (let i = 0; i < aList.length; i++) {
-    const a = aList[i];
-    const b = bList[i];
-    if (!a || !b || a.kind !== b.kind) return false;
-    if (a.kind === "text") {
-      if (a.text.trim() !== b.text.trim()) return false;
-      if (!a.text.trim() && a.text !== b.text) return false;
-    } else if (a.kind === "at") {
-      if (a.atType !== b.atType) return false;
-      if (a.uid && b.uid) {
-        if (a.uid !== b.uid) return false;
-      } else if (a.uin && b.uin && a.uin !== b.uin) {
-        return false;
-      }
-    } else if (a.kind === "pic" || a.kind === "file" || a.kind === "ptt" || a.kind === "video") {
-      if (a.md5 && b.md5) {
-        if (a.md5 !== b.md5) return false;
-      } else if (a.name && b.name && a.name !== b.name) {
-        return false;
-      }
-    } else if (a.kind === "face") {
-      if (a.faceType !== b.faceType || a.faceIndex !== b.faceIndex || a.pokeType !== b.pokeType) {
-        return false;
-      }
-    } else if (a.kind === "reply") {
-      if (a.msgId !== "0" && b.msgId !== "0") {
-        if (a.msgId !== b.msgId) return false;
-      } else if (a.msgSeq !== "0" && b.msgSeq !== "0" && a.msgSeq !== b.msgSeq) {
-        return false;
-      }
-    } else if (a.kind === "ark") {
-      if (a.data !== b.data) return false;
-    } else if (a.kind === "mface") {
-      if (a.emojiId !== b.emojiId) return false;
-    }
-  }
-  return true;
-}
-
 const outboundPipelineMixin = {
+  _ensureEchoCorrelator() {
+    if (!this.echoCorrelator) {
+      this.echoCorrelator = new EchoCorrelator({
+        getSignatureFns: () => ({
+          _ntElementsSignature: this?.constructor?._ntElementsSignature,
+          _elementsSignatureMatch: this?.constructor?._elementsSignatureMatch,
+        }),
+      });
+      if (this._sendEchoWaiters instanceof Map) {
+        this.echoCorrelator.waiters = this._sendEchoWaiters;
+      } else {
+        this._sendEchoWaiters = this.echoCorrelator.waiters;
+      }
+      if (this.sendEchoStats && typeof this.sendEchoStats === "object") {
+        this.echoCorrelator.stats = this.sendEchoStats;
+      } else {
+        this.sendEchoStats = this.echoCorrelator.stats;
+      }
+    }
+    return this.echoCorrelator;
+  },
+
   async _resolvePeerForUser(userId, groupId) {
     const uinStr = String(userId || "").trim();
     const uid = await this.uinUidStore.resolveUid(uinStr, this.invokeNt.bind(this));
@@ -265,140 +156,23 @@ const outboundPipelineMixin = {
   },
 
   _sendPeerKey(peer) {
-    return `${Number(peer?.chatType) || 0}:${String(peer?.peerUid || "")}`;
+    return this._ensureEchoCorrelator().peerKey(peer);
   },
 
   _registerSendEchoWaiter(peer, elements, elementPredicate = null) {
-    const key = this._sendPeerKey(peer);
-    const sigFn =
-      typeof this?.constructor?._ntElementsSignature === "function"
-        ? this.constructor._ntElementsSignature
-        : _ntElementsSignature;
-    const hasPredicate = typeof elementPredicate === "function";
-    const waiter = {
-      sig: hasPredicate ? null : sigFn(elements),
-      elementPredicate: hasPredicate ? elementPredicate : null,
-      echo: null,
-      resolve: null,
-      done: false,
-    };
-    const queue = this._sendEchoWaiters.get(key) || [];
-    queue.push(waiter);
-    while (queue.length > 32) {
-      const stale = queue.shift();
-      stale.done = true;
-      if (stale.resolve) stale.resolve(null);
-    }
-    this._sendEchoWaiters.set(key, queue);
-
-    const remove = () => {
-      const q = this._sendEchoWaiters.get(key);
-      if (!q) return;
-      const idx = q.indexOf(waiter);
-      if (idx >= 0) q.splice(idx, 1);
-      if (q.length === 0) this._sendEchoWaiters.delete(key);
-    };
-
-    return {
-      wait: (timeoutMs) => {
-        if (waiter.echo || waiter.done) {
-          waiter.done = true;
-          remove();
-          return Promise.resolve(waiter.echo);
-        }
-        return new Promise((resolve) => {
-          const timer = setTimeout(() => {
-            waiter.done = true;
-            waiter.resolve = null;
-            remove();
-            resolve(null);
-          }, Math.max(0, Number(timeoutMs) || 0));
-          // Intentionally NOT unref'd: the caller is awaiting this bounded timer.
-          waiter.resolve = (echo) => {
-            clearTimeout(timer);
-            waiter.done = true;
-            waiter.resolve = null;
-            remove();
-            resolve(echo);
-          };
-        });
-      },
-      cancel: () => {
-        waiter.done = true;
-        waiter.resolve = null;
-        remove();
-      },
-    };
+    return this._ensureEchoCorrelator().register(peer, elements, elementPredicate);
   },
 
   _matchSendEcho(ntMsg) {
-    if (!ntMsg || !ntMsg.msgId || String(ntMsg.msgId) === "0") return false;
-    const key = this._sendPeerKey({ chatType: ntMsg.chatType, peerUid: ntMsg.peerUid });
-    const queue = this._sendEchoWaiters.get(key);
-    if (!queue || queue.length === 0) return false;
-    const sigFn =
-      typeof this?.constructor?._ntElementsSignature === "function"
-        ? this.constructor._ntElementsSignature
-        : _ntElementsSignature;
-    const matchFn =
-      typeof this?.constructor?._elementsSignatureMatch === "function"
-        ? this.constructor._elementsSignatureMatch
-        : _elementsSignatureMatch;
-    let sig = null;
-    const waiter = queue.find((w) => {
-      if (w.done || w.echo) return false;
-      if (typeof w.elementPredicate === "function") {
-        return Boolean(w.elementPredicate(ntMsg));
-      }
-      if (!sig) sig = sigFn(ntMsg.elements);
-      return matchFn(w.sig, sig);
-    });
-    if (!waiter) return false;
-    waiter.echo = {
-      msgId: String(ntMsg.msgId),
-      msgSeq: String(ntMsg.msgSeq || "0"),
-      msgTime: ntMsg.msgTime !== undefined ? Number(ntMsg.msgTime) : undefined,
-      rawMsg: ntMsg,
-    };
-    if (waiter.resolve) waiter.resolve(waiter.echo);
-    return true;
+    return this._ensureEchoCorrelator().match(ntMsg);
   },
 
   _hasRichMediaElements(elements) {
-    if (!Array.isArray(elements)) return false;
-    return elements.some((el) => {
-      if (!el || typeof el !== "object") return false;
-      const t = Number(el.elementType);
-      return (
-        t === 2 ||
-        t === 3 ||
-        t === 4 ||
-        t === 5 ||
-        Boolean(el.picElement || el.fileElement || el.pttElement || el.videoElement)
-      );
-    });
+    return hasRichMediaElements(elements);
   },
 
   _computeSendEchoTimeoutMs(elements) {
-    const textTimeout = Math.max(0, Number(this.config.sendEchoTimeoutMs ?? 3000));
-    if (!this._hasRichMediaElements(elements)) {
-      return textTimeout;
-    }
-    const rawRich =
-      this.config.richMediaEchoTimeoutMs ??
-      this.config.sendRichMediaEchoTimeoutMs ??
-      15000;
-    const baseRich = Math.max(textTimeout, Math.max(0, Number(rawRich)));
-    let totalBytes = 0;
-    for (const el of elements) {
-      const sub = el?.picElement || el?.fileElement || el?.pttElement || el?.videoElement;
-      const sz = Number(sub?.fileSize || 0);
-      if (Number.isFinite(sz) && sz > 0) totalBytes += sz;
-    }
-    const extraMb =
-      totalBytes > 1024 * 1024 ? Math.ceil((totalBytes - 1024 * 1024) / (1024 * 1024)) : 0;
-    const maxTimeout = Math.max(baseRich, Number(this.config.maxSendEchoTimeoutMs ?? 60000));
-    return Math.min(maxTimeout, baseRich + extraMb * 2000);
+    return this._ensureEchoCorrelator().computeTimeoutMs(elements, this.config);
   },
 
   _mediaSecurityOptions() {
@@ -496,9 +270,10 @@ const outboundPipelineMixin = {
       let msgSeq = String(sendRes?.msgSeq || sendRes?.msgRecord?.msgSeq || "0");
       let msgTime = Math.floor(Date.now() / 1000);
       let echoRawMsg = sendRes?.msgRecord || null;
+      const echoStats = this.sendEchoStats || this._ensureEchoCorrelator().stats;
       if (realMsgId) {
         echoWaiter.cancel();
-        this.sendEchoStats.fromResult += 1;
+        echoStats.fromResult += 1;
       } else {
         const echoTimeoutMs = this._computeSendEchoTimeoutMs(elements);
         const echo = await echoWaiter.wait(echoTimeoutMs);
@@ -507,13 +282,17 @@ const outboundPipelineMixin = {
           if (msgSeq === "0" && echo.msgSeq) msgSeq = echo.msgSeq;
           if (Number.isFinite(echo.msgTime) && echo.msgTime > 0) msgTime = echo.msgTime;
           if (echo.rawMsg) echoRawMsg = echo.rawMsg;
-          this.sendEchoStats.matched += 1;
+          echoStats.matched += 1;
         } else {
-          this.sendEchoStats.timedOut += 1;
-          this._logWarn(
-            `send-echo-timeout:${this._sendPeerKey(peer)}`,
-            `sendMsg to ${this._sendPeerKey(peer)} succeeded but no onAddSendMsg echo arrived within ${echoTimeoutMs}ms; message_id will not be recallable`
-          );
+          echoStats.timedOut += 1;
+          const peerKeyStr = this._sendPeerKey(peer);
+          const warnKey = `send-echo-timeout:${peerKeyStr}`;
+          const warnMsg = `sendMsg to ${peerKeyStr} succeeded but no onAddSendMsg echo arrived within ${echoTimeoutMs}ms; message_id will not be recallable`;
+          if (typeof this._logWarn === "function") {
+            this._logWarn(warnKey, warnMsg);
+          } else {
+            this.logger?.warnThrottled?.(warnKey, warnMsg, 60000);
+          }
         }
       }
       if (!realMsgId) {

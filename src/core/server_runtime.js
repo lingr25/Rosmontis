@@ -22,6 +22,41 @@ const {
   readHttpJsonBody,
 } = require("./transport_security");
 
+const { isQuietLogsEnabled } = require("./env");
+
+const JSON_CONTENT_TYPE_HEADERS = Object.freeze({
+  "Content-Type": "application/json; charset=utf-8",
+});
+
+function writeHttpJson(res, statusCode, payload) {
+  if (!res || res.writableEnded) return false;
+  res.writeHead(statusCode, JSON_CONTENT_TYPE_HEADERS);
+  res.end(JSON.stringify(payload));
+  return true;
+}
+
+function buildEndpointActionContext(endpointCfg = {}, defaultMsgFormat = "array") {
+  const cfg = endpointCfg && typeof endpointCfg === "object" ? endpointCfg : {};
+  return {
+    messageFormat: cfg.messageFormat || defaultMsgFormat || "array",
+    compatProfile: cfg.compatProfile || cfg.compat_profile,
+    compatAppName: cfg.compatAppName || cfg.compat_app_name,
+    compatAppVersion: cfg.compatAppVersion || cfg.compat_app_version,
+  };
+}
+
+function buildFailedActionReply(retcode, message, echo = undefined) {
+  const msg = message !== undefined && message !== null ? String(message) : "";
+  return {
+    status: "failed",
+    retcode: Number.isFinite(Number(retcode)) ? Number(retcode) : 1400,
+    data: null,
+    message: msg,
+    wording: msg,
+    ...(echo !== undefined ? { echo } : {}),
+  };
+}
+
 const serverRuntimeMixin = {
   _checkAuth(req, expectedToken, parsedUrl = null) {
     return checkRequestAuth(req, expectedToken, {
@@ -57,13 +92,74 @@ const serverRuntimeMixin = {
       }
       this.listenErrors.push(entry);
     }
-    if (!this.config?.quietLogs && process.env.ROSMONTIS_QUIET !== "1") {
+    const warnMsg = `WARN: Failed to listen (${entry.kind} ${entry.host}:${entry.port}): [${entry.code}] ${entry.message}`;
+    if (this.logger && typeof this.logger.warn === "function") {
+      this.logger.warn(warnMsg);
+    } else if (!isQuietLogsEnabled(this.config)) {
       try {
-        process.stderr.write(
-          `[rosmontis] WARN: Failed to listen (${entry.kind} ${entry.host}:${entry.port}): [${entry.code}] ${entry.message}\n`
-        );
+        process.stderr.write(`[rosmontis] ${warnMsg}\n`);
       } catch (_) {}
     }
+  },
+
+  _listenServerInstance(srv, kind, listenHost, listenPort, targetList) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const settleOnce = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      srv.on("error", (err) => {
+        this._recordListenError(kind, listenHost, listenPort, err);
+        settleOnce();
+      });
+      try {
+        srv.listen(listenPort, listenHost, () => {
+          targetList.push(srv);
+          settleOnce();
+        });
+      } catch (syncErr) {
+        this._recordListenError(kind, listenHost, listenPort, syncErr);
+        try {
+          srv.close();
+        } catch (_) {}
+        settleOnce();
+      }
+    });
+  },
+
+  async _handleWsActionMessage(rawText, sendJsonFn, actionContext = {}) {
+    if (typeof sendJsonFn !== "function") return;
+    let payload;
+    try {
+      payload = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
+    } catch (_) {
+      return;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload) || !payload.action) {
+      return;
+    }
+    const actParams =
+      payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
+        ? payload.params
+        : {};
+    let reply;
+    try {
+      reply = await this.handleOneBotAction(
+        payload.action,
+        actParams,
+        payload.echo,
+        actionContext
+      );
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      const retcode = Number(err?.retcode) || 1400;
+      reply = buildFailedActionReply(retcode, msg, payload.echo);
+    }
+    try {
+      sendJsonFn(reply);
+    } catch (_) {}
   },
 
   async startServers() {
@@ -79,263 +175,171 @@ const serverRuntimeMixin = {
       }
     );
 
+    const globalMsgFormat = this.config.messageFormat || "array";
+
     // 1. Start HTTP Server(s)
     for (const httpCfg of this.config.httpServers || []) {
-      const endpointMsgFormat = httpCfg.messageFormat || this.config.messageFormat || "array";
-      await new Promise((resolve) => {
-        const srv = http.createServer(async (req, res) => {
-          req.on("error", () => {});
-          res.on("error", () => {});
+      const actionContext = buildEndpointActionContext(httpCfg, globalMsgFormat);
+      const srv = http.createServer(async (req, res) => {
+        req.on("error", () => {});
+        res.on("error", () => {});
 
-          const originRes = checkOriginHeader(req, {
-            allowedOrigins: httpCfg.allowedOrigins || this.config.allowedOrigins || [],
-          });
-          if (!originRes.allowed) {
-            res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
-            res.end(
-              JSON.stringify({
-                status: "failed",
-                retcode: 1403,
-                message: "Forbidden: Origin not allowed",
-              })
-            );
-            return;
-          }
-
-          let u;
-          try {
-            u = new URL(req.url || "/", "http://127.0.0.1");
-          } catch (_) {
-            u = new URL("/", "http://127.0.0.1");
-          }
-
-          if (!this._checkAuth(req, httpCfg.accessToken, u)) {
-            res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
-            res.end(JSON.stringify({ status: "failed", retcode: 1403, message: "Unauthorized" }));
-            return;
-          }
-
-          const actionName = u.pathname.replace(/^\/+/, "");
-          if (req.method === "GET" && (actionName === "health" || actionName === "")) {
-            res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-            res.end(
-              JSON.stringify({
-                status: "ok",
-                retcode: 0,
-                self_id: Number(this.selfUin || 0),
-                online: this.online,
-              })
-            );
-            return;
-          }
-
-          try {
-            const params = await readHttpJsonBody(req, {
-              maxBodyBytes: this.config.maxHttpBodyBytes || DEFAULT_MAX_HTTP_BODY_BYTES,
-            });
-            for (const [k, v] of u.searchParams.entries()) {
-              if (!(k in params)) params[k] = v;
-            }
-            const act = actionName || String(params.action || "");
-            const actParams =
-              params.params !== undefined
-                ? params.params && typeof params.params === "object" && !Array.isArray(params.params)
-                  ? params.params
-                  : {}
-                : params;
-            const reply = await this.handleOneBotAction(act, actParams, params.echo, {
-              messageFormat: endpointMsgFormat,
-              compatProfile: httpCfg.compatProfile || httpCfg.compat_profile,
-              compatAppName: httpCfg.compatAppName || httpCfg.compat_app_name,
-              compatAppVersion: httpCfg.compatAppVersion || httpCfg.compat_app_version,
-            });
-            if (!res.writableEnded) {
-              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-              res.end(JSON.stringify(reply));
-            }
-          } catch (err) {
-            if (!res.writableEnded) {
-              if (err && (err.statusCode === 413 || err.code === "ERR_HTTP_BODY_TOO_LARGE")) {
-                res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" });
-                res.end(
-                  JSON.stringify({
-                    status: "failed",
-                    retcode: 1413,
-                    message: err.message,
-                  })
-                );
-                return;
-              }
-              const msg = err && err.message ? err.message : String(err);
-              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-              res.end(
-                JSON.stringify({
-                  status: "failed",
-                  retcode: 1400,
-                  data: null,
-                  message: msg,
-                  wording: msg,
-                })
-              );
-            }
-          }
+        const originRes = checkOriginHeader(req, {
+          allowedOrigins: httpCfg.allowedOrigins || this.config.allowedOrigins || [],
         });
-        const listenPort = Number(httpCfg.port ?? 3000);
-        const listenHost = httpCfg.host || "0.0.0.0";
-        let settled = false;
-        const settleOnce = () => {
-          if (settled) return;
-          settled = true;
-          resolve();
-        };
-        srv.on("error", (err) => {
-          this._recordListenError("http", listenHost, listenPort, err);
-          settleOnce();
-        });
+        if (!originRes.allowed) {
+          writeHttpJson(res, 403, buildFailedActionReply(1403, "Forbidden: Origin not allowed"));
+          return;
+        }
+
+        let u;
         try {
-          srv.listen(listenPort, listenHost, () => {
-            this._httpServers.push(srv);
-            settleOnce();
+          u = new URL(req.url || "/", "http://127.0.0.1");
+        } catch (_) {
+          u = new URL("/", "http://127.0.0.1");
+        }
+
+        if (!this._checkAuth(req, httpCfg.accessToken, u)) {
+          writeHttpJson(res, 401, buildFailedActionReply(1403, "Unauthorized"));
+          return;
+        }
+
+        const actionName = u.pathname.replace(/^\/+/, "");
+        if (req.method === "GET" && (actionName === "health" || actionName === "")) {
+          writeHttpJson(res, 200, {
+            status: "ok",
+            retcode: 0,
+            self_id: Number(this.selfUin || 0),
+            online: this.online,
           });
-        } catch (syncErr) {
-          this._recordListenError("http", listenHost, listenPort, syncErr);
-          try {
-            srv.close();
-          } catch (_) {}
-          settleOnce();
+          return;
+        }
+
+        try {
+          const params = await readHttpJsonBody(req, {
+            maxBodyBytes: this.config.maxHttpBodyBytes || DEFAULT_MAX_HTTP_BODY_BYTES,
+          });
+          for (const [k, v] of u.searchParams.entries()) {
+            if (!(k in params)) params[k] = v;
+          }
+          const act = actionName || String(params.action || "");
+          const actParams =
+            params.params !== undefined
+              ? params.params && typeof params.params === "object" && !Array.isArray(params.params)
+                ? params.params
+                : {}
+              : params;
+          const reply = await this.handleOneBotAction(act, actParams, params.echo, actionContext);
+          writeHttpJson(res, 200, reply);
+        } catch (err) {
+          if (err && (err.statusCode === 413 || err.code === "ERR_HTTP_BODY_TOO_LARGE")) {
+            writeHttpJson(res, 413, buildFailedActionReply(1413, err.message));
+            return;
+          }
+          const msg = err && err.message ? err.message : String(err);
+          writeHttpJson(res, 200, buildFailedActionReply(1400, msg));
         }
       });
+
+      const listenPort = Number(httpCfg.port ?? 3000);
+      const listenHost = httpCfg.host || "0.0.0.0";
+      await this._listenServerInstance(srv, "http", listenHost, listenPort, this._httpServers);
     }
 
     // 2. Start Forward WebSocket Server(s)
     for (const wsCfg of this.config.wsServers || []) {
-      const endpointMsgFormat = wsCfg.messageFormat || this.config.messageFormat || "array";
-      await new Promise((resolve) => {
-        const srv = http.createServer((_req, res) => {
-          res.writeHead(426);
-          res.end("Upgrade Required");
+      const baseActionContext = buildEndpointActionContext(wsCfg, globalMsgFormat);
+      const srv = http.createServer((_req, res) => {
+        res.writeHead(426);
+        res.end("Upgrade Required");
+      });
+      srv.on("upgrade", (req, socket, head) => {
+        socket.on("error", () => {});
+
+        const originRes = checkOriginHeader(req, {
+          allowedOrigins: wsCfg.allowedOrigins || this.config.allowedOrigins || [],
         });
-        srv.on("upgrade", (req, socket, head) => {
-          socket.on("error", () => {});
+        if (!originRes.allowed) {
+          socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+          socket.destroy();
+          return;
+        }
 
-          const originRes = checkOriginHeader(req, {
-            allowedOrigins: wsCfg.allowedOrigins || this.config.allowedOrigins || [],
-          });
-          if (!originRes.allowed) {
-            socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-            socket.destroy();
-            return;
-          }
-
-          let u = null;
-          try {
-            u = new URL(req.url || "/", "http://127.0.0.1");
-          } catch (_) {}
-
-          if (!this._checkAuth(req, wsCfg.accessToken, u)) {
-            socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-            socket.destroy();
-            return;
-          }
-          const rawSecKey = req.headers["sec-websocket-key"];
-          const secKey = sanitizeHeaderValue(rawSecKey);
-          if (!secKey) {
-            socket.destroy();
-            return;
-          }
-          const accept = sanitizeHeaderValue(
-            crypto
-              .createHash("sha1")
-              .update(secKey + WS_GUID)
-              .digest("base64")
-          );
-          socket.write(
-            [
-              "HTTP/1.1 101 Switching Protocols",
-              "Upgrade: websocket",
-              "Connection: Upgrade",
-              `Sec-WebSocket-Accept: ${accept}`,
-              "",
-              "",
-            ].join("\r\n")
-          );
-          const conn = new Rfc6455Connection(socket, {
-            isClient: false,
-            maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
-            maxSendBufferBytes:
-              this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
-            allowUnmaskedClientFrames: Boolean(this.config.allowUnmaskedClientFrames),
-          });
-          conn.reportSelfMessage = Boolean(wsCfg.reportSelfMessage);
-          conn._messageFormat = endpointMsgFormat;
-          this._wsServerClients.add(conn);
-
-          conn.on("error", () => {
-            this._wsServerClients.delete(conn);
-            try {
-              socket.destroy();
-            } catch (_) {}
-          });
-          conn.on("close", () => {
-            this._wsServerClients.delete(conn);
-          });
-
-          conn.sendJson(
-            formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
-          );
-
-          conn.on("message", async (text) => {
-            try {
-              const payload = JSON.parse(text);
-              if (payload && typeof payload === "object" && !Array.isArray(payload) && payload.action) {
-                const actParams =
-                  payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
-                    ? payload.params
-                    : {};
-                const reply = await this.handleOneBotAction(
-                  payload.action,
-                  actParams,
-                  payload.echo,
-                  {
-                    messageFormat: conn._messageFormat || "array",
-                    compatProfile: wsCfg.compatProfile || wsCfg.compat_profile,
-                    compatAppName: wsCfg.compatAppName || wsCfg.compat_app_name,
-                    compatAppVersion: wsCfg.compatAppVersion || wsCfg.compat_app_version,
-                  }
-                );
-                conn.sendJson(reply);
-              }
-            } catch (_) {}
-          });
-          if (head && head.length > 0) {
-            conn._onData(head);
-          }
-        });
-        const listenPort = Number(wsCfg.port ?? 3001);
-        const listenHost = wsCfg.host || "0.0.0.0";
-        let settled = false;
-        const settleOnce = () => {
-          if (settled) return;
-          settled = true;
-          resolve();
-        };
-        srv.on("error", (err) => {
-          this._recordListenError("ws", listenHost, listenPort, err);
-          settleOnce();
-        });
+        let u = null;
         try {
-          srv.listen(listenPort, listenHost, () => {
-            this._wsServers.push(srv);
-            settleOnce();
-          });
-        } catch (syncErr) {
-          this._recordListenError("ws", listenHost, listenPort, syncErr);
+          u = new URL(req.url || "/", "http://127.0.0.1");
+        } catch (_) {}
+
+        if (!this._checkAuth(req, wsCfg.accessToken, u)) {
+          socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+        const rawSecKey = req.headers["sec-websocket-key"];
+        const secKey = sanitizeHeaderValue(rawSecKey);
+        if (!secKey) {
+          socket.destroy();
+          return;
+        }
+        const accept = sanitizeHeaderValue(
+          crypto
+            .createHash("sha1")
+            .update(secKey + WS_GUID)
+            .digest("base64")
+        );
+        socket.write(
+          [
+            "HTTP/1.1 101 Switching Protocols",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            `Sec-WebSocket-Accept: ${accept}`,
+            "",
+            "",
+          ].join("\r\n")
+        );
+        const conn = new Rfc6455Connection(socket, {
+          isClient: false,
+          maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
+          maxSendBufferBytes:
+            this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
+          allowUnmaskedClientFrames: Boolean(this.config.allowUnmaskedClientFrames),
+        });
+        conn.reportSelfMessage = Boolean(wsCfg.reportSelfMessage);
+        conn._messageFormat = baseActionContext.messageFormat;
+        this._wsServerClients.add(conn);
+
+        conn.on("error", () => {
+          this._wsServerClients.delete(conn);
           try {
-            srv.close();
+            socket.destroy();
           } catch (_) {}
-          settleOnce();
+        });
+        conn.on("close", () => {
+          this._wsServerClients.delete(conn);
+        });
+
+        conn.sendJson(
+          formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
+        );
+
+        conn.on("message", (text) => {
+          this._handleWsActionMessage(
+            text,
+            (reply) => conn.sendJson(reply),
+            {
+              ...baseActionContext,
+              messageFormat: conn._messageFormat || baseActionContext.messageFormat,
+            }
+          );
+        });
+        if (head && head.length > 0) {
+          conn._onData(head);
         }
       });
+
+      const listenPort = Number(wsCfg.port ?? 3001);
+      const listenHost = wsCfg.host || "0.0.0.0";
+      await this._listenServerInstance(srv, "ws", listenHost, listenPort, this._wsServers);
     }
 
     // 3. Start Reverse WebSocket Client(s)
@@ -416,7 +420,10 @@ const serverRuntimeMixin = {
   },
 
   _startReverseWsLoop(clientCfg) {
-    const endpointMsgFormat = clientCfg.messageFormat || this.config.messageFormat || "array";
+    const baseActionContext = buildEndpointActionContext(
+      clientCfg,
+      this.config.messageFormat || "array"
+    );
     const entry = {
       cfg: clientCfg,
       conn: null,
@@ -426,7 +433,7 @@ const serverRuntimeMixin = {
       handle: null,
       connectedSelfId: "0",
       immediateReconnectOnce: false,
-      messageFormat: endpointMsgFormat,
+      messageFormat: baseActionContext.messageFormat,
     };
     this._reverseWsClients.push(entry);
 
@@ -458,28 +465,15 @@ const serverRuntimeMixin = {
             formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
           );
         },
-        async (text, conn) => {
-          try {
-            const payload = JSON.parse(text);
-            if (payload && typeof payload === "object" && !Array.isArray(payload) && payload.action) {
-              const actParams =
-                payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
-                  ? payload.params
-                  : {};
-              const reply = await this.handleOneBotAction(
-                payload.action,
-                actParams,
-                payload.echo,
-                {
-                  messageFormat: entry.messageFormat || "array",
-                  compatProfile: clientCfg.compatProfile || clientCfg.compat_profile,
-                  compatAppName: clientCfg.compatAppName || clientCfg.compat_app_name,
-                  compatAppVersion: clientCfg.compatAppVersion || clientCfg.compat_app_version,
-                }
-              );
-              conn.sendJson(reply);
+        (text, conn) => {
+          this._handleWsActionMessage(
+            text,
+            (reply) => conn.sendJson(reply),
+            {
+              ...baseActionContext,
+              messageFormat: entry.messageFormat || baseActionContext.messageFormat,
             }
-          } catch (_) {}
+          );
         },
         () => {
           entry.connecting = false;
@@ -513,6 +507,9 @@ const serverRuntimeMixin = {
     this._aioInteractionSeq += 1;
     this._clearIdleTimers();
     this._sessionScheduler.dispose();
+    if (this.echoCorrelator && typeof this.echoCorrelator.clear === "function") {
+      this.echoCorrelator.clear();
+    }
     this._rejectPendingRendererCmds(null, "bridge servers stopped");
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer);
@@ -545,4 +542,7 @@ const serverRuntimeMixin = {
 
 module.exports = {
   serverRuntimeMixin,
+  writeHttpJson,
+  buildEndpointActionContext,
+  buildFailedActionReply,
 };

@@ -9,6 +9,9 @@ const {
   formatNoticeEvent,
   formatRequestEvent,
 } = bridgeOnebot;
+const { isPrefixedEnvFlagOne } = require("./env");
+const { setBoundedMap } = require("./primitives");
+const { pickPositiveUin, normalizeLoginIdentity } = require("./nt_normalizer");
 
 function _isPositiveUin(v) {
   return (
@@ -22,16 +25,8 @@ function _isPositiveUin(v) {
 }
 
 function _pickPositiveUin(...candidates) {
-  if (typeof bridgeOnebot.pickPositiveUin === "function") {
-    const picked = bridgeOnebot.pickPositiveUin(...candidates);
-    return _isPositiveUin(picked) ? String(picked) : "";
-  }
-  for (const c of candidates) {
-    if (_isPositiveUin(c)) {
-      return String(Math.trunc(Number(c)));
-    }
-  }
-  return "";
+  const picked = pickPositiveUin(...candidates);
+  return picked > 0 ? String(picked) : "";
 }
 
 function _stripTransientMedia(ntMsg) {
@@ -177,7 +172,9 @@ const inboundPipelineMixin = {
         if (_isPositiveUin(resolved)) {
           return String(resolved);
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("inbound", err);
+      }
     }
     return "";
   },
@@ -476,9 +473,9 @@ const inboundPipelineMixin = {
         const seq = String(item.seq || "");
         const notifyType = Number(item.type || 0);
         const status = Number(item.status || 0);
-        const groupId = Number(item.group?.groupCode || 0);
+        const groupId = pickPositiveUin(item.group?.groupCode);
         const flag = seq ? `${seq}:${notifyType}:${groupId}` : "";
-        if (flag) this._setBoundedMap(this._groupNotifiesCache, flag, item);
+        if (flag) setBoundedMap(this._groupNotifiesCache, flag, item);
 
         if (item.user1?.uid && _isPositiveUin(item.user1?.uin)) {
           this.uinUidStore?.remember?.(item.user1.uin, item.user1.uid, {
@@ -540,7 +537,7 @@ const inboundPipelineMixin = {
         const friendUid = rawFriendUid || positiveReqUin;
         const reqExtra = String(req.reqTime || req.flag || req.postscript || req.extWords || "0");
         const flag = `${friendUid}:${reqExtra}`;
-        this._setBoundedMap(this._buddyReqsCache, flag, req);
+        setBoundedMap(this._buddyReqsCache, flag, req);
         const dedupKey = `friend_req:${friendUid}:${req.reqTime || req.flag || req.postscript || req.extWords || ""}`;
         if (this._isDuplicateEvent(dedupKey)) continue;
         const resolvedUin =
@@ -585,7 +582,9 @@ const inboundPipelineMixin = {
       for (const waiter of Array.from(this._buddyListWaiters)) {
         try {
           waiter(firstArg);
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("inbound", err);
+        }
       }
       return;
     }
@@ -649,7 +648,9 @@ const inboundPipelineMixin = {
           } else {
             waiter.resolve(filePath);
           }
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("inbound", err);
+        }
       }
       return;
     }
@@ -669,13 +670,15 @@ const inboundPipelineMixin = {
       for (const g of groupList) {
         if (g && (g.groupCode || g.groupUin || g.group_id)) {
           const gid = String(g.groupCode || g.groupUin || g.group_id);
-          this._setBoundedMap(this._groupListCache, gid, g);
+          setBoundedMap(this._groupListCache, gid, g);
         }
       }
       for (const waiter of Array.from(this._groupListWaiters)) {
         try {
           waiter(groupList);
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("inbound", err);
+        }
       }
       return;
     }
@@ -703,16 +706,9 @@ const inboundPipelineMixin = {
       return;
     }
     if (eventName === "onUserLoggedIn" || eventName === "onQRCodeLoginSucceed") {
-      const uinCandidate =
-        firstArg && typeof firstArg === "object" ? firstArg.uin || firstArg.userId : firstArg;
-      const uidCandidate =
-        firstArg && typeof firstArg === "object" ? firstArg.uid : undefined;
-      const nickCandidate =
-        firstArg && typeof firstArg === "object" ? firstArg.nickName || firstArg.nick : undefined;
+      const identity = normalizeLoginIdentity(firstArg);
       this._updateSelfIdentity({
-        uin: uinCandidate,
-        uid: uidCandidate,
-        nick: nickCandidate,
+        ...identity,
         markOnline: true,
       });
       return;
@@ -732,7 +728,7 @@ const inboundPipelineMixin = {
         formatNoticeEvent(
           "bot_offline",
           {
-            user_id: Number(this.selfUin || 0),
+            user_id: pickPositiveUin(this.selfUin),
             tag: String(firstArg?.tipsTitle || "kicked_offline"),
             message: String(firstArg?.tipsDesc || "QQ offline"),
           },
@@ -868,7 +864,8 @@ const inboundPipelineMixin = {
       if (waitedPath && (await _statPositiveFile(waitedPath))) {
         return String(waitedPath);
       }
-    } catch (_) {
+    } catch (err) {
+      this.logger?.debug?.("inbound", err);
     } finally {
       cleanupWaiter();
     }
@@ -931,7 +928,9 @@ const inboundPipelineMixin = {
               localPath = String(resolvedPath);
               st = await _statPositiveFile(localPath);
             }
-          } catch (_) {}
+          } catch (err) {
+            this.logger?.debug?.("inbound", err);
+          }
         }
 
         if (!st && ntMsg.msgId && ntMsg.peerUid) {
@@ -1003,7 +1002,9 @@ const inboundPipelineMixin = {
                 configurable: true,
                 writable: true,
               });
-            } catch (_) {}
+            } catch (err) {
+              this.logger?.debug?.("inbound", err);
+            }
           }
         }
         continue;
@@ -1043,7 +1044,9 @@ const inboundPipelineMixin = {
                 configurable: true,
                 writable: true,
               });
-            } catch (_) {}
+            } catch (err) {
+              this.logger?.debug?.("inbound", err);
+            }
           }
         }
       }
@@ -1087,10 +1090,8 @@ const inboundPipelineMixin = {
     }
 
     const autoReadAndType =
-      this.config.autoReadAndTypeOnPrivateRecv === true ||
-      process.env.ROSMONTIS_AUTO_READ_AND_TYPE_ON_PRIVATE_RECV === "1" ||
-      process.env.ONEBOT_AUTO_READ_AND_TYPE_ON_PRIVATE_RECV === "1" ||
-      process.env.XIAO_BRIDGE_AUTO_READ_AND_TYPE_ON_PRIVATE_RECV === "1";
+      Boolean(this.config && this.config.autoReadAndTypeOnPrivateRecv === true) ||
+      isPrefixedEnvFlagOne("AUTO_READ_AND_TYPE_ON_PRIVATE_RECV");
     const isSelfSender =
       (Boolean(this.selfUin) && String(ntMsg.senderUin || "") === String(this.selfUin)) ||
       (Boolean(this.selfUid) && String(ntMsg.senderUid || "") === String(this.selfUid));
@@ -1116,7 +1117,9 @@ const inboundPipelineMixin = {
             sendTyping: true,
             eventType: 1,
             advisory: true,
-          }).catch(() => {})
+          }).catch((err) => {
+            this.logger?.debug?.("inbound", err);
+          })
       );
     }
   },

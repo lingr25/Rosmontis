@@ -51,15 +51,16 @@
 
 ## 2. Rosmontis 核心架构
 
-Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个顶层入口模块、`src/core/` 下的 12 个核心子模块与 `src/actions/` 下的 4 个动作域子模块组成（零外部 npm 依赖）：
+Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个顶层入口模块、JSDoc 类型契约（`src/types.js` & `jsconfig.json`）、`src/onebot/` 下的 4 个协议子模块、`src/core/` 下的 17 个零依赖核心子模块与 `src/actions/` 下的 4 个动作域子模块组成（零外部 npm 依赖）：
 
 | 模块 | 职责 |
 | :--- | :--- |
 | `src/app_launcher_index.js` | 纯 JS 引导包装器：在 `major.node` 启动前初始化 `bridge_main.js`，支持 `ROSMONTIS_DISABLE=1` 一键旁路 |
 | `src/bridge_renderer.js` | 渲染层受信任桥接器：闭包隔离 `__ipcToken` 鉴权，监听结构化 `__ROSMONTIS_BRIDGE_CMD__` 指令通道，构造原生 `RM_IPCFROM_RENDERER{windowId}` 帧并驱动会话因果状态机 |
-| `src/bridge_main.js` | 主进程协调器：组装 `src/core/*` 运行时管线与 `src/actions/*` 动作路由表，统筹生命周期、自动快登与 65+ OneBot v11 动作分发 |
-| `src/bridge_onebot.js` | 协议编解码库：CQ 码/消息段双向转换、富媒体元素组装、LRU 消息短 ID 映射与 UIN/UID 双向索引 |
-| `src/core/*` | 12 个零依赖核心子模块：`nt_capture`（无痕捕获与原生原型链自动归还）、`renderer_ipc`（渲染窗口注入、跨进程 `Map` 保真序列化与三级 `invokeNt` 调度）、`inbound_pipeline`（内核事件监听与富媒体水合）、`outbound_pipeline`（两阶段出站发送与 `onAddSendMsg` 回显关联）、`server_runtime`（HTTP / 正向 WS / 反向 WS 服务运行时）、`session_scheduler`（会话亲和互斥锁与切换冷却）、`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
+| `src/bridge_main.js` | 主进程精简协调器：组合 `BridgeLogger`、`TtlDedupeSet`、`TempCleanupQueue`、`EchoCorrelator`、`HumanSessionController` 等核心子系统与动作路由表，统筹生命周期、自动快登与 OneBot v11 动作分发 |
+| `src/bridge_onebot.js` & `src/onebot/*` | OneBot v11 协议统一门面与 4 个高内聚子模块：`stores`（LRU 消息短 ID 映射与 UIN/UID 双向索引）、`cq_codec`（CQ 码与消息段归一化编解码）、`segment_converter`（NTQQ `elements` 与消息段双向转换）、`event_formatter`（消息、灰条通知、请求与元事件格式化） |
+| `src/types.js` & `jsconfig.json` | 零编译开销的 JSDoc 协议与内部运行时类型契约，提供 IDE 智能补全与静态契约约束 |
+| `src/core/*` | 17 个零依赖核心子模块：`env`（多前缀环境变量统一解析）、`primitives`（有界 LRU、TTL 去重、临时文件清理队列、事件等待器、限流日志、跨进程 `Map`/`void` 无损编解码与声明式动作路由）、`nt_normalizer`（多版本 NTQQ 内核结构防腐层）、`echo_correlator`（出站 `sendMsg` <-> `onAddSendMsg` 真实 `msgId` 关联）、`session_controller`（人类会话因果控制器 `HumanSessionController`）、`session_scheduler`（会话亲和互斥锁与切换冷却 `CausalSessionScheduler`）、`nt_capture`（无痕捕获与原生原型链自动归还）、`renderer_ipc`（渲染窗口注入、受信任 IPC 与三级 `invokeNt` 调度）、`inbound_pipeline`（内核事件监听与富媒体水合）、`outbound_pipeline`（两阶段出站发送管线）、`server_runtime`（HTTP / 正向 WS / 反向 WS 服务运行时）、`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
 | `src/actions/*` | 4 个 OneBot v11 动作域子模块：`message_actions`（登录状态、消息收发、合并转发、历史记录、已读/回应/戳一戳）、`contact_actions`（好友列表、资料、备注与好友申请）、`group_actions`（群信息/成员、群管操作、精华消息与入群申请）、`file_media_actions`（群/私聊文件传输、媒体解析、OCR/语音转文字、个人资料与 Ark 分享） |
 
 ### 2.1 渲染层官方 IPC 帧协议与 Map 跨进程还原
@@ -89,9 +90,9 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 **防重复发送保护（Side-Effect Replay Guard）**：
 对于 `sendMsg`、`recallMsg`、转发、戳一戳、表情回应、群管理等有外部副作用的命令（`SIDE_EFFECT_NT_METHODS`），只有当上一级**根本未派发**（如渲染窗口尚未就绪，携带 `ROSMONTIS_BRIDGE_UNAVAILABLE` 标记）时才允许回退到下一级；一旦某级已派发请求，任何超时或业务错误均直接返回调用方，**绝不在下一级重放**，彻底杜绝大图慢速上传时的重复刷屏。
 
-### 2.4 会话因果状态机与会话亲和并发调度（CausalSessionScheduler）
+### 2.4 会话因果状态机与会话亲和并发调度（`HumanSessionController` & `CausalSessionScheduler`）
 
-出站发消息采用**两阶段解耦**管线：第一阶段在锁外并发完成富媒体流式下载、图片尺寸嗅探与 EXIF 清理；第二阶段经 `CausalSessionScheduler`（同会话亲和互斥队列 + `maxAffinityStreak` 防饥饿上限 + `aioSwitchCooldownMs` 高频切换冷却）串行化包裹“会话激活 + `sendMsg` IPC 派发”，IPC 返回即释放互斥锁并在锁外等待 `onAddSendMsg` 真实回显（富媒体动态延长回显超时），消除多群并发来回乒乓切窗（AIO Thrashing）。
+出站发消息采用**两阶段解耦**管线：第一阶段在锁外并发完成富媒体流式下载、图片尺寸嗅探与 EXIF 清理；第二阶段由 `HumanSessionController` 经 `CausalSessionScheduler`（同会话亲和互斥队列 + `maxAffinityStreak` 防饥饿上限 + `aioSwitchCooldownMs` 高频切换冷却）串行化包裹“会话激活 + `sendMsg` IPC 派发”，IPC 返回即释放互斥锁并在锁外等待 `onAddSendMsg` 真实回显（富媒体动态延长回显超时），消除多群并发来回乒乓切窗（AIO Thrashing）。
 
 私聊与群聊严格遵循真实人类时间轴（**收到消息 -> 已读 -> 正在输入 -> 模型生成 -> 发送（或不发送）**）：
 
@@ -100,10 +101,10 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 3. 已读与输入态（`set_input_status` 或可选 `autoReadAndTypeOnPrivateRecv` 触发）：先调用 `setMsgRead` 消红点，再调用 `sendShowInputStatusReq` 展示“对方正在输入…”（模型最终决定不回复亦完全自然）
 4. 发送与两级空闲退场：`send_msg` 阶段若已在目标会话则直接派发 `sendMsg`（不再瞬时补发 0ms 输入态）；默认无交互 45 秒后自动持锁发送 `enterOrExitAio(active, enterType: 2)` 退回会话列表，5 分钟无交互后自动发送 `setFocusOnBase({ isFocus: false })` 切入后台失焦
 
-### 2.5 真实回显 `msgId` 关联与 NTv2 富媒体闭环
+### 2.5 真实回显 `msgId` 关联（`EchoCorrelator`）与 NTv2 富媒体闭环
 
 1. **出站 `sendMsg` <-> `onAddSendMsg` 回显关联**：
-   NTQQ 3.2.32 的 `sendMsg` 返回值仅包含 `{result, errMsg}` 而不直接携带 `msgId`。Rosmontis 在调用 `sendMsg` 前挂起回显匹配器，精准捕获内核 `onAddSendMsg` 推送的真实 19 位 `msgId` 后再映射为 OneBot 31-bit 正整数 `message_id`，保证发送后立即调用 `delete_msg` 即可 100% 撤回。
+   NTQQ 3.2.32 的 `sendMsg` 返回值仅包含 `{result, errMsg}` 而不直接携带 `msgId`。Rosmontis 通过 `EchoCorrelator` 在调用 `sendMsg` 前挂起元素签名匹配器，精准捕获内核 `onAddSendMsg` 推送的真实 19 位 `msgId` 后再映射为 OneBot 31-bit 正整数 `message_id`，保证发送后立即调用 `delete_msg` 即可 100% 撤回。
 2. **入站无 `rkey` 图片自动水合**：
    NTQQ 3.2.32 入站 `picElement.originImageUrl` 常为不带 `rkey=` 的相对路径，外部直接请求必返 `400 Bad Request`。`_hydrateNtMsgMedia` 优先读取本地原图/缩略图缓存，未命中时自动调用内核 `downloadRichMedia` 等待 `onRichMediaDownloadComplete` 落盘并编码为 `base64://` URI，下游机器人无需关心 `rkey` 签名算法即可直接读取图片字节。
 3. **出站图片 EXIF 清理与路径规范化**：

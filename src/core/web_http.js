@@ -10,6 +10,7 @@ const {
   createSsrfSafeLookup,
 } = require("./media_security");
 const { sanitizeHeaderValue, isValidHttpHeaderName } = require("./transport_security");
+const { pickEnv, isPrefixedEnvTruthy } = require("./env");
 
 const DEFAULT_MAX_WEB_RESPONSE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
@@ -58,18 +59,10 @@ const REQUEST_OPTION_KEYS = new Set([
   "headers",
 ]);
 
-function _isTruthyEnvFlag(val) {
-  if (typeof val !== "string") return false;
-  const lower = val.trim().toLowerCase();
-  return lower === "1" || lower === "true" || lower === "yes";
-}
-
 function isWebCredentialApiEnabled(config) {
   return (
     config?.enableWebCredentialApi === true ||
-    _isTruthyEnvFlag(process.env.ROSMONTIS_ENABLE_WEB_CREDENTIAL_API) ||
-    _isTruthyEnvFlag(process.env.ONEBOT_ENABLE_WEB_CREDENTIAL_API) ||
-    _isTruthyEnvFlag(process.env.XIAO_BRIDGE_ENABLE_WEB_CREDENTIAL_API)
+    isPrefixedEnvTruthy("ENABLE_WEB_CREDENTIAL_API")
   );
 }
 
@@ -150,9 +143,7 @@ function _resolveAllowPrivateUrls(options = {}) {
   if (options && options.allowPrivateUrls !== undefined) {
     return Boolean(options.allowPrivateUrls);
   }
-  const envVal = String(process.env.ROSMONTIS_ALLOW_PRIVATE_URLS || "")
-    .trim()
-    .toLowerCase();
+  const envVal = pickEnv("ROSMONTIS_ALLOW_PRIVATE_URLS").toLowerCase();
   return envVal === "1" || envVal === "true";
 }
 
