@@ -1,0 +1,22 @@
+{
+  "manifest_version": 4,
+  "type": "extension",
+  "name": "Rosmontis",
+  "slug": "rosmontis",
+  "description": "Pure-JS Electron Renderer-Layer OneBot v11 Bridge for QQ NT",
+  "version": "1.0.0",
+  "authors": [
+    {
+      "name": "lingr25",
+      "link": "https://github.com/lingr25"
+    }
+  ],
+  "platform": [
+    "linux",
+    "win32",
+    "darwin"
+  ],
+  "injects": {
+    "main": "./src/plugin_loader.js"
+  }
+}

@@ -130,6 +130,22 @@ function isAutoInstallDisabledFromEnv() {
   ]);
 }
 
+function withAutoInstallDisabled(fn) {
+  const env = _getEnv();
+  const hasPrev = Object.prototype.hasOwnProperty.call(env, "ROSMONTIS_NO_AUTOINSTALL");
+  const prev = env.ROSMONTIS_NO_AUTOINSTALL;
+  env.ROSMONTIS_NO_AUTOINSTALL = "1";
+  try {
+    return fn();
+  } finally {
+    if (!hasPrev) {
+      delete env.ROSMONTIS_NO_AUTOINSTALL;
+    } else {
+      env.ROSMONTIS_NO_AUTOINSTALL = prev;
+    }
+  }
+}
+
 function isTestModeFromEnv() {
   return isEnvFlagOne(["ROSMONTIS_TEST_MODE", "XIAO_BRIDGE_TEST_MODE"]);
 }
@@ -144,7 +160,7 @@ function isDebugLogsEnabled(config) {
 
 function getHomeDir() {
   const env = _getEnv();
-  return env.HOME || os.homedir();
+  return env.HOME || env.USERPROFILE || os.homedir();
 }
 
 function getTempBaseDir() {
@@ -193,6 +209,7 @@ module.exports = {
   isPrefixedEnvFlagOne,
   isBridgeDisabledFromEnv,
   isAutoInstallDisabledFromEnv,
+  withAutoInstallDisabled,
   isTestModeFromEnv,
   isQuietLogsEnabled,
   isDebugLogsEnabled,

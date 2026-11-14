@@ -167,6 +167,7 @@ function loadBridgeConfig(customConfigDir) {
         "/app/data/config",
         "/app/config",
         "/opt/QQ/config",
+        path.resolve(__dirname, "..", "..", "config"),
         path.resolve(process.cwd(), "config"),
       ].filter(Boolean);
 
@@ -229,8 +230,11 @@ function loadBridgeConfig(customConfigDir) {
       if (bestEntry) {
         const { uin, raw, nets } = bestEntry;
         loadedRaw = raw;
-        if (!defaultConfig.selfUin && uin) {
-          defaultConfig.selfUin = uin;
+        if (!defaultConfig.selfUin) {
+          const rawSelfUin = String(raw.selfUin ?? raw.self_id ?? uin ?? "").trim();
+          if (/^[1-9]\d*$/.test(rawSelfUin)) {
+            defaultConfig.selfUin = rawSelfUin;
+          }
         }
         if (envHeartbeatRaw === "" && raw.heartbeatIntervalMs !== undefined) {
           const fileHb = Number(raw.heartbeatIntervalMs);

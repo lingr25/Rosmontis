@@ -107,12 +107,22 @@ function getNtqqVersionMetadata(options = {}) {
   if (_cachedVersionMeta && !options.forceRefresh && !options.packagePaths && !options.chromeVersion) {
     return _cachedVersionMeta;
   }
-  const candidatePaths = options.packagePaths || [
-    "/opt/QQ/resources/app/package.orig.json",
-    "/opt/QQ/resources/app/package.json",
-    path.resolve(__dirname, "..", "package_patch.json"),
-    path.join(__dirname, "package_patch.json"),
-  ];
+  const electronAppPkg =
+    typeof process !== "undefined" &&
+    process &&
+    typeof process.resourcesPath === "string" &&
+    process.resourcesPath.trim()
+      ? path.join(process.resourcesPath.trim(), "app", "package.json")
+      : "";
+  const candidatePaths =
+    options.packagePaths ||
+    [
+      "/opt/QQ/resources/app/package.orig.json",
+      "/opt/QQ/resources/app/package.json",
+      electronAppPkg,
+      path.resolve(__dirname, "..", "package_patch.json"),
+      path.join(__dirname, "package_patch.json"),
+    ].filter(Boolean);
   let qqVersion = "3.2.32-52194";
   let buildVersion = "52194";
   for (const pkgPath of candidatePaths) {
@@ -130,11 +140,17 @@ function getNtqqVersionMetadata(options = {}) {
   const chromeVersion = String(
     options.chromeVersion || (process && process.versions && process.versions.chrome) || "138.0.0.0"
   );
+  const uaPlatform =
+    process.platform === "win32"
+      ? "Windows NT 10.0; Win64; x64"
+      : process.platform === "darwin"
+      ? "Macintosh; Intel Mac OS X 10_15_7"
+      : "X11; Linux x86_64";
   const meta = {
     qqVersion,
     buildVersion,
     chromeVersion,
-    userAgent: `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36 QQ/${qqVersion}`,
+    userAgent: `Mozilla/5.0 (${uaPlatform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36 QQ/${qqVersion}`,
   };
   if (!options.packagePaths && !options.chromeVersion) {
     _cachedVersionMeta = meta;
@@ -1092,11 +1108,31 @@ function _getQqProfileRoots() {
   const homeDir = getHomeDir();
   const sysHome = os.homedir();
   const xdgConfig = getXdgConfigHome();
+  const appData = pickEnv("APPDATA");
+  const localAppData = pickEnv("LOCALAPPDATA");
   return [
     xdgConfig ? path.join(xdgConfig, "QQ") : "",
     homeDir ? path.join(homeDir, ".config/QQ") : "",
     sysHome && sysHome !== homeDir ? path.join(sysHome, ".config/QQ") : "",
     "/app/.config/QQ",
+    homeDir ? path.join(homeDir, "Documents", "Tencent Files") : "",
+    sysHome && sysHome !== homeDir ? path.join(sysHome, "Documents", "Tencent Files") : "",
+    homeDir ? path.join(homeDir, "OneDrive", "Documents", "Tencent Files") : "",
+    sysHome && sysHome !== homeDir ? path.join(sysHome, "OneDrive", "Documents", "Tencent Files") : "",
+    appData ? path.join(appData, "Tencent", "QQ") : "",
+    localAppData ? path.join(localAppData, "Tencent", "QQ") : "",
+    homeDir
+      ? path.join(
+          homeDir,
+          "Library",
+          "Containers",
+          "com.tencent.qq",
+          "Data",
+          "Library",
+          "Application Support",
+          "QQ"
+        )
+      : "",
   ].filter(Boolean);
 }
 
@@ -1115,9 +1151,9 @@ function _isAllowedQqMediaCachePath(realPath, qqRoots) {
     if (!_isSubPathOrEqual(realPath, root)) continue;
     const rel = path.relative(root, realPath);
     const segments = rel.split(/[\\/]+/).filter(Boolean);
-    // Expected layout: [nt_qq_<hash>, "nt_data", "Pic"|"Video"|"File"|"Ptt"|..., ...file]
+    // Expected layout: [nt_qq_<hash> | <uin>/nt_qq, "nt_data", "Pic"|"Video"|"File"|"Ptt"|..., ...file]
     const ntDataIdx = segments.findIndex((seg) => seg.toLowerCase() === "nt_data");
-    if (ntDataIdx >= 0 && ntDataIdx <= 2 && ntDataIdx + 2 < segments.length) {
+    if (ntDataIdx >= 0 && ntDataIdx <= 3 && ntDataIdx + 2 < segments.length) {
       const mediaCategory = segments[ntDataIdx + 1].toLowerCase();
       if (ALLOWED_QQ_MEDIA_SUBDIRS.has(mediaCategory)) {
         return true;

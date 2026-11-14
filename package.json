@@ -18,6 +18,13 @@
   ],
   "author": "lingr25",
   "license": "MIT",
+  "qwqnt": {
+    "name": "Rosmontis",
+    "description": "Pure-JS Electron Renderer-Layer OneBot v11 Bridge for QQ NT",
+    "injects": {
+      "main": "./src/plugin_loader.js"
+    }
+  },
   "engines": {
     "node": ">=18.0.0"
   }

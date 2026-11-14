@@ -322,8 +322,8 @@ let singletonBridge = null;
 
 function installMainBridge(options = {}) {
   if (singletonBridge && !options.forceNew) {
-    if (options.config) {
-      singletonBridge.config = options.config;
+    if (options.config || options.configDir) {
+      singletonBridge.config = options.config || loadBridgeConfig(options.configDir);
       singletonBridge
         .stopServers()
         .then(() => {
