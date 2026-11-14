@@ -123,7 +123,11 @@ function resolveHelpers(helpers = {}) {
 }
 
 async function fetchClientKey(bridge) {
-  const res = await bridge.invokeNt("nodeIKernelTicketService/forceFetchClientKey", {}, []);
+  const res = await bridge.invokeNt(
+    "nodeIKernelTicketService/forceFetchClientKey",
+    { domain: "", url: "" },
+    [""]
+  );
   return {
     clientKey: String(res?.clientKey || ""),
     expireTime: String(res?.expireTime || "7200"),
@@ -149,7 +153,7 @@ async function getCookiesObject(bridge, domain = "qun.qq.com", helpers = {}) {
     try {
       const psRes = await bridge.invokeNt(
         psCmd,
-        { domainList: [domain], isForNewPCQQ: true },
+        { domains: [domain], domainList: [domain], isForNewPCQQ: true },
         [[domain], true]
       );
       const map = psRes?.domainPskeyMap || psRes;

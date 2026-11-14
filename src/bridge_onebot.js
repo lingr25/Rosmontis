@@ -34,6 +34,7 @@ const {
   UinUidStore,
   pickPositiveUin,
   stripTransientNtMedia,
+  buildNtMarketFaceUrl,
 } = require("./onebot/stores");
 
 const {
@@ -88,6 +89,7 @@ module.exports = {
   downloadMediaStreamToTempDir,
   resolveMediaSource,
   buildNtPicUrl,
+  buildNtMarketFaceUrl,
   buildNtRecordUri,
   ntMsgToOneBotSegments,
   oneBotSegmentsToNtElements,

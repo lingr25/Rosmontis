@@ -378,26 +378,16 @@ function normalizeGroupMember(m, groupId = 0) {
   let roleNum = 0;
   if (typeof rawRole === "number" && Number.isFinite(rawRole)) {
     roleNum = Math.trunc(rawRole);
-    role =
-      roleNum === 4 || roleNum === 1
-        ? "owner"
-        : roleNum === 3 || roleNum === 2
-        ? "admin"
-        : "member";
+    role = roleNum === 4 ? "owner" : roleNum === 3 ? "admin" : "member";
   } else if (typeof rawRole === "string") {
     const trimmedRole = rawRole.trim();
     if (/^\d+$/.test(trimmedRole)) {
       roleNum = Math.trunc(Number(trimmedRole));
-      role =
-        roleNum === 4 || roleNum === 1
-          ? "owner"
-          : roleNum === 3 || roleNum === 2
-          ? "admin"
-          : "member";
+      role = roleNum === 4 ? "owner" : roleNum === 3 ? "admin" : "member";
     } else if (trimmedRole) {
       role = trimmedRole;
       const lowerRole = trimmedRole.toLowerCase();
-      roleNum = lowerRole === "owner" ? 4 : lowerRole === "admin" ? 3 : 0;
+      roleNum = lowerRole === "owner" ? 4 : lowerRole === "admin" ? 3 : 2;
     }
   }
 

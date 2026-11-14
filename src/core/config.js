@@ -248,6 +248,9 @@ function loadBridgeConfig(customConfigDir) {
           "focusIdleBlurMs",
           "sendEchoTimeoutMs",
           "richMediaEchoTimeoutMs",
+          "mediaHydrationTimeoutMs",
+          "richMediaDownloadTimeoutMs",
+          "forwardMediaHydrationBudgetMs",
           "dedupeWindowMs",
           "autoQuickLogin",
           "maxMediaBytes",
@@ -354,6 +357,12 @@ function loadBridgeConfig(customConfigDir) {
     loadedRaw.forwardEchoTimeoutMs,
     0,
     "FORWARD_ECHO_TIMEOUT_MS"
+  );
+
+  defaultConfig.forwardMediaHydrationBudgetMs = _resolvePositiveIntWithDefault(
+    loadedRaw.forwardMediaHydrationBudgetMs,
+    3500,
+    "FORWARD_MEDIA_HYDRATION_BUDGET_MS"
   );
 
   _applyOptionalBoolOverride(

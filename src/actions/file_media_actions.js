@@ -4,7 +4,9 @@ const fs = require("fs");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
-const { resolveMediaSource } = require("../core/media_security");
+const { buildNtMarketFaceUrl } = require("../bridge_onebot");
+const { resolveTempDirFromEnv } = require("../core/env");
+const { resolveMediaSource, pruneTempDirAsync } = require("../core/media_security");
 const { transcodeRecordOutFormat } = require("../core/audio_codec");
 const { createActionRouter, createEventWaiter } = require("../core/primitives");
 const {
@@ -187,6 +189,23 @@ function elementToMediaDesc(el, ntMsgId, chatType, peerUid) {
       fileSize: Number(ve.fileSize || 0),
     };
   }
+  if (t === 11 && el.marketFaceElement) {
+    const mf = el.marketFaceElement;
+    const emojiId = String(mf.emojiId || "").trim();
+    return {
+      ntMsgId: String(ntMsgId || ""),
+      chatType: Number(chatType || 1),
+      peerUid: String(peerUid || ""),
+      elementId,
+      elementType: 11,
+      md5: emojiId.toLowerCase(),
+      fileUuid: emojiId,
+      fileName: String(mf.faceName || (emojiId ? `${emojiId}.gif` : "marketface.gif")),
+      sourcePath: String(mf.staticFacePath || mf.dynamicFacePath || ""),
+      url: buildNtMarketFaceUrl(emojiId),
+      fileSize: 0,
+    };
+  }
   return null;
 }
 
@@ -220,7 +239,7 @@ function selectMediaDescFromRawMsg(rawMsg, entry, action, rawFile, rawFileId, el
   }
 
   if (action === "get_image") {
-    return descs.find((d) => d.elementType === 2) || descs[0];
+    return descs.find((d) => d.elementType === 2 || d.elementType === 11) || descs[0];
   }
   if (action === "get_record") {
     return descs.find((d) => d.elementType === 4) || descs[0];
@@ -228,22 +247,235 @@ function selectMediaDescFromRawMsg(rawMsg, entry, action, rawFile, rawFileId, el
   return descs.find((d) => d.elementType === 3 || d.elementType === 5) || descs[0];
 }
 
-async function listGroupFiles(bridge, groupId, folderId) {
-  const res = await bridge.invokeNt("nodeIKernelRichMediaService/getGroupFileList", {
-    groupId: String(groupId),
-    groupFileListForm: {
-      sortType: 1,
-      fileCount: 100,
-      startIndex: 0,
-      sortOrder: 2,
-      showOnlinedocFolder: 0,
-      folderId,
-    },
+function sanitizeDownloadFileName(rawName, fallback = "file") {
+  const base = path.basename(String(rawName || "").trim());
+  const cleaned = base.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
+  return cleaned || fallback;
+}
+
+async function allocateTempDownloadPath(bridge, preferredName = "file") {
+  const tempDir = resolveTempDirFromEnv(bridge?.config?.tempDir);
+  await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
+  const safeName = sanitizeDownloadFileName(preferredName, "file");
+  const filePath = path.join(
+    tempDir,
+    `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`
+  );
+  return { tempDir, filePath };
+}
+
+async function resolveGroupFileMeta(bridge, groupId, fileId, rawBusId) {
+  const explicitBus =
+    rawBusId !== undefined &&
+    rawBusId !== null &&
+    rawBusId !== "" &&
+    Number.isFinite(Number(rawBusId)) &&
+    Number(rawBusId) > 0
+      ? Number(rawBusId)
+      : 0;
+  let fileInfo = null;
+  if (groupId && fileId) {
+    try {
+      const infoRes = await bridge.invokeNt(
+        "nodeIKernelRichMediaService/getGroupFileInfo",
+        { groupId: String(groupId), fileId: String(fileId) },
+        [String(groupId), String(fileId)]
+      );
+      fileInfo =
+        infoRes?.groupFileInfoResult?.fileInfo ||
+        infoRes?.fileInfo ||
+        (infoRes && typeof infoRes === "object" && (infoRes.fileId || infoRes.busId)
+          ? infoRes
+          : null);
+    } catch (_) {}
+  }
+  const busId =
+    explicitBus ||
+    (Number(fileInfo?.busId || fileInfo?.busid || 0) > 0
+      ? Number(fileInfo.busId || fileInfo.busid)
+      : 102);
+  return { busId, fileInfo };
+}
+
+async function waitRichMediaTargetFile(bridge, targetPath, extraKeys = [], timeoutMs = 8000) {
+  const effectiveTimeout = Math.max(50, Number(timeoutMs) || 8000);
+  if (!bridge._richMediaWaiters) {
+    bridge._richMediaWaiters = new Map();
+  }
+  const waitKeys = [targetPath, ...extraKeys].map((k) => String(k || "")).filter(Boolean);
+  let timer = null;
+  let pollTimer = null;
+  let waiterEntry = null;
+  let settled = false;
+
+  const cleanup = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (waiterEntry && bridge._richMediaWaiters) {
+      for (const k of waitKeys) {
+        const set = bridge._richMediaWaiters.get(k);
+        if (set) {
+          set.delete(waiterEntry);
+          if (set.size === 0) bridge._richMediaWaiters.delete(k);
+        }
+      }
+    }
+  };
+
+  let finishRef = null;
+  const promise = new Promise((resolve) => {
+    let polling = false;
+    const finish = (candidate) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(String(candidate || targetPath || ""));
+    };
+    finishRef = finish;
+    waiterEntry = {
+      msgId: "",
+      elementId: "0",
+      targetPath,
+      resolve: (downloadedPath) => finish(downloadedPath || targetPath),
+    };
+    for (const k of waitKeys) {
+      if (!bridge._richMediaWaiters.has(k)) {
+        bridge._richMediaWaiters.set(k, new Set());
+      }
+      bridge._richMediaWaiters.get(k).add(waiterEntry);
+    }
+    if (targetPath) {
+      pollTimer = setInterval(async () => {
+        if (polling || settled) return;
+        polling = true;
+        try {
+          const st = await statNonEmptyFile(targetPath);
+          if (st) finish(targetPath);
+        } finally {
+          polling = false;
+        }
+      }, 150);
+      pollTimer.unref?.();
+    }
+    timer = setTimeout(() => finish(targetPath), effectiveTimeout);
+    timer.unref?.();
   });
-  const items = Array.isArray(res?.items)
-    ? res.items
-    : Array.isArray(res?.files)
-    ? res.files
+
+  return {
+    promise,
+    cancel: () => finishRef && finishRef(""),
+  };
+}
+
+async function downloadGroupFileToLocal(bridge, groupId, fileId, options = {}) {
+  const groupCode = String(groupId || "").trim();
+  const targetFileId = String(fileId || "").trim();
+  if (!groupCode || !targetFileId) return { localPath: "", url: "" };
+
+  const { fileInfo } = await resolveGroupFileMeta(
+    bridge,
+    groupCode,
+    targetFileId,
+    options.busId
+  );
+  if (fileInfo?.localPath) {
+    const existing = await statNonEmptyFile(String(fileInfo.localPath));
+    if (existing) {
+      return { localPath: String(fileInfo.localPath), url: pathToFileURL(String(fileInfo.localPath)).href };
+    }
+  }
+
+  const modelId = String(
+    options.modelId ||
+      (fileInfo?.fileModelId && String(fileInfo.fileModelId) !== "0" ? fileInfo.fileModelId : "") ||
+      targetFileId
+  );
+  const preferredName = String(options.fileName || fileInfo?.fileName || targetFileId || "group_file");
+  const { tempDir, filePath: savePath } = await allocateTempDownloadPath(bridge, preferredName);
+  const peer = { chatType: 2, peerUid: groupCode, guildId: "" };
+  const timeoutMs =
+    Number(options.timeoutMs || bridge?.config?.richMediaDownloadTimeoutMs) || 8000;
+
+  const waiter = await waitRichMediaTargetFile(bridge, savePath, [`0:0`], timeoutMs);
+  try {
+    const res = await bridge.invokeNt(
+      "nodeIKernelRichMediaService/downloadFileForModelId",
+      {
+        peer,
+        fileModelIdList: [modelId],
+        modelIdList: [modelId],
+        savePath,
+        save_path: savePath,
+      },
+      [peer, [modelId], savePath]
+    );
+    const directFilePath =
+      res && typeof res === "object" && res.filePath ? String(res.filePath) : "";
+    if (directFilePath) {
+      const directStat = await statNonEmptyFile(directFilePath);
+      if (directStat) {
+        waiter.cancel();
+        if (path.resolve(directFilePath).startsWith(path.resolve(tempDir))) {
+          trackActionTempMedia(bridge, { isTempFile: true, localPath: directFilePath });
+          await pruneTempDirAsync(tempDir, 128);
+        }
+        return { localPath: directFilePath, url: pathToFileURL(directFilePath).href };
+      }
+    }
+    const directUrl =
+      typeof res === "string"
+        ? res
+        : String(res?.url || res?.downloadUrl || res?.httpsUrl || "");
+    if (/^(?:https?|file):\/\//i.test(directUrl)) {
+      waiter.cancel();
+      return { localPath: "", url: directUrl };
+    }
+
+    const immediateStat = await statNonEmptyFile(savePath);
+    const candidatePath = immediateStat ? savePath : await waiter.promise;
+    const finalStat = await statNonEmptyFile(candidatePath);
+    if (finalStat) {
+      trackActionTempMedia(bridge, { isTempFile: true, localPath: candidatePath });
+      await pruneTempDirAsync(tempDir, 128);
+      return { localPath: candidatePath, url: pathToFileURL(candidatePath).href };
+    }
+  } catch (_) {
+    waiter.cancel();
+  }
+  return { localPath: "", url: "" };
+}
+
+async function listGroupFiles(bridge, groupId, folderId, options = {}) {
+  const groupIdStr = String(groupId);
+  const fileListForm = {
+    sortType: 1,
+    fileCount: Math.max(1, Number(options.fileCount || 100)),
+    startIndex: Math.max(0, Number(options.startIndex || 0)),
+    sortOrder: 2,
+    showOnlinedocFolder: false,
+    folderId: String(folderId || "/"),
+  };
+  const res = await bridge.invokeNt(
+    "nodeIKernelRichMediaService/getGroupFileList",
+    {
+      groupId: groupIdStr,
+      fileListForm,
+    },
+    [groupIdStr, fileListForm]
+  );
+  const listRoot = res?.groupFileListResult || res || {};
+  const items = Array.isArray(listRoot.item)
+    ? listRoot.item
+    : Array.isArray(listRoot.items)
+    ? listRoot.items
+    : Array.isArray(listRoot.files)
+    ? listRoot.files
     : [];
   const files = [];
   const folders = [];
@@ -389,7 +621,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
   let kernelStat = await statNonEmptyFile(kernelLocalPath);
   let kernelRemoteUrl = "";
 
-  if (mediaDesc && !kernelStat) {
+  if (mediaDesc && !kernelStat && Number(mediaDesc.elementType) !== 11) {
     const ntMsgId = String(mediaDesc.ntMsgId || "");
     const chatType = Number(mediaDesc.chatType || 1);
     const peerUid = String(mediaDesc.peerUid || "");
@@ -404,9 +636,12 @@ async function resolveOneBotMediaAction(p, _context, action) {
             peerUid,
             elementId,
             downloadType: 1,
+            downSourceType: 0,
+            downloadScene: 0,
+            fileModelId: String(mediaDesc.fileModelId || "0"),
             thumbSize: 0,
             filePath: safeTargetPath,
-            timeoutMs: 8000,
+            timeoutMs: Number(this.config?.richMediaDownloadTimeoutMs) || 8000,
           });
           const candidate = String(dlPath || safeTargetPath || "");
           const st = await statNonEmptyFile(candidate);
@@ -419,8 +654,9 @@ async function resolveOneBotMediaAction(p, _context, action) {
         try {
           const getReq = {
             downSourceType: 0,
-            fileModelId: "0",
             downloadSourceType: 0,
+            downloadScene: 0,
+            fileModelId: String(mediaDesc.fileModelId || "0"),
             triggerType: 1,
             msgId: ntMsgId,
             chatType,
@@ -464,69 +700,19 @@ async function resolveOneBotMediaAction(p, _context, action) {
           : "") ||
         ""
     ).trim();
-    if (knownUuid && (groupCode || mediaDesc?.peerUid)) {
-      const busId = Number(p.busid || 102);
-      const filePeer = groupCode
-        ? { chatType: 2, peerUid: groupCode, guildId: "" }
-        : {
-            chatType: Number(mediaDesc.chatType || 1),
-            peerUid: String(mediaDesc.peerUid),
-            guildId: "",
-          };
-      const attempts = [
-        ...(groupCode
-          ? [
-              [
-                "nodeIKernelRichMediaService/downloadFileForModelId",
-                { peer: filePeer, modelIdList: [knownUuid], downSourceType: 0 },
-                [filePeer, [knownUuid], ""],
-              ],
-            ]
-          : []),
-        [
-          "nodeIKernelRichMediaService/downloadFileForFileUuid",
-          {
-            peer: filePeer,
-            fileUuid: knownUuid,
-            httpsUrl: "",
-            fileName: String(mediaDesc?.fileName || ""),
-            fileSize: String(mediaDesc?.fileSize || 0),
-            busId,
-          },
-          [filePeer, knownUuid, ""],
-        ],
-        ...(groupCode
-          ? [
-              [
-                "nodeIKernelRichMediaService/getGroupFileDownloadUrl",
-                { groupId: groupCode, fileId: knownUuid, busId },
-                [groupCode, knownUuid, busId],
-              ],
-            ]
-          : []),
-      ];
-      for (const [cmd, payload, posArgs] of attempts) {
-        try {
-          const res = await this.invokeNt(cmd, payload, posArgs);
-          const candidatePath =
-            res && typeof res === "object" && res.filePath ? String(res.filePath) : "";
-          if (candidatePath) {
-            const st = await statNonEmptyFile(candidatePath);
-            if (st) {
-              kernelLocalPath = candidatePath;
-              kernelStat = st;
-              break;
-            }
-          }
-          const candidateUrl =
-            typeof res === "string"
-              ? res
-              : String(res?.url || res?.downloadUrl || res?.httpsUrl || "");
-          if (/^https?:\/\//i.test(candidateUrl)) {
-            kernelRemoteUrl = candidateUrl;
-            break;
-          }
-        } catch (_) {}
+    if (knownUuid && groupCode) {
+      const dl = await downloadGroupFileToLocal(this, groupCode, knownUuid, {
+        busId: p.busid,
+        fileName: mediaDesc?.fileName,
+      });
+      if (dl.localPath) {
+        const st = await statNonEmptyFile(dl.localPath);
+        if (st) {
+          kernelLocalPath = dl.localPath;
+          kernelStat = st;
+        }
+      } else if (/^https?:\/\//i.test(dl.url)) {
+        kernelRemoteUrl = dl.url;
       }
     }
   }
@@ -640,6 +826,56 @@ async function handleWebCredentialOrQzoneAction(p, _context, action) {
   return await dispatchWebCredentialOrQzoneAction(this, action, p, WEB_HTTP_HELPERS);
 }
 
+function normalizeOcrResultLines(res) {
+  const rawList = Array.isArray(res)
+    ? res
+    : Array.isArray(res?.ocrResult)
+    ? res.ocrResult
+    : Array.isArray(res?.lines)
+    ? res.lines
+    : Array.isArray(res?.texts)
+    ? res.texts
+    : Array.isArray(res?.result?.ocrResult)
+    ? res.result.ocrResult
+    : [];
+  const texts = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== "object") continue;
+    if (Array.isArray(item.coordinates) && item.confidence !== undefined) {
+      texts.push({
+        text: String(item.text || ""),
+        confidence: Number(item.confidence) || 0,
+        coordinates: item.coordinates.map((pt) => ({
+          x: Number(pt?.x || 0),
+          y: Number(pt?.y || 0),
+        })),
+      });
+      continue;
+    }
+    const rawScore = Number(item.score ?? item.confidence ?? 0);
+    const confidence = Number.isFinite(rawScore)
+      ? rawScore > 0 && rawScore <= 1
+        ? Math.round(rawScore * 100)
+        : Math.round(rawScore)
+      : 0;
+    const coordinates = [item.pt1, item.pt2, item.pt3, item.pt4]
+      .filter((pt) => pt && typeof pt === "object")
+      .map((pt) => ({
+        x: Number(pt.x || 0),
+        y: Number(pt.y || 0),
+      }));
+    texts.push({
+      text: String(item.text || ""),
+      confidence,
+      coordinates,
+    });
+  }
+  return {
+    texts,
+    language: String(res?.language || "zh"),
+  };
+}
+
 // ============================================================================
 // Declarative Action Handlers & Aliases
 // ============================================================================
@@ -647,102 +883,240 @@ async function handleWebCredentialOrQzoneAction(p, _context, action) {
 const ACTION_HANDLERS = {
   // ---- 7. Group & Private Files ----
   async get_group_root_files(p) {
-    return await listGroupFiles(this, Number(p.group_id || 0), "/");
+    return await listGroupFiles(this, Number(p.group_id || 0), "/", {
+      fileCount: p.file_count,
+      startIndex: p.start_index,
+    });
   },
 
   async get_group_files_by_folder(p) {
     return await listGroupFiles(
       this,
       Number(p.group_id || 0),
-      String(p.folder_id || p.folder || "/")
+      String(p.folder_id || p.folder || "/"),
+      {
+        fileCount: p.file_count,
+        startIndex: p.start_index,
+      }
     );
   },
 
   async get_group_file_system_info(p) {
     const groupId = String(p.group_id || "");
-    const res = await this.invokeNt("nodeIKernelRichMediaService/getGroupSpace", {
-      groupId,
-    });
+    const res = await this.invokeNt(
+      "nodeIKernelRichMediaService/getGroupSpace",
+      { groupId },
+      [groupId]
+    );
+    const space = res?.groupSpaceResult || res || {};
     return {
-      file_count: Number(res?.fileCount || 0),
-      limit_count: Number(res?.maxFileCount || 10000),
-      used_space: Number(res?.usedSpace || 0),
-      total_space: Number(res?.totalSpace || 10737418240),
+      file_count: Number(space.fileCount ?? space.totalFileCount ?? 0),
+      limit_count: Number(space.maxFileCount ?? 10000),
+      used_space: Number(space.usedSpace ?? 0),
+      total_space: Number(space.totalSpace ?? 10737418240),
     };
   },
 
   async get_group_file_url(p) {
-    const groupId = String(p.group_id || "");
-    const fileId = String(p.file_id || "");
-    const busId = Number(p.busid || 102);
-    const peer = { chatType: 2, peerUid: groupId, guildId: "" };
+    const groupId = String(p.group_id || "").trim();
+    const fileId = String(p.file_id || "").trim();
+    if (!groupId || !fileId) return { url: "" };
 
-    // 1. Primary: genuine NTQQ RichMedia downloadFileForModelId / downloadFileForFileUuid
-    for (const [cmd, payload, posArgs] of [
-      [
-        "nodeIKernelRichMediaService/downloadFileForModelId",
-        { peer, modelIdList: [fileId], downSourceType: 0 },
-        [peer, [fileId], ""],
-      ],
-      [
-        "nodeIKernelRichMediaService/downloadFileForFileUuid",
-        { peer, fileUuid: fileId, httpsUrl: "", fileName: "", fileSize: "0", busId },
-        [peer, fileId, ""],
-      ],
-      [
-        "nodeIKernelRichMediaService/getGroupFileDownloadUrl",
-        { groupId, fileId, busId },
-        [groupId, fileId, busId],
-      ],
-    ]) {
+    const mediaDesc = this.messageIdStore?.lookupMedia?.(fileId) || null;
+    if (mediaDesc?.sourcePath) {
+      const existing = await statNonEmptyFile(String(mediaDesc.sourcePath));
+      if (existing) {
+        return { url: pathToFileURL(String(mediaDesc.sourcePath)).href };
+      }
+    }
+    if (
+      mediaDesc?.ntMsgId &&
+      !/^(sent_|fwd_|echo_timeout_)/.test(String(mediaDesc.ntMsgId)) &&
+      mediaDesc.peerUid &&
+      mediaDesc.elementId &&
+      typeof this._downloadRichMediaElement === "function"
+    ) {
       try {
-        const res = await this.invokeNt(cmd, payload, posArgs);
-        const url =
-          typeof res === "string"
-            ? res
-            : String(res?.url || res?.downloadUrl || res?.httpsUrl || "");
-        if (url) return { url };
+        const { tempDir, filePath: fallbackSavePath } = await allocateTempDownloadPath(
+          this,
+          mediaDesc.fileName || fileId
+        );
+        const targetPath = mediaDesc.sourcePath
+          ? String(mediaDesc.sourcePath)
+          : fallbackSavePath;
+        const dlPath = await this._downloadRichMediaElement({
+          msgId: String(mediaDesc.ntMsgId),
+          chatType: Number(mediaDesc.chatType || 2),
+          peerUid: String(mediaDesc.peerUid),
+          elementId: String(mediaDesc.elementId),
+          downloadType: 1,
+          downSourceType: 0,
+          downloadScene: 0,
+          fileModelId: String(mediaDesc.fileModelId || "0"),
+          thumbSize: 0,
+          filePath: targetPath,
+          timeoutMs: Number(this.config?.richMediaDownloadTimeoutMs) || 8000,
+        });
+        const candidate = String(dlPath || targetPath || "");
+        const st = await statNonEmptyFile(candidate);
+        if (st) {
+          if (path.resolve(candidate).startsWith(path.resolve(tempDir))) {
+            trackActionTempMedia(this, { isTempFile: true, localPath: candidate });
+            await pruneTempDirAsync(tempDir, 128);
+          }
+          return { url: pathToFileURL(candidate).href };
+        }
       } catch (_) {}
     }
-    return { url: "" };
+
+    const dl = await downloadGroupFileToLocal(this, groupId, fileId, {
+      busId: p.busid,
+      modelId: p.model_id,
+      fileName: p.file_name || mediaDesc?.fileName,
+    });
+    return { url: String(dl.url || "") };
   },
 
   async get_private_file_url(p) {
-    const fileId = String(p.file_id || "");
-    const fileHash = String(p.file_hash || "");
-    const userId = String(p.user_id || "");
-    const peer = userId
-      ? await this._resolvePeerForUser(userId)
-      : { chatType: 1, peerUid: "", guildId: "" };
+    const fileId = String(p.file_id || "").trim();
+    const fileHash = String(p.file_hash || "").trim().toLowerCase();
+    const userId = String(p.user_id || "").trim();
 
-    for (const [cmd, payload, posArgs] of [
-      [
-        "nodeIKernelRichMediaService/downloadFileForFileUuid",
-        { peer, fileUuid: fileId, fileHash, userId },
-        [peer, fileId, ""],
-      ],
-      [
-        "nodeIKernelRichMediaService/getPrivateFileDownloadUrl",
-        { fileId, fileHash, userId },
-        [fileId, fileHash, userId],
-      ],
-    ]) {
+    let mediaDesc = null;
+    if (p.msg_id || p.message_id) {
+      const entry = resolveMessageEntry(this, p.msg_id || p.message_id);
+      if (entry?.rawMsg) {
+        mediaDesc = selectMediaDescFromRawMsg(
+          entry.rawMsg,
+          entry,
+          "get_file",
+          fileId,
+          fileHash,
+          p.element_id
+        );
+      }
+    }
+    if (!mediaDesc && typeof this.messageIdStore?.lookupMedia === "function") {
+      if (fileId) mediaDesc = this.messageIdStore.lookupMedia(fileId);
+      if (!mediaDesc && fileHash) mediaDesc = this.messageIdStore.lookupMedia(fileHash);
+    }
+
+    if (!mediaDesc && userId) {
       try {
-        const res = await this.invokeNt(cmd, payload, posArgs);
-        const url =
-          typeof res === "string"
-            ? res
-            : String(res?.url || res?.downloadUrl || res?.httpsUrl || "");
-        if (url) return { url };
+        const peer = await this._resolvePeerForUser(userId);
+        if (peer?.peerUid) {
+          const histRes = await this.invokeNt(
+            "nodeIKernelMsgService/getMsgsIncludeSelf",
+            { peer, msgId: "0", cnt: 20, queryOrder: false },
+            [peer, "0", 20, false]
+          );
+          const msgList = Array.isArray(histRes?.msgList) ? histRes.msgList : [];
+          for (const msg of msgList) {
+            this.messageIdStore?.indexMsgMedia?.(msg);
+            const candidate = selectMediaDescFromRawMsg(
+              msg,
+              null,
+              "get_file",
+              fileId,
+              fileHash,
+              p.element_id
+            );
+            if (
+              candidate &&
+              ((fileId && candidate.fileUuid === fileId) ||
+                (fileHash && candidate.md5 === fileHash) ||
+                (!fileId && !fileHash))
+            ) {
+              mediaDesc = candidate;
+              break;
+            }
+          }
+        }
       } catch (_) {}
+    }
+
+    if (!mediaDesc) return { url: "" };
+
+    if (mediaDesc.sourcePath) {
+      const existing = await statNonEmptyFile(String(mediaDesc.sourcePath));
+      if (existing) {
+        return { url: pathToFileURL(String(mediaDesc.sourcePath)).href };
+      }
+    }
+
+    const ntMsgId = String(mediaDesc.ntMsgId || "");
+    const peerUid = String(mediaDesc.peerUid || "");
+    const elementId = String(mediaDesc.elementId || "");
+    if (!ntMsgId || /^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) || !peerUid || !elementId) {
+      return { url: "" };
+    }
+
+    const { tempDir, filePath: fallbackSavePath } = await allocateTempDownloadPath(
+      this,
+      mediaDesc.fileName || fileId || "private_file"
+    );
+    const targetPath = mediaDesc.sourcePath ? String(mediaDesc.sourcePath) : fallbackSavePath;
+    const timeoutMs = Number(this.config?.richMediaDownloadTimeoutMs) || 8000;
+
+    let candidatePath = "";
+    if (typeof this._downloadRichMediaElement === "function") {
+      try {
+        candidatePath = await this._downloadRichMediaElement({
+          msgId: ntMsgId,
+          chatType: Number(mediaDesc.chatType || 1),
+          peerUid,
+          elementId,
+          downloadType: 1,
+          downSourceType: 0,
+          downloadScene: 0,
+          fileModelId: String(mediaDesc.fileModelId || "0"),
+          thumbSize: 0,
+          filePath: targetPath,
+          timeoutMs,
+        });
+      } catch (_) {}
+    } else {
+      try {
+        const getReq = {
+          downSourceType: 0,
+          downloadSourceType: 0,
+          downloadScene: 0,
+          fileModelId: String(mediaDesc.fileModelId || "0"),
+          triggerType: 1,
+          msgId: ntMsgId,
+          chatType: Number(mediaDesc.chatType || 1),
+          peerUid,
+          elementId,
+          thumbSize: 0,
+          downloadType: 1,
+          filePath: targetPath,
+        };
+        const res = await this.invokeNt(
+          "nodeIKernelMsgService/downloadRichMedia",
+          { getReq },
+          [getReq]
+        );
+        candidatePath = String(res?.filePath || targetPath || "");
+      } catch (_) {}
+    }
+
+    const resolved = String(candidatePath || targetPath || "");
+    const st = await statNonEmptyFile(resolved);
+    if (st) {
+      if (path.resolve(resolved).startsWith(path.resolve(tempDir))) {
+        trackActionTempMedia(this, { isTempFile: true, localPath: resolved });
+        await pruneTempDirAsync(tempDir, 128);
+      }
+      return { url: pathToFileURL(resolved).href };
     }
     return { url: "" };
   },
 
   async upload_group_file(p) {
     const groupId = Number(p.group_id || 0);
+    const groupIdStr = String(groupId);
     const folder = String(p.folder || p.folder_id || "/").trim();
-    const peer = { chatType: 2, peerUid: String(groupId), guildId: "" };
+    const peer = { chatType: 2, peerUid: groupIdStr, guildId: "" };
     const sent = await this._sendMessageToPeer(peer, [
       {
         type: "file",
@@ -756,16 +1130,19 @@ const ACTION_HANDLERS = {
     const fileUuid = await extractUploadedFileUuid(this, peer, sent);
     if (folder && folder !== "/" && fileUuid) {
       try {
+        const { busId } = await resolveGroupFileMeta(this, groupIdStr, fileUuid, p.busid);
+        const busIdList = [busId];
+        const fileIdList = [String(fileUuid)];
         await this.invokeNt(
           "nodeIKernelRichMediaService/moveGroupFile",
           {
-            groupId: String(groupId),
-            busIdList: [Number(p.busid || 102)],
-            fileIdList: [String(fileUuid)],
+            groupId: groupIdStr,
+            busIdList,
+            fileIdList,
             curFolderId: "/",
             dstFolderId: folder,
           },
-          [String(groupId), [String(fileUuid)], "/", folder]
+          [groupIdStr, busIdList, fileIdList, "/", folder]
         );
       } catch (_) {}
     }
@@ -794,17 +1171,25 @@ const ACTION_HANDLERS = {
   },
 
   async create_group_file_folder(p) {
-    const res = await this.invokeNt("nodeIKernelRichMediaService/createGroupFolder", {
-      groupId: String(p.group_id),
-      parentFolderId: String(p.parent_id || "/"),
-      folderName: String(p.name || ""),
-    });
+    const groupId = String(p.group_id);
+    const folderName = String(p.name || "");
+    const res = await this.invokeNt(
+      "nodeIKernelRichMediaService/createGroupFolder",
+      {
+        groupId,
+        folderName,
+      },
+      [groupId, folderName]
+    );
+    const groupItem = res?.resultWithGroupItem?.groupItem || res?.groupItem || res;
     return {
       result: { retCode: 0, retMsg: "success" },
       groupItem: {
-        folderInfo: res?.folderInfo || {
-          folderId: String(res?.folderId || `folder_${Date.now()}`),
-          folderName: String(p.name || ""),
+        folderInfo: groupItem?.folderInfo || {
+          folderId: String(
+            groupItem?.folderId || res?.folderId || `folder_${Date.now()}`
+          ),
+          folderName,
           folderPath: String(p.parent_id || "/"),
         },
       },
@@ -812,58 +1197,104 @@ const ACTION_HANDLERS = {
   },
 
   async delete_group_folder(p) {
-    await this.invokeNt("nodeIKernelRichMediaService/deleteGroupFolder", {
-      groupId: String(p.group_id),
-      folderId: String(p.folder_id || ""),
-    });
+    const groupId = String(p.group_id);
+    const folderId = String(p.folder_id || "");
+    await this.invokeNt(
+      "nodeIKernelRichMediaService/deleteGroupFolder",
+      { groupId, folderId },
+      [groupId, folderId]
+    );
     return {};
   },
 
   async delete_group_file(p) {
-    await this.invokeNt("nodeIKernelRichMediaService/deleteGroupFile", {
-      groupId: String(p.group_id),
-      busIdList: [Number(p.busid || 102)],
-      fileIdList: [String(p.file_id || "")],
-    });
+    const groupId = String(p.group_id);
+    const fileId = String(p.file_id || "");
+    const { busId } = await resolveGroupFileMeta(this, groupId, fileId, p.busid);
+    const busIdList = [busId];
+    const fileIdList = [fileId];
+    await this.invokeNt(
+      "nodeIKernelRichMediaService/deleteGroupFile",
+      {
+        groupId,
+        busIdList,
+        fileIdList,
+        transGroupFileResult: [],
+      },
+      [groupId, busIdList, fileIdList]
+    );
     return {};
   },
 
   async move_group_file(p) {
-    await this.invokeNt("nodeIKernelRichMediaService/moveGroupFile", {
-      groupId: String(p.group_id),
-      busIdList: [Number(p.busid || 102)],
-      fileIdList: [String(p.file_id || "")],
-      curFolderId: String(p.parent_directory || "/"),
-      dstFolderId: String(p.target_directory || "/"),
-    });
+    const groupId = String(p.group_id);
+    const fileId = String(p.file_id || "");
+    const { busId } = await resolveGroupFileMeta(this, groupId, fileId, p.busid);
+    const busIdList = [busId];
+    const fileIdList = [fileId];
+    const curFolderId = String(p.parent_directory || "/");
+    const dstFolderId = String(p.target_directory || "/");
+    await this.invokeNt(
+      "nodeIKernelRichMediaService/moveGroupFile",
+      {
+        groupId,
+        busIdList,
+        fileIdList,
+        curFolderId,
+        dstFolderId,
+      },
+      [groupId, busIdList, fileIdList, curFolderId, dstFolderId]
+    );
     return {};
   },
 
   async rename_group_file(p) {
-    await this.invokeNt("nodeIKernelRichMediaService/renameGroupFile", {
-      groupId: String(p.group_id),
-      busId: Number(p.busid || 102),
-      fileId: String(p.file_id || ""),
-      parentFolderId: String(p.current_parent_directory || p.parent_directory || "/"),
-      newFileName: String(p.new_name || p.name || ""),
-    });
+    const groupId = String(p.group_id);
+    const fileId = String(p.file_id || "");
+    const { busId } = await resolveGroupFileMeta(this, groupId, fileId, p.busid);
+    const parentFolderId = String(p.current_parent_directory || p.parent_directory || "/");
+    const newFileName = String(p.new_name || p.name || "");
+    await this.invokeNt(
+      "nodeIKernelRichMediaService/renameGroupFile",
+      {
+        groupId,
+        busId,
+        fileId,
+        parentFolderId,
+        newFileName,
+      },
+      [groupId, busId, fileId, parentFolderId, newFileName]
+    );
     return {};
   },
 
   async rename_group_file_folder(p) {
-    await this.invokeNt("nodeIKernelRichMediaService/renameGroupFolder", {
-      groupId: String(p.group_id),
-      folderId: String(p.folder_id || ""),
-      newFolderName: String(p.new_folder_name || p.new_name || p.name || ""),
-    });
+    const groupId = String(p.group_id);
+    const folderId = String(p.folder_id || "");
+    const newFolderName = String(p.new_folder_name || p.new_name || p.name || "");
+    await this.invokeNt(
+      "nodeIKernelRichMediaService/renameGroupFolder",
+      {
+        groupId,
+        folderId,
+        newFolderName,
+      },
+      [groupId, folderId, newFolderName]
+    );
     return {};
   },
 
   async trans_group_file(p) {
-    await this.invokeNt("nodeIKernelRichMediaService/transGroupFile", {
-      groupId: String(p.group_id),
-      fileId: String(p.file_id || ""),
-    });
+    const groupId = String(p.group_id);
+    const fileId = String(p.file_id || "");
+    await this.invokeNt(
+      "nodeIKernelRichMediaService/transGroupFile",
+      {
+        groupId,
+        fileId,
+      },
+      [groupId, fileId]
+    );
     return { ok: true };
   },
 
@@ -873,17 +1304,20 @@ const ACTION_HANDLERS = {
   get_file: resolveOneBotMediaAction,
 
   async ocr_image(p) {
-    const imgSrc = String(p.image || "");
+    const imgSrc = String(p.image || p.file || "").trim();
     let media = null;
     try {
       media = await resolveMediaSource(imgSrc, this._mediaSecurityOptions());
-      const res = await this.invokeNt("nodeIKernelMiscService/ocr", {
-        path: media.localPath,
-      });
-      return {
-        texts: Array.isArray(res?.texts) ? res.texts : [],
-        language: String(res?.language || "zh"),
-      };
+      const res = await this.invokeNt(
+        "nodeIKernelRichMediaService/getScreenOCR",
+        {
+          imgFilepath: media.localPath,
+          path: media.localPath,
+          filePath: media.localPath,
+        },
+        [media.localPath]
+      );
+      return normalizeOcrResultLines(res);
     } finally {
       scheduleResolvedMediaCleanup(this, media);
     }
@@ -933,12 +1367,17 @@ const ACTION_HANDLERS = {
     }
 
     const waiter = createPttTextWaiter(this, ntMsgId, 10000);
+    const msgElement = pttEl || { elementType: 4, elementId: "" };
     try {
-      const res = await this.invokeNt("nodeIKernelMsgService/translatePtt2Text", {
-        msgId: ntMsgId,
-        peer,
-        msgElement: pttEl || { elementType: 4, elementId: "" },
-      });
+      const res = await this.invokeNt(
+        "nodeIKernelMsgService/translatePtt2Text",
+        {
+          msgId: ntMsgId,
+          peer,
+          msgElement,
+        },
+        [ntMsgId, peer, msgElement]
+      );
       if (res?.text) {
         waiter.cancel();
         return { text: String(res.text) };
@@ -952,47 +1391,71 @@ const ACTION_HANDLERS = {
   },
 
   async set_qq_profile(p) {
-    await this.invokeNt("nodeIKernelProfileService/modifyDesktopMiniProfile", {
-      profile: {
-        nick: p.nickname !== undefined ? String(p.nickname) : undefined,
-        longNick: p.personal_note !== undefined ? String(p.personal_note) : undefined,
-      },
-    });
+    const profile = {
+      ...(p.nickname !== undefined ? { nick: String(p.nickname) } : {}),
+      ...(p.personal_note !== undefined ? { longNick: String(p.personal_note) } : {}),
+      ...(p.sex !== undefined ? { sex: Number(p.sex) } : {}),
+    };
+    if (Object.keys(profile).length > 0) {
+      await this.invokeNt(
+        "nodeIKernelProfileService/modifyDesktopMiniProfile",
+        { profile },
+        [profile]
+      );
+    }
+    if (p.personal_note !== undefined) {
+      const words = String(p.personal_note);
+      try {
+        await this.invokeNt(
+          "nodeIKernelProfileService/setLongNick",
+          { words, longNick: words },
+          [words]
+        );
+      } catch (_) {}
+    }
     return {};
   },
 
   async set_self_longnick(p) {
-    await this.invokeNt("nodeIKernelProfileService/modifyDesktopMiniProfile", {
-      profile: {
-        longNick: String(p.longNick ?? p.personal_note ?? ""),
-      },
-    });
+    const words = String(p.longNick ?? p.personal_note ?? "");
+    await this.invokeNt(
+      "nodeIKernelProfileService/setLongNick",
+      { words, longNick: words },
+      [words]
+    );
     return {};
   },
 
   async set_online_status(p) {
-    await this.invokeNt("nodeIKernelOnlineStatusService/setOnlineStatus", {
-      statusReq: {
-        status: Number(p.status || 10),
-        extStatus: Number(p.ext_status || 0),
-        batteryStatus: Number(p.battery_status || 100),
-      },
-    });
+    const statusReq = {
+      status: Number(p.status ?? 10),
+      extStatus: Number(p.ext_status ?? 0),
+      batteryStatus: Number(p.battery_status ?? 0),
+    };
+    await this.invokeNt(
+      "nodeIKernelMsgService/setStatus",
+      { statusReq, ...statusReq },
+      [statusReq]
+    );
     return {};
   },
 
   async set_diy_online_status(p) {
-    await this.invokeNt("nodeIKernelOnlineStatusService/setOnlineStatus", {
-      statusReq: {
-        status: 10,
-        extStatus: 2000,
-        customStatus: {
-          faceId: String(p.face_id ?? 212),
-          faceType: Number(p.face_type ?? 1),
-          wording: String(p.wording ?? ""),
-        },
+    const statusReq = {
+      status: 10,
+      extStatus: Number(p.ext_status ?? 2000),
+      batteryStatus: 0,
+      customStatus: {
+        faceId: String(p.face_id ?? 212),
+        faceType: Number(p.face_type ?? 1),
+        wording: String(p.wording ?? ""),
       },
-    });
+    };
+    await this.invokeNt(
+      "nodeIKernelMsgService/setStatus",
+      { statusReq, ...statusReq },
+      [statusReq]
+    );
     return {};
   },
 
@@ -1013,12 +1476,16 @@ const ACTION_HANDLERS = {
 
   async fetch_custom_face(p) {
     const count = Number(p.count || 48);
-    const res = await this.invokeNt("nodeIKernelMsgService/fetchFavEmojiList", {
-      resId: "",
-      count,
-      backwardFetch: true,
-      forceRefresh: true,
-    });
+    const res = await this.invokeNt(
+      "nodeIKernelMsgService/fetchFavEmojiList",
+      {
+        resId: "",
+        count,
+        backwardFetch: true,
+        forceRefresh: true,
+      },
+      ["", count, true, true]
+    );
     const list = Array.isArray(res?.emojiInfoList) ? res.emojiInfoList : [];
     return list.map((e) => String(e.url || e.emoOriginalPath || "")).filter(Boolean);
   },
@@ -1052,14 +1519,17 @@ const ACTION_HANDLERS = {
   },
 
   async get_robot_uin_range() {
-    const res = await this.invokeNt("nodeIKernelRobotService/getRobotUinRange", {
-      req: {
-        justFetchMsgConfig: "0",
-        type: 1,
-        version: 0,
-        aioKeywordVersion: 0,
-      },
-    });
+    const req = {
+      justFetchMsgConfig: "0",
+      type: 1,
+      version: 0,
+      aioKeywordVersion: 0,
+    };
+    const res = await this.invokeNt(
+      "nodeIKernelRobotService/getRobotUinRange",
+      { req },
+      [req]
+    );
     return Array.isArray(res?.response?.robotUinRanges)
       ? res.response.robotUinRanges
       : [];
@@ -1079,9 +1549,11 @@ const ACTION_HANDLERS = {
   comment_qzone: handleWebCredentialOrQzoneAction,
 
   async get_rkey() {
-    const res = await this.invokeNt("nodeIKernelUnitedConfigService/loadUnitedConfig", {
-      id: "100293",
-    });
+    const res = await this.invokeNt(
+      "nodeIKernelUnitedConfigService/loadUnitedConfig",
+      { id: "100293", group: "100293" },
+      ["100293"]
+    );
     return {
       rkeys: [
         { type: "private", rkey: String(res?.configData?.content || "") },

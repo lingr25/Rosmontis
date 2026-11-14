@@ -4,8 +4,8 @@ const { pickPositiveUin, lookupCachedUin } = require("./stores");
 const { ntMsgToOneBotSegments } = require("./segment_converter");
 
 function mapNtRoleToOneBot(roleVal) {
-  if (roleVal === "owner" || roleVal === 4 || roleVal === 1) return "owner";
-  if (roleVal === "admin" || roleVal === 3 || roleVal === 2) return "admin";
+  if (roleVal === "owner" || roleVal === 4 || roleVal === "4") return "owner";
+  if (roleVal === "admin" || roleVal === 3 || roleVal === "3") return "admin";
   return "member";
 }
 

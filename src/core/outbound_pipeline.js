@@ -229,6 +229,7 @@ const outboundPipelineMixin = {
 
   _mediaSecurityOptions() {
     return {
+      ...(this.config.tempDir ? { tempDir: this.config.tempDir } : {}),
       maxMediaBytes: this.config.maxMediaBytes,
       allowPrivateUrls:
         this.config.allowPrivateUrls === true || this.config.allowPrivateMediaUrls === true
@@ -439,26 +440,39 @@ const outboundPipelineMixin = {
   },
 
   async _sendPokeInternal(groupId, userId) {
-    const targetUin = Number(userId || 0);
+    const rawUserStr = String(userId ?? "").trim();
+    let targetUin = /^\d+$/.test(rawUserStr) ? Number(rawUserStr) : 0;
+    if (!targetUin && rawUserStr && this.uinUidStore) {
+      targetUin = Number(this.uinUidStore.getUinSync(rawUserStr) || 0);
+      if (!targetUin && typeof this._ensureUinForUid === "function") {
+        targetUin = Number((await this._ensureUinForUid(rawUserStr)) || 0);
+      }
+    }
     const targetGroup = groupId ? Number(groupId) : 0;
     const targetUid = targetUin
       ? await this.uinUidStore.resolveUid(targetUin, this.invokeNt.bind(this))
+      : rawUserStr.startsWith("u_")
+      ? rawUserStr
       : "";
     const peer =
       targetGroup > 0
         ? { chatType: 2, peerUid: String(targetGroup), guildId: "" }
-        : await this._resolvePeerForUser(targetUin);
+        : await this._resolvePeerForUser(targetUin || rawUserStr);
 
-    // 1. Primary: genuine NTQQ 3.2.32 `nodeIKernelMsgService/sendNudge`
+    const toUinStr = String(targetUin || 0);
+    const chatUinStr = String(targetGroup > 0 ? targetGroup : targetUin || 0);
+
+    // 1. Primary: genuine NTQQ 3.2.32 `nodeIKernelMsgService/sendNudge(peer, toUin, chatUin)` (3 args)
     try {
       await this.invokeNt(
         "nodeIKernelMsgService/sendNudge",
         {
           peer,
-          toUid: targetUid || String(targetUin),
-          uid: targetUid || String(targetUin),
+          targetUin: toUinStr,
+          toUin: toUinStr,
+          chatUin: chatUinStr,
         },
-        [peer, targetUid || String(targetUin)]
+        [peer, toUinStr, chatUinStr]
       );
       return;
     } catch (err) {

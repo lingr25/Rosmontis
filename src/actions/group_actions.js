@@ -140,7 +140,9 @@ async function fetchGroupSystemNotifies(bridge, doubt) {
     const nType = Number(item.type || 1);
     const gid = pickPositiveUin(item.group?.groupCode);
     const flag = `${seq}:${nType}:${gid}`;
-    bridge._setBoundedMap(bridge._groupNotifiesCache, flag, item);
+    const cachedItem =
+      typeof item.doubt === "boolean" ? item : { ...item, doubt: Boolean(doubt) };
+    bridge._setBoundedMap(bridge._groupNotifiesCache, flag, cachedItem);
     const entry = {
       request_id: Number(seq || 0),
       invitor_uin: pickPositiveUin(
@@ -178,13 +180,12 @@ async function updateGroupEssence(bridge, p, isAdd) {
   const cmd = isAdd
     ? "nodeIKernelGroupService/addGroupEssence"
     : "nodeIKernelGroupService/removeGroupEssence";
-  await bridge.invokeNt(cmd, {
-    param: {
-      groupCode: String(entry.peer?.peerUid || entry.groupId || p.group_id || ""),
-      msgRandom: Number(entry.rawMsg?.msgRandom ?? entry.msgRandom ?? 0),
-      msgSeq: Number(entry.msgSeq || 0),
-    },
-  });
+  const param = {
+    groupCode: String(entry.peer?.peerUid || entry.groupId || p.group_id || ""),
+    msgRandom: Number(entry.rawMsg?.msgRandom ?? entry.msgRandom ?? 0),
+    msgSeq: Number(entry.msgSeq || 0),
+  };
+  await bridge.invokeNt(cmd, { param }, [param]);
   return {};
 }
 
@@ -503,26 +504,24 @@ const ACTION_HANDLERS = {
   },
 
   async set_group_ban(p) {
+    const groupCode = String(p.group_id);
     const uid = await this.uinUidStore.resolveUid(p.user_id, this.invokeNt.bind(this));
     const memList = [{ uid, timeStamp: Number(p.duration ?? 1800) }];
     await this.invokeNt(
-      "nodeIKernelGroupService/banMember",
-      { groupCode: String(p.group_id), memList },
-      [String(p.group_id), memList]
+      "nodeIKernelGroupService/setMemberShutUp",
+      { groupCode, memList },
+      [groupCode, memList]
     );
     return {};
   },
 
   async set_group_whole_ban(p) {
-    const enable = Boolean(p.enable ?? true);
-    const groupInfo = {
-      groupCode: String(p.group_id),
-      shutUpAllMember: enable ? 1 : 0,
-    };
+    const groupCode = String(p.group_id);
+    const shutUp = Boolean(p.enable ?? true);
     await this.invokeNt(
-      "nodeIKernelGroupService/modifyGroupExtInfo",
-      { groupInfo },
-      [groupInfo]
+      "nodeIKernelGroupService/setGroupShutUp",
+      { groupCode, shutUp },
+      [groupCode, shutUp]
     );
     return {};
   },
@@ -562,29 +561,12 @@ const ACTION_HANDLERS = {
     return {};
   },
 
-  async set_group_special_title(p) {
-    const uid = await this.uinUidStore.resolveUid(p.user_id, this.invokeNt.bind(this));
-    const specialTitle = String(p.special_title ?? "");
-    const expireTime = Number(p.duration ?? -1);
-    try {
-      await this.invokeNt(
-        "nodeIKernelGroupService/setIdentityTitleInfo",
-        {
-          groupCode: String(p.group_id),
-          uid,
-          specialTitle,
-          expireTime,
-        },
-        [String(p.group_id), uid, specialTitle, expireTime]
-      );
-    } catch (_) {
-      await this.invokeNt("nodeIKernelGroupService/modifyMemberSpecialTitle", {
-        groupCode: String(p.group_id),
-        uid,
-        specialTitle,
-      });
-    }
-    return {};
+  async set_group_special_title() {
+    const err = new Error(
+      "set_group_special_title is unsupported by Linux QQNT 3.2.32 kernel (no modifyMemberSpecialTitle RPC)"
+    );
+    err.retcode = 1404;
+    throw err;
   },
 
   async set_group_name(p) {
@@ -618,18 +600,21 @@ const ACTION_HANDLERS = {
     const notifyType = Number(cached?.type || parts[1] || (p.sub_type === "invite" ? 2 : 1));
     const groupCode = String(cached?.group?.groupCode || parts[2] || p.group_id || "");
     const approve = Boolean(p.approve ?? true);
-    await this.invokeNt("nodeIKernelGroupService/operateSysNotify", {
-      doubt: false,
-      operateMsg: {
-        operateType: approve ? 1 : 2,
-        targetMsg: {
-          seq: String(seq),
-          type: notifyType,
-          groupCode,
-          postscript: String(p.reason || ""),
-        },
+    const doubt = Boolean(cached?.doubt ?? cached?._doubt ?? p.doubt ?? false);
+    const operateMsg = {
+      operateType: approve ? 1 : 2,
+      targetMsg: {
+        seq: String(seq),
+        type: notifyType,
+        groupCode,
+        postscript: String(p.reason || ""),
       },
-    });
+    };
+    await this.invokeNt(
+      "nodeIKernelGroupService/operateSysNotify",
+      { doubt, operateMsg },
+      [doubt, operateMsg]
+    );
     return {};
   },
 
@@ -658,19 +643,41 @@ const ACTION_HANDLERS = {
         }
       } catch (_) {}
     }
-    for (const essenceCmd of [
-      "nodeIKernelGroupService/getGroupLatestEssenceList",
-      "nodeIKernelGroupService/fetchGroupEssenceList",
-      "nodeIKernelGroupService/getGroupEssenceList",
-    ]) {
-      try {
-        const res = await this.invokeNt(essenceCmd, { groupCode: groupId }, [groupId]);
-        if (res && (Array.isArray(res.msgList) || Array.isArray(res.list))) {
-          return res.msgList || res.list;
-        }
-        if (res !== undefined) return res?.msgList || [];
-      } catch (_) {}
-    }
+    const pageStart = Math.max(0, Number(p.page_start ?? 0));
+    const pageLimit = Math.max(1, Number(p.page_limit ?? 50));
+    const v2Req = { groupCode: groupId, pageStart, pageLimit };
+    try {
+      const res = await this.invokeNt(
+        "nodeIKernelGroupService/fetchGroupEssenceListV2",
+        { req: v2Req, ...v2Req },
+        [v2Req]
+      );
+      if (res && (Array.isArray(res.msgList) || Array.isArray(res.list))) {
+        return res.msgList || res.list;
+      }
+      if (res !== undefined) return res?.msgList || [];
+    } catch (_) {}
+
+    const latestReq = {
+      groupCode: groupId,
+      source: 0,
+      sign: "",
+      signTs: "0",
+      msgType: 0,
+      pageCookie: "",
+      excludeMsgType: [],
+    };
+    try {
+      const res = await this.invokeNt(
+        "nodeIKernelGroupService/getGroupLatestEssenceList",
+        { req: latestReq, ...latestReq },
+        [latestReq]
+      );
+      if (res && (Array.isArray(res.msgList) || Array.isArray(res.list))) {
+        return res.msgList || res.list;
+      }
+      if (res !== undefined) return res?.msgList || [];
+    } catch (_) {}
     return [];
   },
 
@@ -713,26 +720,53 @@ const ACTION_HANDLERS = {
         }
       } catch (_) {}
     }
-    await this.invokeNt("nodeIKernelGroupService/publishGroupBulletin", {
-      groupCode,
-      pskey: "",
-      data: {
-        text: content,
-        pinned: Number(p.pinned ?? 0),
-        isShowEditCard: 1,
-        tipWindowType: 1,
-        confirmRequired: Number(p.confirm_required ?? 1),
-      },
-    });
+
+    let psKey = "";
+    for (const psCmd of [
+      "nodeIKernelTipOffService/getPskey",
+      "nodeIKernelTicketService/getPskey",
+    ]) {
+      if (psKey) break;
+      try {
+        const psRes = await this.invokeNt(
+          psCmd,
+          { domains: ["qun.qq.com"], domainList: ["qun.qq.com"], isForNewPCQQ: true },
+          [["qun.qq.com"], true]
+        );
+        const map = psRes?.domainPskeyMap || psRes;
+        const candidate =
+          map instanceof Map
+            ? map.get("qun.qq.com")
+            : map && typeof map === "object"
+            ? map["qun.qq.com"]
+            : "";
+        if (candidate) psKey = String(candidate);
+      } catch (_) {}
+    }
+
+    const req = {
+      text: content,
+      oldFeedsId: String(p.old_feeds_id ?? ""),
+      pinned: Number(p.pinned ?? 0),
+      confirmRequired: Number(p.confirm_required ?? 1),
+      ...(p.pic_info && typeof p.pic_info === "object" ? { picInfo: p.pic_info } : {}),
+    };
+    await this.invokeNt(
+      "nodeIKernelGroupService/publishGroupBulletin",
+      { groupCode, psKey, req },
+      [groupCode, psKey, req]
+    );
     return {};
   },
 
   async _get_group_notice(p) {
     const groupCode = String(p.group_id || "");
     try {
-      const res = await this.invokeNt("nodeIKernelGroupService/getGroupBulletin", {
-        groupCode,
-      });
+      const res = await this.invokeNt(
+        "nodeIKernelGroupService/getGroupBulletin",
+        { groupCode },
+        [groupCode]
+      );
       if (Array.isArray(res?.feeds)) {
         return res.feeds;
       }

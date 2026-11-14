@@ -1,7 +1,43 @@
 "use strict";
 
 const crypto = require("crypto");
+const fs = require("fs");
 const path = require("path");
+
+function buildNtMarketFaceUrl(marketFaceElement) {
+  if (!marketFaceElement || typeof marketFaceElement !== "object") return "";
+  if (typeof marketFaceElement.__base64Uri === "string" && marketFaceElement.__base64Uri) {
+    return marketFaceElement.__base64Uri;
+  }
+  const directUrl = String(marketFaceElement.url || "").trim();
+  if (directUrl) {
+    return directUrl;
+  }
+  const emojiId = String(marketFaceElement.emojiId || "").trim().toLowerCase();
+  if (/^[0-9a-f]{4,64}$/.test(emojiId)) {
+    return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw300.gif`;
+  }
+  const candidatePaths = [
+    marketFaceElement.dynamicFacePath,
+    marketFaceElement.staticFacePath,
+  ]
+    .map((p) => String(p || "").trim())
+    .filter(Boolean);
+  for (const localPath of candidatePaths) {
+    try {
+      if (fs.existsSync(localPath)) {
+        const st = fs.statSync(localPath);
+        if (st.isFile() && st.size > 0) {
+          if (st.size <= 10 * 1024 * 1024) {
+            return `base64://${fs.readFileSync(localPath).toString("base64")}`;
+          }
+          return `file://${localPath}`;
+        }
+      }
+    } catch (_) {}
+  }
+  return "";
+}
 
 function pickPositiveUin(...candidates) {
   for (const c of candidates) {
@@ -32,6 +68,7 @@ class MessageIdStore {
     this.byPeerSeq = new Map();
     this._rawIds = new Set();
     this.byMediaKey = new Map();
+    this.byForwardId = new Map();
     this._seqCounter = 100000;
   }
 
@@ -108,6 +145,14 @@ class MessageIdStore {
             const cur = this.byMediaKey.get(k);
             if (cur && cur.oneBotId === oldestKey) {
               this.byMediaKey.delete(k);
+            }
+          }
+        }
+        if (entry._forwardKeys) {
+          for (const fk of entry._forwardKeys) {
+            const curFwd = this.byForwardId.get(fk);
+            if (curFwd && curFwd.oneBotId === oldestKey) {
+              this.byForwardId.delete(fk);
             }
           }
         }
@@ -214,6 +259,50 @@ class MessageIdStore {
         fileName = ve.fileName || "";
         sourcePath = ve.filePath || ve.sourcePath || "";
         url = "";
+      } else if (elementType === 11 && el.marketFaceElement) {
+        const mf = el.marketFaceElement;
+        md5 = mf.emojiId || "";
+        fileName = mf.emojiId ? `${String(mf.emojiId).toLowerCase()}.gif` : "";
+        sourcePath = mf.dynamicFacePath || mf.staticFacePath || "";
+        url = buildNtMarketFaceUrl(mf);
+      } else if (elementType === 16 && el.multiForwardMsgElement) {
+        const fwd = el.multiForwardMsgElement;
+        const fwdPeer =
+          (entry?.forwardPeer && entry.forwardPeer.peerUid ? entry.forwardPeer : null) ||
+          (entry?.peer && entry.peer.peerUid ? entry.peer : null) || {
+            chatType: Number(ntMsg.chatType) || 0,
+            peerUid: String(ntMsg.peerUid || ""),
+            guildId: String(ntMsg.guildId || ""),
+          };
+        const parentMsgId = String(ntMsg.msgId || entry?.msgId || "");
+        const rootMsgId = String(entry?.rootMsgId || parentMsgId);
+        if (parentMsgId && fwdPeer.peerUid) {
+          const fwdDesc = {
+            oneBotId: resolvedOneBotId,
+            shortId: resolvedOneBotId,
+            peer: fwdPeer,
+            rootMsgId: rootMsgId || parentMsgId,
+            parentMsgId,
+            resId: String(fwd.resId || ""),
+          };
+          const candidates = [String(fwd.resId || ""), String(fwd.fileName || "")];
+          const xml = String(fwd.xmlContent || "");
+          if (xml) {
+            for (const m of xml.matchAll(/\b(?:m_resid|resid|m_fileName)="([^"]+)"/gi)) {
+              if (m[1]) candidates.push(m[1]);
+            }
+          }
+          for (const cand of candidates) {
+            const trimmed = cand.trim();
+            if (!trimmed) continue;
+            this.byForwardId.set(trimmed, fwdDesc);
+            if (entry) {
+              if (!entry._forwardKeys) entry._forwardKeys = new Set();
+              entry._forwardKeys.add(trimmed);
+            }
+          }
+        }
+        continue;
       } else {
         continue;
       }
@@ -300,6 +389,13 @@ class MessageIdStore {
     }
 
     return null;
+  }
+
+  lookupForward(token) {
+    if (token === undefined || token === null) return null;
+    const raw = String(token).trim();
+    if (!raw) return null;
+    return this.byForwardId.get(raw) || null;
   }
 
   register(msgId, peer, msgSeq, extra = {}) {
@@ -403,7 +499,12 @@ class MessageIdStore {
       }
       if (extra.msgTime !== undefined) existing.msgTime = Number(extra.msgTime);
       if (msgRandom && !existing.msgRandom) existing.msgRandom = msgRandom;
+      if (extra.rootMsgId) existing.rootMsgId = String(extra.rootMsgId);
+      if (extra.forwardPeer && extra.forwardPeer.peerUid) {
+        existing.forwardPeer = extra.forwardPeer;
+      }
       if (!existing._mediaKeys) existing._mediaKeys = new Set();
+      if (!existing._forwardKeys) existing._forwardKeys = new Set();
       if (rawMsg) {
         existing.rawMsg = rawMsg;
         this._touchRawId(existing.shortId);
@@ -419,6 +520,9 @@ class MessageIdStore {
       shortId,
       oneBotId: shortId,
       msgId: msgIdStr || String(shortId),
+      rootMsgId: String(extra.rootMsgId || msgIdStr || ""),
+      forwardPeer:
+        extra.forwardPeer && extra.forwardPeer.peerUid ? extra.forwardPeer : null,
       peer: normPeer,
       chatType: normPeer.chatType,
       peerUid: normPeer.peerUid,
@@ -432,6 +536,7 @@ class MessageIdStore {
       oneBotEvent: extra.oneBotEvent || null,
       createdAt: Date.now(),
       _mediaKeys: new Set(),
+      _forwardKeys: new Set(),
     };
 
     this.byShortId.set(shortId, entry);
@@ -668,11 +773,11 @@ class UinUidStore {
       const uid = m.uid ?? "";
       const roleNum = m.role ?? m.permission;
       const role =
-        typeof roleNum === "string"
+        typeof roleNum === "string" && !/^\d+$/.test(roleNum.trim())
           ? roleNum
-          : roleNum === 4 || roleNum === 1
+          : Number(roleNum) === 4
           ? "owner"
-          : roleNum === 3 || roleNum === 2
+          : Number(roleNum) === 3
           ? "admin"
           : "member";
       this.remember(uin, uid, {
@@ -842,6 +947,7 @@ module.exports = {
   pickPositiveUin,
   lookupCachedUin,
   stripTransientNtMedia,
+  buildNtMarketFaceUrl,
   MessageIdStore,
   UinUidStore,
 };

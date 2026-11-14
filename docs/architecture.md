@@ -43,7 +43,7 @@
 
 早期基于 `LD_PRELOAD`、C++ `.so` 注入、`ptrace` 附加或篡改 `wrapper.node` 内存的方案，普遍绕过前 3 层直接调用第 4 层 C++ 接口，不仅在分发编译产物与二进制补丁时面临严峻的合规问题，还会造成严重的客户端状态割裂（“有包无态”）：
 
-1. **缺失会话激活与窗口焦点因果链**：真实客户端发消息前必然经过第 2 层渲染窗口切换会话、触发 `enterOrExitAio` / `addActiveChatByUid` / `setFocusOnBase` 等状态流转；直调第 4 层 `sendMsg` 时客户端窗口状态长期冻结在空白页。
+1. **缺失会话激活与窗口焦点因果链**：真实客户端发消息前必然经过第 2 层渲染窗口切换会话、触发 `setFocusOnBase` / `enterOrExitAio` / `setMsgRead` / `sendShowInputStatusReq` 等状态流转；直调第 4 层 `sendMsg` 时客户端窗口状态长期冻结在空白页。
 2. **缺失渲染层 IPC 轨迹**：主进程对 `RM_IPCFROM_RENDERER{windowId}` 具备完整生命周期统计，绕过 IPC 会出现“零 UI 交互却高频发包”的明显断层。
 3. **跨进程状态不一致与富媒体崩溃**：未经过客户端内置 EXIF 清理与缓存目录规范化（`copyFileWithDelExifInfo`）就将外部临时路径直接塞入原生层，极易引发原生段错误；入站无 `rkey` 的 NTv2 图片 URL 若不经内核 `downloadRichMedia` 落盘，外部 HTTP 下载也会直接返回 `400 Bad Request`。
 
@@ -69,9 +69,9 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 
 - **请求帧**（发往 `RM_IPCFROM_RENDERER{windowId}`）：
   - `callbackId` 使用标准 `crypto.randomUUID()`（RFC 4122 v4），绝不添加任何自定义字符串前缀。
-  - 请求体为 `[header, [cmd, ...args]]`，其中 `eventName: "ntApi"`，`cmdType: "invoke"`。
+  - 请求帧由双参数 `(header, { cmdName: cmd, cmdType: "invoke", payload: [args, null] })` 构成，其中 `header` 携带 `type: "request"`、`eventName: "ntApi"` 与 `peerId: windowId`。
 - **响应帧**（监听 `RM_IPCFROM_MAIN{windowId}`）：
-  - 兼容处理 NTQQ 原生拼写 `header.promiseStatue`（`"fullfill"` / `"reject"`）。
+  - 兼容处理 NTQQ 原生拼写 `header.promiseStatue`（`"full"` / `"err"`）。
   - **跨 `executeJavaScript` 的 `Map` 与 `void` 保真序列化**：Electron 的 `webContents.executeJavaScript` 在跨进程结构化克隆时会把 ES6 `Map` 退化为空对象 `{}`。Rosmontis 在渲染层出口递归编码 `Map` 条目并在主进程入口无损还原为真正的 `Map` 实例，解决了群成员列表（`result.infos` 为 `Map`）等接口返回空数据的问题。
 
 ### 2.2 瞬态捕获与原型链自动归还（Ephemeral Hook Release）
@@ -96,10 +96,10 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 
 私聊与群聊严格遵循真实人类时间轴（**收到消息 -> 已读 -> 正在输入 -> 模型生成 -> 发送（或不发送）**）：
 
-1. 窗口获焦：`setFocusOnBase({ isFocus: true })`（窗口已获焦时不重复发送）
-2. 切换目标会话：若原驻留其他会话则先 `enterOrExitAio(prev, enterType: 2)`，再执行 `addActiveChatByUid` -> `enterOrExitAio(target, enterType: 1)`
-3. 已读与输入态（`set_input_status` 或可选 `autoReadAndTypeOnPrivateRecv` 触发）：先调用 `setMsgRead` 消红点，再调用 `sendShowInputStatusReq` 展示“对方正在输入…”（模型最终决定不回复亦完全自然）
-4. 发送与两级空闲退场：`send_msg` 阶段若已在目标会话则直接派发 `sendMsg`（不再瞬时补发 0ms 输入态）；默认无交互 45 秒后自动持锁发送 `enterOrExitAio(active, enterType: 2)` 退回会话列表，5 分钟无交互后自动发送 `setFocusOnBase({ isFocus: false })` 切入后台失焦
+1. 窗口获焦：`setFocusOnBase({ chatType, peerUid, guildId })` 绑定目标会话 Contact 焦点（窗口已获焦时不重复发送）
+2. 切换目标会话：若原驻留其他会话则先调用 `enterOrExitAio({ info_list: [{ peer: prev, option: 2 }] })` 退出旧会话，再调用 `enterOrExitAio({ info_list: [{ peer: target, option: 1 }] })` 进入目标会话（对应底层 C++ `vector<EnterOrExitAioInfo>`）
+3. 已读与输入态（`set_input_status` 或可选 `autoReadAndTypeOnPrivateRecv` 触发）：先调用 `setMsgRead` 消红点，再调用 `sendShowInputStatusReq(chatType, eventType, peerUid)` 展示“对方正在输入…”（模型最终决定不回复亦完全自然）
+4. 发送与两级空闲退场：`send_msg` 阶段若已在目标会话则直接派发 `sendMsg`（不再瞬时补发 0ms 输入态）；默认无交互 45 秒后自动持锁发送 `enterOrExitAio({ info_list: [{ peer: active, option: 2 }] })` 退回会话列表，5 分钟无交互后自动发送 `setFocusOnBase({ chatType: 0, peerUid: "", guildId: "" })` 重置焦点切入后台空闲
 
 ### 2.5 真实回显 `msgId` 关联（`EchoCorrelator`）与 NTv2 富媒体闭环
 
@@ -110,7 +110,7 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 3. **出站图片 EXIF 清理与路径规范化**：
    出站图片发送前自动调用 `nodeIKernelMsgService/copyFileWithDelExifInfo` 规范化至客户端内部富媒体缓存目录并重算真实大小与 MD5，消除野生路径引发的原生崩溃。
 4. **免扫码快速登录恢复**：
-   容器或进程重启后，Rosmontis 自动读取本地 `login.db` / `getLoginList` 中的快速登录凭据（自动开启 `setAutoLoginSwitch`），通过 `quickLoginWithUin` 与登录页按钮点击兜底在十余秒内恢复在线，无需重复扫码。
+   容器或进程重启后，Rosmontis 自动读取本地 `login.db` / `getLoginList` 中的快速登录凭据（通过 `nodeIKernelLoginService/setAutoLogin` 自动开启自动登录），通过 `quickLoginWithUin` 与登录页按钮点击兜底在十余秒内恢复在线，无需重复扫码。
 
 ---
 

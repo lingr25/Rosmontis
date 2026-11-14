@@ -5,7 +5,7 @@ const path = require("path");
 const { pathToFileURL } = require("url");
 
 const { segmentsToCqCode, normalizeOneBotMessage } = require("./cq_codec");
-const { pickPositiveUin, lookupCachedUin } = require("./stores");
+const { pickPositiveUin, lookupCachedUin, buildNtMarketFaceUrl } = require("./stores");
 const { resolveMediaSource } = require("../core/media_security");
 const { prepareVoiceMedia, DEFAULT_WAVE_AMPLITUDES } = require("../core/audio_codec");
 
@@ -323,6 +323,50 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
       continue;
     }
 
+    // 9: walletElement (QQ red packet — read-only metadata, never opened/claimed)
+    if (elType === 9 || el.walletElement) {
+      const we = el.walletElement && typeof el.walletElement === "object" ? el.walletElement : {};
+      const aio =
+        (we.receiver && typeof we.receiver === "object" ? we.receiver : null) ||
+        (we.sender && typeof we.sender === "object" ? we.sender : null) ||
+        {};
+      const rawTitle = String(aio.title || we.title || we.pcBody || "").trim();
+      const rawNotice = String(aio.notice || we.notice || "").trim();
+      const rawSubTitle = String(aio.subTitle || "").trim();
+      const rawContent = String(aio.content || "").trim();
+      const cleanedNotice = rawNotice.replace(/^\[QQ红包\]\s*/i, "").trim();
+      const genericFallback = /^请使用新版.*查收红包/;
+      const title =
+        rawTitle ||
+        (cleanedNotice && !genericFallback.test(cleanedNotice) ? cleanedNotice : "") ||
+        "QQ红包";
+      const msgTypeNum = Number(we.msgType ?? 0);
+      const redTypeNum = Number(we.redType ?? 0);
+      const rawTargets = Array.isArray(we.grapUin)
+        ? we.grapUin
+        : Array.isArray(we.grabUin)
+        ? we.grabUin
+        : [];
+      const targetUins = rawTargets
+        .map((u) => pickPositiveUin(u))
+        .filter((u) => u > 0)
+        .map((u) => String(u));
+      segments.push({
+        type: "redbag",
+        data: {
+          title,
+          ...(rawSubTitle ? { sub_title: rawSubTitle } : {}),
+          ...(rawContent ? { content: rawContent } : {}),
+          ...(rawNotice ? { notice: rawNotice } : {}),
+          ...(msgTypeNum > 0 ? { msg_type: String(msgTypeNum) } : {}),
+          ...(redTypeNum > 0 ? { red_type: String(redTypeNum) } : {}),
+          ...(we.billNo ? { bill_no: String(we.billNo) } : {}),
+          ...(targetUins.length > 0 ? { target_uins: targetUins.join("|") } : {}),
+        },
+      });
+      continue;
+    }
+
     // 10: arkElement (JSON card)
     if (elType === 10 && el.arkElement) {
       const bytesData = el.arkElement.bytesData || "";
@@ -338,6 +382,7 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
     // 11: marketFaceElement (mall sticker)
     if (elType === 11 && el.marketFaceElement) {
       const mf = el.marketFaceElement;
+      const mfUrl = buildNtMarketFaceUrl(mf);
       segments.push({
         type: "mface",
         data: {
@@ -345,7 +390,7 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
           emoji_package_id: String(mf.emojiPackageId || ""),
           key: String(mf.key || ""),
           summary: String(mf.faceName || "[商城表情]"),
-          ...(mf.url ? { url: String(mf.url) } : {}),
+          ...(mfUrl ? { url: mfUrl } : {}),
         },
       });
       continue;
@@ -354,7 +399,12 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
     // 16: multiForwardMsgElement (merged forward message)
     if (elType === 16 && el.multiForwardMsgElement) {
       const fwd = el.multiForwardMsgElement;
-      const resId = String(fwd.resId || ntMsg?.msgId || "");
+      let xmlResId = "";
+      if (!fwd.resId && fwd.xmlContent) {
+        const m = /\b(?:m_resid|resid)="([^"]+)"/i.exec(String(fwd.xmlContent));
+        if (m && m[1]) xmlResId = m[1];
+      }
+      const resId = String(fwd.resId || xmlResId || ntMsg?.msgId || "");
       segments.push({
         type: "forward",
         data: {
@@ -364,6 +414,13 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
       });
       continue;
     }
+  }
+
+  if (segments.length === 0 && !Array.isArray(ntMsg) && Number(ntMsg?.msgType) === 10) {
+    segments.push({
+      type: "redbag",
+      data: { title: "QQ红包" },
+    });
   }
 
   return {
@@ -896,6 +953,23 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
       continue;
     }
 
+    if (type === "redbag" || type === "wallet" || type === "qqwallet" || type === "red_packet") {
+      const rbTitle = String(data.title || data.wording || data.wish || "").trim();
+      const rbLabel = rbTitle && rbTitle !== "QQ红包" ? `[QQ红包] ${rbTitle}` : "[QQ红包]";
+      elements.push({
+        elementType: 1,
+        elementId: "",
+        textElement: {
+          content: rbLabel,
+          atType: 0,
+          atUid: "",
+          atTinyId: "",
+          atNtUid: "",
+        },
+      });
+      continue;
+    }
+
     if (type === "poke") {
       const targetQq = data.qq || data.id || data.user_id;
       sideEffects.push({
@@ -914,6 +988,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
 
 module.exports = {
   buildNtPicUrl,
+  buildNtMarketFaceUrl,
   buildNtRecordUri,
   ntMsgToOneBotSegments,
   pickMediaSource,

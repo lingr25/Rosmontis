@@ -36,7 +36,9 @@ const DEFAULT_REGISTERED_EVENTS = [
   "nodeIKernelBuddyListener/onBuddyListChange",
   "nodeIKernelBuddyListener/onBuddyListChangedV2",
   "nodeIKernelBuddyListener/onBuddyReqChange",
+  "nodeIKernelBuddyListener/onDoubtBuddyReqChange",
   "nodeIKernelProfileListener/onProfileSimpleChanged",
+  "nodeIKernelProfileListener/onProfileDetailInfoChanged",
   "nodeIKernelLoginListener/onQRCodeGetPicture",
   "nodeIKernelLoginListener/onQRCodeSessionQuickLoginFailed",
   "nodeIKernelLoginListener/onQRCodeLoginSucceed",
@@ -932,15 +934,20 @@ function installRendererBridge(targetWindow, options = {}) {
     return snapshotSessionSummary();
   }
 
-  async function ensureWindowFocus(steps) {
+  async function ensureWindowFocus(peer, steps) {
     if (sessionState.focused) {
       steps.setFocusOnBase = true;
       return;
     }
+    const focusPeer = {
+      chatType: Number(peer?.chatType || 0),
+      peerUid: String(peer?.peerUid || ""),
+      guildId: String(peer?.guildId || ""),
+    };
     try {
       await invokeNtApi(
         "nodeIKernelMsgService/setFocusOnBase",
-        [{ isFocus: true }, null],
+        [{ peer: focusPeer, ...focusPeer }, null],
         SESSION_STEP_TIMEOUT_MS
       );
       steps.setFocusOnBase = true;
@@ -956,7 +963,6 @@ function installRendererBridge(targetWindow, options = {}) {
     if (sessionState.activeAioPeerKey === peerKey) {
       steps.alreadyInAio = true;
       steps.enterOrExitAio = true;
-      steps.addActiveChatByUid = true;
       return;
     }
 
@@ -964,7 +970,7 @@ function installRendererBridge(targetWindow, options = {}) {
       try {
         await invokeNtApi(
           "nodeIKernelMsgService/enterOrExitAio",
-          [{ info: { peer: sessionState.activeAioPeer, enterType: 2 } }, null],
+          [{ info_list: [{ peer: sessionState.activeAioPeer, option: 2 }] }, null],
           SESSION_STEP_TIMEOUT_MS
         );
         steps.exitedPreviousAio = true;
@@ -976,20 +982,8 @@ function installRendererBridge(targetWindow, options = {}) {
 
     try {
       await invokeNtApi(
-        "nodeIKernelMsgService/addActiveChatByUid",
-        [{ peer }, null],
-        SESSION_STEP_TIMEOUT_MS
-      );
-      steps.addActiveChatByUid = true;
-    } catch (err) {
-      rethrowIfBridgeUnavailable(err);
-      reportDiag("session.addActiveChatByUid", err);
-    }
-
-    try {
-      await invokeNtApi(
         "nodeIKernelMsgService/enterOrExitAio",
-        [{ info: { peer, enterType: 1 } }, null],
+        [{ info_list: [{ peer, option: 1 }] }, null],
         SESSION_STEP_TIMEOUT_MS
       );
       steps.enterOrExitAio = true;
@@ -1043,8 +1037,9 @@ function installRendererBridge(targetWindow, options = {}) {
             "nodeIKernelMsgService/sendShowInputStatusReq",
             [
               {
+                chatType: 1,
                 eventType: effEventType,
-                peer: { chatType: 1, peerUid: peer.peerUid, guildId: "" },
+                peerUid: String(peer.peerUid),
               },
               null,
             ],
@@ -1087,7 +1082,7 @@ function installRendererBridge(targetWindow, options = {}) {
       try {
         await invokeNtApi(
           "nodeIKernelMsgService/enterOrExitAio",
-          [{ info: { peer: prevPeer, enterType: 2 } }, null],
+          [{ info_list: [{ peer: prevPeer, option: 2 }] }, null],
           SESSION_STEP_TIMEOUT_MS
         );
         exitedAio = true;
@@ -1099,10 +1094,11 @@ function installRendererBridge(targetWindow, options = {}) {
 
     if (blurWindow && sessionState.focused) {
       sessionState.focused = false;
+      const basePeer = { chatType: 0, peerUid: "", guildId: "" };
       try {
         await invokeNtApi(
           "nodeIKernelMsgService/setFocusOnBase",
-          [{ isFocus: false }, null],
+          [{ peer: basePeer, ...basePeer }, null],
           SESSION_STEP_TIMEOUT_MS
         );
         blurredWindow = true;
@@ -1163,7 +1159,7 @@ function installRendererBridge(targetWindow, options = {}) {
     }
 
     const peerKey = formatPeerKey(peer);
-    await ensureWindowFocus(steps);
+    await ensureWindowFocus(peer, steps);
     await switchActiveAio(peer, peerKey, steps);
     await applyReadAndTyping(
       peer,

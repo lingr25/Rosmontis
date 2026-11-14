@@ -461,6 +461,12 @@ const inboundPipelineMixin = {
 
     // 4. Group notifications (join/invite requests)
     if (eventName === "onGroupNotifiesUpdated") {
+      const doubt =
+        typeof args[0] === "boolean"
+          ? args[0]
+          : typeof firstArg?.doubt === "boolean"
+          ? firstArg.doubt
+          : false;
       const notifies = Array.isArray(args[1])
         ? args[1]
         : Array.isArray(firstArg?.notifies)
@@ -475,7 +481,9 @@ const inboundPipelineMixin = {
         const status = Number(item.status || 0);
         const groupId = pickPositiveUin(item.group?.groupCode);
         const flag = seq ? `${seq}:${notifyType}:${groupId}` : "";
-        if (flag) setBoundedMap(this._groupNotifiesCache, flag, item);
+        const cachedItem =
+          typeof item.doubt === "boolean" ? item : { ...item, doubt: Boolean(doubt) };
+        if (flag) setBoundedMap(this._groupNotifiesCache, flag, cachedItem);
 
         if (item.user1?.uid && _isPositiveUin(item.user1?.uin)) {
           this.uinUidStore?.remember?.(item.user1.uin, item.user1.uid, {
@@ -605,6 +613,49 @@ const inboundPipelineMixin = {
           nickname: core.nick || info.nick || "",
           remark: core.remark || info.remark || "",
         });
+      }
+      return;
+    }
+
+    if (eventName === "onProfileDetailInfoChanged") {
+      const info = firstArg?.info || firstArg;
+      if (info && typeof info === "object") {
+        const simple = info.simpleInfo || info;
+        const core = simple.coreInfo || simple.baseInfo || info.coreInfo || info.baseInfo || info;
+        const uid = String(info.uid || simple.uid || core.uid || "");
+        const uin = _pickPositiveUin(info.uin, simple.uin, core.uin);
+        if (uid || uin) {
+          this.uinUidStore.remember(uin, uid, {
+            nickname: core.nick || info.nick || "",
+            remark: core.remark || info.remark || "",
+          });
+        }
+        if (uid && this._profileDetailWaiters instanceof Map) {
+          const waiters = this._profileDetailWaiters.get(uid);
+          if (waiters) {
+            this._profileDetailWaiters.delete(uid);
+            for (const resolve of Array.from(waiters)) {
+              try {
+                resolve(info);
+              } catch (err) {
+                this.logger?.debug?.("inbound", err);
+              }
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    if (eventName === "onDoubtBuddyReqChange") {
+      if (this._doubtBuddyWaiters) {
+        for (const waiter of Array.from(this._doubtBuddyWaiters)) {
+          try {
+            waiter(firstArg);
+          } catch (err) {
+            this.logger?.debug?.("inbound", err);
+          }
+        }
       }
       return;
     }
@@ -744,6 +795,9 @@ const inboundPipelineMixin = {
     peerUid,
     elementId,
     downloadType = 1,
+    downSourceType = 0,
+    downloadScene = 0,
+    fileModelId = "0",
     thumbSize = 0,
     filePath = "",
     timeoutMs = 8000,
@@ -832,10 +886,12 @@ const inboundPipelineMixin = {
     });
 
     try {
+      const resolvedDownSourceType = Number(downSourceType ?? 0);
       const getReq = {
-        downSourceType: 0,
-        downloadSourceType: 0,
-        fileModelId: "0",
+        downSourceType: resolvedDownSourceType,
+        downloadSourceType: resolvedDownSourceType,
+        downloadScene: Number(downloadScene ?? 0),
+        fileModelId: String(fileModelId || "0"),
         triggerType: 1,
         msgId: msgIdStr,
         chatType: Number(chatType || 1),
@@ -860,6 +916,9 @@ const inboundPipelineMixin = {
       if (directPath && (await _statPositiveFile(directPath))) {
         return directPath;
       }
+      if (targetPath && (await _statPositiveFile(targetPath))) {
+        return targetPath;
+      }
       const waitedPath = await waitDownload;
       if (waitedPath && (await _statPositiveFile(waitedPath))) {
         return String(waitedPath);
@@ -872,18 +931,35 @@ const inboundPipelineMixin = {
     return "";
   },
 
-  async _hydrateNtMsgMedia(ntMsg) {
+  async _hydrateNtMsgMedia(ntMsg, options = {}) {
     if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
     const maxPicBytes = 10 * 1024 * 1024;
     const maxPttBytes = 2 * 1024 * 1024;
+    const skipRemoteDownload = Boolean(options?.skipRemoteDownload);
+    const downSourceType = Number(options?.downSourceType ?? 0);
+    const fallbackChatType = Number(ntMsg.chatType || options?.chatType || 1);
+    const fallbackPeerUid = String(
+      ntMsg.peerUid && String(ntMsg.peerUid) !== "0" ? ntMsg.peerUid : options?.peerUid || ""
+    );
     const hydrationTimeout = Math.max(
-      500,
+      100,
       Number(
-        this.config?.mediaHydrationTimeoutMs ??
+        options?.timeoutMs ??
+          this.config?.mediaHydrationTimeoutMs ??
           this.config?.richMediaDownloadTimeoutMs ??
           8000
       ) || 8000
     );
+    const deadlineMs = Number(options?.deadlineMs) > 0 ? Number(options.deadlineMs) : 0;
+    const remainingRemoteBudgetMs = (capMs) => {
+      if (skipRemoteDownload) return 0;
+      if (deadlineMs > 0) {
+        const rem = deadlineMs - Date.now();
+        if (rem <= 0) return 0;
+        return Math.min(hydrationTimeout, capMs, rem);
+      }
+      return Math.min(hydrationTimeout, capMs);
+    };
 
     for (const el of ntMsg.elements) {
       if (!el || typeof el !== "object") continue;
@@ -933,16 +1009,18 @@ const inboundPipelineMixin = {
           }
         }
 
-        if (!st && ntMsg.msgId && ntMsg.peerUid) {
+        const origBudgetMs = remainingRemoteBudgetMs(8000);
+        if (!st && origBudgetMs > 0 && ntMsg.msgId && fallbackPeerUid) {
           const downloadedOrig = await this._downloadRichMediaElement({
             msgId: ntMsg.msgId,
-            chatType: ntMsg.chatType || 1,
-            peerUid: ntMsg.peerUid,
+            chatType: fallbackChatType,
+            peerUid: fallbackPeerUid,
             elementId: el.elementId || "0",
             downloadType: 1,
+            downSourceType,
             thumbSize: 0,
             filePath: localPath,
-            timeoutMs: Math.min(hydrationTimeout, 8000),
+            timeoutMs: origBudgetMs,
           });
           if (downloadedOrig) {
             const dlStat = await _statPositiveFile(downloadedOrig);
@@ -969,17 +1047,19 @@ const inboundPipelineMixin = {
               break;
             }
           }
-          if (!st && ntMsg.msgId && ntMsg.peerUid) {
+          const thumbBudgetMs = remainingRemoteBudgetMs(5000);
+          if (!st && thumbBudgetMs > 0 && ntMsg.msgId && fallbackPeerUid) {
             const fallbackThumbPath = thumbs.length > 0 ? String(thumbs[0] || "") : "";
             const downloadedThumb = await this._downloadRichMediaElement({
               msgId: ntMsg.msgId,
-              chatType: ntMsg.chatType || 1,
-              peerUid: ntMsg.peerUid,
+              chatType: fallbackChatType,
+              peerUid: fallbackPeerUid,
               elementId: el.elementId || "0",
               downloadType: 2,
+              downSourceType,
               thumbSize: 720,
               filePath: fallbackThumbPath,
-              timeoutMs: Math.min(hydrationTimeout, 5000),
+              timeoutMs: thumbBudgetMs,
             });
             if (downloadedThumb) {
               const dlThumbStat = await _statPositiveFile(downloadedThumb);
@@ -1016,16 +1096,25 @@ const inboundPipelineMixin = {
         let localPath = String(ptt.filePath || ptt.sourcePath || "").trim();
         let st = await _statPositiveFile(localPath);
 
-        if (!st && this._isNtReady() && ntMsg.msgId && ntMsg.peerUid && el.elementId) {
+        const pttBudgetMs = remainingRemoteBudgetMs(8000);
+        if (
+          !st &&
+          pttBudgetMs > 0 &&
+          this._isNtReady() &&
+          ntMsg.msgId &&
+          fallbackPeerUid &&
+          el.elementId
+        ) {
           const downloadedPtt = await this._downloadRichMediaElement({
             msgId: ntMsg.msgId,
-            chatType: ntMsg.chatType || 1,
-            peerUid: ntMsg.peerUid,
+            chatType: fallbackChatType,
+            peerUid: fallbackPeerUid,
             elementId: el.elementId,
             downloadType: 1,
+            downSourceType,
             thumbSize: 0,
             filePath: localPath,
-            timeoutMs: Math.min(hydrationTimeout, 8000),
+            timeoutMs: pttBudgetMs,
           });
           if (downloadedPtt) {
             localPath = downloadedPtt;

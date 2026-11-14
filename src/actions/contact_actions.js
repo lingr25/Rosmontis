@@ -193,14 +193,78 @@ const ACTION_HANDLERS = {
     const uid = await this.uinUidStore.resolveUid(userId, this.invokeNt.bind(this));
     let detail = null;
     if (uid) {
+      const extractDetail = (res) => {
+        if (!res || typeof res !== "object") return null;
+        if (res.detail instanceof Map) return res.detail.get(uid) || null;
+        if (res.detail && typeof res.detail === "object") {
+          if (res.detail[uid]) return res.detail[uid];
+          if (res.detail.uid || res.detail.simpleInfo || res.detail.coreInfo || res.detail.nick) {
+            return res.detail;
+          }
+        }
+        if (res.info && typeof res.info === "object") return res.info;
+        if (res.simpleInfo || res.coreInfo || res.baseInfo || res.nick || res.nickname) {
+          return res;
+        }
+        return null;
+      };
+
       try {
         const res = await this.invokeNt(
-          "nodeIKernelProfileService/getUserDetailInfo",
-          { uid },
-          [uid]
+          "nodeIKernelProfileService/fetchUserDetailInfo",
+          {
+            callFrom: "BuddyProfileStore",
+            uid: [uid],
+            uids: [uid],
+            source: 0,
+            bizList: [0],
+          },
+          ["BuddyProfileStore", [uid], 0, [0]]
         );
-        detail = res?.info || res?.detail?.[uid] || res;
-      } catch (_) {}
+        detail = extractDetail(res);
+      } catch (_) {
+        let cleanupWaiter = null;
+        const waitDetail =
+          this._profileDetailWaiters instanceof Map
+            ? new Promise((resolve) => {
+                let timer = setTimeout(() => {
+                  timer = null;
+                  cleanupWaiter?.();
+                  resolve(null);
+                }, 300);
+                timer.unref?.();
+                const onDetail = (info) => {
+                  if (timer) {
+                    clearTimeout(timer);
+                    timer = null;
+                  }
+                  cleanupWaiter?.();
+                  resolve(info);
+                };
+                cleanupWaiter = () => {
+                  const set = this._profileDetailWaiters.get(uid);
+                  if (set) {
+                    set.delete(onDetail);
+                    if (set.size === 0) this._profileDetailWaiters.delete(uid);
+                  }
+                };
+                if (!this._profileDetailWaiters.has(uid)) {
+                  this._profileDetailWaiters.set(uid, new Set());
+                }
+                this._profileDetailWaiters.get(uid).add(onDetail);
+              })
+            : Promise.resolve(null);
+        try {
+          const fallbackRes = await this.invokeNt(
+            "nodeIKernelProfileService/getUserDetailInfo",
+            { uid },
+            [uid]
+          );
+          detail = extractDetail(fallbackRes) || (await waitDetail);
+        } catch (_) {
+          cleanupWaiter?.();
+        }
+      }
     }
     const profile = normalizeBuddyProfile(detail, uid);
     const base = detail?.simpleInfo?.baseInfo || detail?.baseInfo || detail || {};
@@ -219,13 +283,16 @@ const ACTION_HANDLERS = {
 
   async delete_friend(p) {
     const uid = await this.uinUidStore.resolveUid(p.user_id, this.invokeNt.bind(this));
-    await this.invokeNt("nodeIKernelBuddyService/delBuddy", {
-      delInfo: {
-        friendUid: uid,
-        tempBlock: Boolean(p.block),
-        tempBothDel: true,
-      },
-    });
+    const delInfo = {
+      friendUid: uid,
+      tempBlock: Boolean(p.block),
+      tempBothDel: true,
+    };
+    await this.invokeNt(
+      "nodeIKernelBuddyService/delBuddy",
+      { delInfo },
+      [delInfo]
+    );
     return {};
   },
 
@@ -239,34 +306,75 @@ const ACTION_HANDLERS = {
         ? friendUidPart
         : await this.uinUidStore.resolveUid(friendUidPart, this.invokeNt.bind(this)));
     const reqTime = String(cached?.reqTime || reqTimePart || Math.floor(Date.now() / 1000));
-    await this.invokeNt("nodeIKernelBuddyService/approvalFriendRequest", {
-      approvalInfo: {
-        friendUid,
-        reqTime,
-        accept: Boolean(p.approve ?? true),
-      },
-    });
+    const approvalInfo = {
+      friendUid,
+      reqTime,
+      accept: Boolean(p.approve ?? true),
+    };
+    await this.invokeNt(
+      "nodeIKernelBuddyService/approvalFriendRequest",
+      { approvalInfo },
+      [approvalInfo]
+    );
     return {};
   },
 
   async set_friend_remark(p) {
     const uid = await this.uinUidStore.resolveUid(p.user_id, this.invokeNt.bind(this));
-    await this.invokeNt("nodeIKernelBuddyService/setBuddyRemark", {
-      remarkParams: { uid, remark: String(p.remark ?? "") },
-    });
+    const remarkParams = { uid, remark: String(p.remark ?? "") };
+    await this.invokeNt(
+      "nodeIKernelBuddyService/setBuddyRemark",
+      { remarkParams },
+      [remarkParams]
+    );
     return {};
   },
 
-  async get_doubt_friends_add_request() {
-    const res = await this.invokeNt("nodeIKernelBuddyService/getDoubtBuddyReq", {});
-    return Array.isArray(res?.doubtList) ? res.doubtList : [];
+  async get_doubt_friends_add_request(p = {}) {
+    const reqId = String(Date.now());
+    const reqNum = Math.max(1, Number(p?.count || 50));
+    const cookie = String(p?.cookie || "");
+    const waitDoubt = this._doubtBuddyWaiters
+      ? waitForEventOnce(this._doubtBuddyWaiters, 200)
+      : Promise.resolve(null);
+    const res = await this.invokeNt(
+      "nodeIKernelBuddyService/getDoubtBuddyReq",
+      { reqId, reqNum, cookie },
+      [reqId, reqNum, cookie]
+    );
+    if (Array.isArray(res?.doubtList)) {
+      return res.doubtList;
+    }
+    const asyncEvt = await waitDoubt;
+    if (Array.isArray(asyncEvt?.doubtList)) {
+      return asyncEvt.doubtList;
+    }
+    return Array.isArray(asyncEvt) ? asyncEvt : [];
   },
 
-  async set_doubt_friends_add_request(p) {
-    await this.invokeNt("nodeIKernelBuddyService/approvalDoubtBuddyReq", {
-      reqId: String(p.flag || p.req_id || ""),
-      accept: Boolean(p.approve ?? true),
-    });
+  async set_doubt_friends_add_request(p = {}) {
+    const rawTarget = String(p.uid || p.flag || p.req_id || p.user_id || "").trim();
+    const uid =
+      rawTarget.startsWith("u_") || !/^\d+$/.test(rawTarget)
+        ? rawTarget
+        : await this.uinUidStore.resolveUid(rawTarget, this.invokeNt.bind(this));
+    if (!uid) throw new Error("uid or flag is required");
+    const approve = Boolean(p.approve ?? true);
+    if (approve) {
+      const groupId = String(p.group_id ?? "");
+      const remark = String(p.remark ?? "");
+      await this.invokeNt(
+        "nodeIKernelBuddyService/approvalDoubtBuddyReq",
+        { uid, groupId, remark },
+        [uid, groupId, remark]
+      );
+    } else {
+      await this.invokeNt(
+        "nodeIKernelBuddyService/delDoubtBuddyReq",
+        { uid },
+        [uid]
+      );
+    }
     return {};
   },
 

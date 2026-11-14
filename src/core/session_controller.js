@@ -25,16 +25,24 @@ async function runCausalLeaveSteps({
 
   if (shouldExitAio && prevPeer) {
     try {
-      await invokeNt("nodeIKernelMsgService/enterOrExitAio", {
-        info: { peer: prevPeer, enterType: 2 },
-      });
+      const exitList = [{ peer: prevPeer, option: 2 }];
+      await invokeNt(
+        "nodeIKernelMsgService/enterOrExitAio",
+        { info_list: exitList },
+        [exitList]
+      );
       exitedAio = true;
     } catch (_) {}
   }
 
   if (shouldBlur) {
     try {
-      await invokeNt("nodeIKernelMsgService/setFocusOnBase", { isFocus: false });
+      const basePeer = { chatType: 0, peerUid: "", guildId: "" };
+      await invokeNt(
+        "nodeIKernelMsgService/setFocusOnBase",
+        { peer: basePeer, ...basePeer },
+        [basePeer]
+      );
       blurredWindow = true;
     } catch (_) {}
   }
@@ -65,7 +73,16 @@ async function runCausalActivateSteps({
   let focused = Boolean(windowFocused);
   if (!focused) {
     try {
-      await invokeNt("nodeIKernelMsgService/setFocusOnBase", { isFocus: true });
+      const focusPeer = {
+        chatType: Number(peer?.chatType || 1),
+        peerUid: String(peer?.peerUid || ""),
+        guildId: String(peer?.guildId || ""),
+      };
+      await invokeNt(
+        "nodeIKernelMsgService/setFocusOnBase",
+        { peer: focusPeer, ...focusPeer },
+        [focusPeer]
+      );
       didFocus = true;
       focused = true;
     } catch (_) {}
@@ -78,19 +95,22 @@ async function runCausalActivateSteps({
   if (!alreadyInAio) {
     if (prevPeer && normPrevPeerKey) {
       try {
-        await invokeNt("nodeIKernelMsgService/enterOrExitAio", {
-          info: { peer: prevPeer, enterType: 2 },
-        });
+        const exitList = [{ peer: prevPeer, option: 2 }];
+        await invokeNt(
+          "nodeIKernelMsgService/enterOrExitAio",
+          { info_list: exitList },
+          [exitList]
+        );
         exitedPreviousAio = true;
       } catch (_) {}
     }
     try {
-      await invokeNt("nodeIKernelMsgService/addActiveChatByUid", { peer });
-    } catch (_) {}
-    try {
-      await invokeNt("nodeIKernelMsgService/enterOrExitAio", {
-        info: { peer, enterType: 1 },
-      });
+      const enterList = [{ peer, option: 1 }];
+      await invokeNt(
+        "nodeIKernelMsgService/enterOrExitAio",
+        { info_list: enterList },
+        [enterList]
+      );
     } catch (_) {}
   }
 
@@ -117,11 +137,17 @@ async function runCausalActivateSteps({
 
   if (shouldSendTyping) {
     const resolvedEventType = Number(effEventType ?? 1);
+    const resolvedChatType = Number(peer?.chatType || 1);
+    const resolvedPeerUid = String(peer?.peerUid || "");
     try {
       await invokeNt(
         "nodeIKernelMsgService/sendShowInputStatusReq",
-        { eventType: resolvedEventType, peer },
-        [1, resolvedEventType, peer.peerUid]
+        {
+          chatType: resolvedChatType,
+          eventType: resolvedEventType,
+          peerUid: resolvedPeerUid,
+        },
+        [resolvedChatType, resolvedEventType, resolvedPeerUid]
       );
       didSendTyping = true;
     } catch (_) {}

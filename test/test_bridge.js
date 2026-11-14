@@ -547,7 +547,6 @@ async function runTests() {
     assert.strictEqual(simRes1.vueState.mounted, true);
     assert.strictEqual(simRes1.alreadyInAio, false);
     assert.strictEqual(simRes1.enterOrExitAio, true);
-    assert.strictEqual(simRes1.addActiveChatByUid, true);
     assert.strictEqual(simRes1.setFocusOnBase, true);
     assert.strictEqual(simRes1.markRead, true);
     assert.strictEqual(simRes1.sendTyping, true);
@@ -613,6 +612,11 @@ async function runTests() {
     controller.installMapPrototypeHook();
     const diMap = new Map();
 
+    const msgEmitter = new EventEmitter();
+    const groupEmitter = new EventEmitter();
+    const buddyEmitter = new EventEmitter();
+    const loginEmitter = new EventEmitter();
+
     const calledNtApis = [];
     const fakeNtApi = new Proxy(
       {},
@@ -653,6 +657,9 @@ async function runTests() {
                   },
                 ],
               };
+            }
+            if (prop === "nodeIKernelBuddyService/getDoubtBuddyReq") {
+              return { result: 0, errMsg: "", doubtList: [] };
             }
             if (prop === "nodeIKernelGroupService/getGroupList") {
               return {
@@ -709,10 +716,50 @@ async function runTests() {
               return { configData: { content: "rkey_private=1&rkey_group=2" } };
             }
             if (prop === "nodeIKernelRichMediaService/downloadFileForModelId") {
-              return { url: "https://multimedia.nt.qq.com.cn/group_file_test.pdf" };
+              if (payload?.savePath) {
+                fs.writeFileSync(payload.savePath, Buffer.from("GROUP_PDF_TEST"));
+              }
+              return { result: 0, errMsg: "" };
             }
-            if (prop === "nodeIKernelRichMediaService/downloadFileForFileUuid") {
-              return { url: "https://multimedia.nt.qq.com.cn/private_file_test.pdf" };
+            if (prop === "nodeIKernelMsgService/getMsgsIncludeSelf") {
+              if (payload?.peer?.chatType === 1) {
+                return {
+                  msgList: [
+                    {
+                      msgId: "7500000000000000201",
+                      chatType: 1,
+                      peerUid: payload.peer.peerUid,
+                      elements: [
+                        {
+                          elementId: "el_file_priv_1",
+                          elementType: 3,
+                          fileElement: {
+                            fileUuid: "file_priv_1",
+                            fileName: "private_file_test.pdf",
+                            fileSize: 13,
+                          },
+                        },
+                      ],
+                    },
+                  ],
+                };
+              }
+              return { msgList: [] };
+            }
+            if (prop === "nodeIKernelMsgService/downloadRichMedia") {
+              if (payload?.getReq?.filePath) {
+                fs.writeFileSync(payload.getReq.filePath, Buffer.from("PRIV_PDF_TEST"));
+                setImmediate(() => {
+                  msgEmitter.emit("onRichMediaDownloadComplete", {
+                    notifyInfo: {
+                      msgId: payload.getReq.msgId,
+                      msgElementId: payload.getReq.elementId,
+                      filePath: payload.getReq.filePath,
+                    },
+                  });
+                });
+              }
+              return { result: 0, errMsg: "" };
             }
             return { result: 0, errMsg: "" };
           };
@@ -727,10 +774,6 @@ async function runTests() {
 
     assert.strictEqual(controller.capturedServices.ntApi, fakeNtApi);
 
-    const msgEmitter = new EventEmitter();
-    const groupEmitter = new EventEmitter();
-    const buddyEmitter = new EventEmitter();
-    const loginEmitter = new EventEmitter();
     const listenerMap = new Map([
       ["nodeIKernelMsgListener", msgEmitter],
       ["nodeIKernelGroupListener", groupEmitter],
@@ -835,7 +878,6 @@ async function runTests() {
       ["set_group_admin", { group_id: 654321, user_id: 100020002, enable: true }],
       ["set_group_card", { group_id: 654321, user_id: 100020002, card: "阿米娅" }],
       ["set_group_name", { group_id: 654321, group_name: "新罗德岛" }],
-      ["set_group_special_title", { group_id: 654321, user_id: 100020002, special_title: "领袖" }],
       ["set_group_leave", { group_id: 654321 }],
       ["set_qq_profile", { nickname: "Rosmontis", personal_note: "常驻干员" }],
       ["set_self_longnick", { longNick: "常驻干员" }],
@@ -888,18 +930,27 @@ async function runTests() {
         assert.ok(Number.isInteger(sentMessageId) && sentMessageId > 0);
       }
       if (act === "get_group_file_url") {
-        assert.strictEqual(
-          resp.data.url,
-          "https://multimedia.nt.qq.com.cn/group_file_test.pdf"
+        assert.ok(
+          resp.data.url.startsWith("file://"),
+          `Expected file:// URL from get_group_file_url, got ${resp.data.url}`
         );
       }
       if (act === "get_private_file_url") {
-        assert.strictEqual(
-          resp.data.url,
-          "https://multimedia.nt.qq.com.cn/private_file_test.pdf"
+        assert.ok(
+          resp.data.url.startsWith("file://"),
+          `Expected file:// URL from get_private_file_url, got ${resp.data.url}`
         );
       }
     }
+
+    // Verify set_group_special_title fails honestly with retcode === 1404 on Linux QQNT 3.2.32
+    const specialTitleResp = await controller.handleOneBotAction("set_group_special_title", {
+      group_id: 654321,
+      user_id: 100020002,
+      special_title: "领袖",
+    });
+    assert.strictEqual(specialTitleResp.status, "failed");
+    assert.strictEqual(specialTitleResp.retcode, 1404);
 
     // Verify get_cookies fails cleanly with status === "failed" & retcode === 1403 when enableWebCredentialApi is omitted or false
     for (const cfgOverride of [{}, { enableWebCredentialApi: false }]) {
@@ -925,15 +976,28 @@ async function runTests() {
       calledNtApis.some((c) => c.cmd === "nodeIKernelMsgService/sendNudge"),
       "Expected send_poke / group_poke to invoke nodeIKernelMsgService/sendNudge"
     );
-    // Confirm set_group_special_title invoked real setIdentityTitleInfo
+    // Confirm set_group_ban & set_group_whole_ban invoked real setMemberShutUp & setGroupShutUp
     assert.ok(
-      calledNtApis.some((c) => c.cmd === "nodeIKernelGroupService/setIdentityTitleInfo"),
-      "Expected set_group_special_title to invoke nodeIKernelGroupService/setIdentityTitleInfo"
+      calledNtApis.some((c) => c.cmd === "nodeIKernelGroupService/setMemberShutUp"),
+      "Expected set_group_ban to invoke nodeIKernelGroupService/setMemberShutUp"
     );
-    // Confirm get_essence_msg_list invoked real getGroupLatestEssenceList
     assert.ok(
-      calledNtApis.some((c) => c.cmd === "nodeIKernelGroupService/getGroupLatestEssenceList"),
-      "Expected get_essence_msg_list to invoke nodeIKernelGroupService/getGroupLatestEssenceList"
+      calledNtApis.some((c) => c.cmd === "nodeIKernelGroupService/setGroupShutUp"),
+      "Expected set_group_whole_ban to invoke nodeIKernelGroupService/setGroupShutUp"
+    );
+    // Confirm ocr_image invoked real getScreenOCR & set_online_status invoked real setStatus
+    assert.ok(
+      calledNtApis.some((c) => c.cmd === "nodeIKernelRichMediaService/getScreenOCR"),
+      "Expected ocr_image to invoke nodeIKernelRichMediaService/getScreenOCR"
+    );
+    assert.ok(
+      calledNtApis.some((c) => c.cmd === "nodeIKernelMsgService/setStatus"),
+      "Expected set_online_status to invoke nodeIKernelMsgService/setStatus"
+    );
+    // Confirm get_essence_msg_list invoked real fetchGroupEssenceListV2
+    assert.ok(
+      calledNtApis.some((c) => c.cmd === "nodeIKernelGroupService/fetchGroupEssenceListV2"),
+      "Expected get_essence_msg_list to invoke nodeIKernelGroupService/fetchGroupEssenceListV2"
     );
 
     // Verify message-dependent actions using the registered message_id
@@ -1094,7 +1158,15 @@ async function runTests() {
     assert.ok(!sampleCbId.startsWith("rosmontis_cb_"), `callbackId must not start with rosmontis_cb_: ${sampleCbId}`);
     assert.ok(uuidRegex.test(sampleCbId), `callbackId must be RFC 4122 v4 UUID: ${sampleCbId}`);
 
-    await rBridge.invokeNtApi("nodeIKernelMsgService/setFocusOnBase", [{ isFocus: true }, null]);
+    await rBridge.invokeNtApi("nodeIKernelMsgService/setFocusOnBase", [
+      {
+        peer: { chatType: 1, peerUid: "u_1", guildId: "" },
+        chatType: 1,
+        peerUid: "u_1",
+        guildId: "",
+      },
+      null,
+    ]);
     assert.strictEqual(sentIpcFrames.length, 1);
     const frameCbId = sentIpcFrames[0].meta.callbackId;
     assert.ok(!frameCbId.startsWith("rosmontis_cb_"));
@@ -1154,7 +1226,7 @@ async function runTests() {
     );
 
     try {
-      // 1. Trigger set_input_status (event_type: 1): setFocusOnBase -> addActiveChatByUid -> enterOrExitAio(1) -> setMsgRead -> sendShowInputStatusReq
+      // 1. Trigger set_input_status (event_type: 1): setFocusOnBase -> enterOrExitAio(1) -> setMsgRead -> sendShowInputStatusReq
       const statusResp = await controller.handleOneBotAction("set_input_status", {
         user_id: 100020002,
         event_type: 1,
@@ -1163,12 +1235,15 @@ async function runTests() {
 
       const cmdsAfterTyping = callOrder.map((c) => c.cmd);
       const focusIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/setFocusOnBase");
-      const activeIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/addActiveChatByUid");
       const enterIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/enterOrExitAio");
       const readIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/setMsgRead");
       const typingIdx = cmdsAfterTyping.indexOf("nodeIKernelMsgService/sendShowInputStatusReq");
-      assert.ok(focusIdx >= 0 && focusIdx < activeIdx, "setFocusOnBase must precede addActiveChatByUid");
-      assert.ok(activeIdx >= 0 && activeIdx < enterIdx, "addActiveChatByUid must precede enterOrExitAio");
+      assert.strictEqual(
+        cmdsAfterTyping.includes("nodeIKernelMsgService/addActiveChatByUid"),
+        false,
+        "addActiveChatByUid does not exist in QQNT and must never be called"
+      );
+      assert.ok(focusIdx >= 0 && focusIdx < enterIdx, "setFocusOnBase must precede enterOrExitAio");
       assert.ok(enterIdx >= 0 && enterIdx < readIdx, "enterOrExitAio must precede setMsgRead");
       assert.ok(readIdx >= 0 && readIdx < typingIdx, "setMsgRead must precede sendShowInputStatusReq");
 
@@ -1204,7 +1279,6 @@ async function runTests() {
       const cmdsDirect = callOrder.map((c) => c.cmd);
       assert.deepStrictEqual(cmdsDirect, [
         "nodeIKernelMsgService/enterOrExitAio",
-        "nodeIKernelMsgService/addActiveChatByUid",
         "nodeIKernelMsgService/enterOrExitAio",
         "nodeIKernelMsgService/setMsgRead",
         "nodeIKernelMsgService/sendMsg",
@@ -2386,11 +2460,12 @@ async function runTests() {
             const cmd = data.cmdName;
             const arg0 = Array.isArray(data.payload) ? data.payload[0] : data.payload;
             if (cmd === "nodeIKernelMsgService/enterOrExitAio") {
-              const p = arg0?.info?.peer;
+              const entry = arg0?.info_list?.[0];
+              const p = entry?.peer;
               const pKey = p ? `${p.chatType}:${p.peerUid}:${p.guildId || ""}` : "";
-              if (arg0?.info?.enterType === 1) {
+              if (entry?.option === 1) {
                 currentActivePeerKey = pKey;
-              } else if (arg0?.info?.enterType === 2 && currentActivePeerKey === pKey) {
+              } else if (entry?.option === 2 && currentActivePeerKey === pKey) {
                 currentActivePeerKey = "";
               }
             }
@@ -2490,11 +2565,12 @@ async function runTests() {
             if (typeof prop !== "string" || !prop.includes("/")) return undefined;
             return async (payload) => {
               if (prop === "nodeIKernelMsgService/enterOrExitAio") {
-                const p = payload?.info?.peer;
+                const entry = payload?.info_list?.[0];
+                const p = entry?.peer;
                 const pKey = p ? `${p.chatType}:${p.peerUid}:${p.guildId || ""}` : "";
-                if (payload?.info?.enterType === 1) {
+                if (entry?.option === 1) {
                   currentActivePeerKey = pKey;
-                } else if (payload?.info?.enterType === 2 && currentActivePeerKey === pKey) {
+                } else if (entry?.option === 2 && currentActivePeerKey === pKey) {
                   currentActivePeerKey = "";
                 }
               }
@@ -2539,18 +2615,22 @@ async function runTests() {
           ipcCalls.map((c) => c.cmd),
           [
             "nodeIKernelMsgService/setFocusOnBase",
-            "nodeIKernelMsgService/addActiveChatByUid",
             "nodeIKernelMsgService/enterOrExitAio",
             "nodeIKernelMsgService/setMsgRead",
             "nodeIKernelMsgService/sendMsg",
           ],
-          "Direct send_private_msg must strictly follow setFocusOnBase(true) -> addActiveChatByUid -> enterOrExitAio(1) -> setMsgRead -> sendMsg without a 0ms sendShowInputStatusReq"
+          "Direct send_private_msg must strictly follow setFocusOnBase(Contact) -> enterOrExitAio(option: 1) -> setMsgRead -> sendMsg without addActiveChatByUid or 0ms sendShowInputStatusReq"
         );
-        assert.deepStrictEqual(ipcCalls[0].payload, { isFocus: true });
-        assert.strictEqual(ipcCalls[2].payload.info.enterType, 1);
-        assert.strictEqual(ipcCalls[2].payload.info.peer.peerUid, "u_uid_u1");
+        assert.deepStrictEqual(ipcCalls[0].payload, {
+          peer: { chatType: 1, peerUid: "u_uid_u1", guildId: "" },
+          chatType: 1,
+          peerUid: "u_uid_u1",
+          guildId: "",
+        });
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].option, 1);
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].peer.peerUid, "u_uid_u1");
 
-        // Switch to second session (Group 888002): must exit U1 first, addActiveChatByUid(G2), enterOrExitAio(G2, 1), without repeating setFocusOnBase(true)
+        // Switch to second session (Group 888002): must exit U1 first, enterOrExitAio(G2, 1), without repeating setFocusOnBase
         ipcCalls.length = 0;
         const res2 = await bridge.handleOneBotAction("send_group_msg", {
           group_id: 888002,
@@ -2561,17 +2641,16 @@ async function runTests() {
           ipcCalls.map((c) => c.cmd),
           [
             "nodeIKernelMsgService/enterOrExitAio",
-            "nodeIKernelMsgService/addActiveChatByUid",
             "nodeIKernelMsgService/enterOrExitAio",
             "nodeIKernelMsgService/setMsgRead",
             "nodeIKernelMsgService/sendMsg",
           ],
-          "Switching session must exit old AIO -> addActiveChatByUid(new) -> enterOrExitAio(new, 1) without repeating setFocusOnBase(true)"
+          "Switching session must exit old AIO -> enterOrExitAio(new, option: 1) without repeating setFocusOnBase"
         );
-        assert.strictEqual(ipcCalls[0].payload.info.enterType, 2);
-        assert.strictEqual(ipcCalls[0].payload.info.peer.peerUid, "u_uid_u1");
-        assert.strictEqual(ipcCalls[2].payload.info.enterType, 1);
-        assert.strictEqual(ipcCalls[2].payload.info.peer.peerUid, "888002");
+        assert.strictEqual(ipcCalls[0].payload.info_list[0].option, 2);
+        assert.strictEqual(ipcCalls[0].payload.info_list[0].peer.peerUid, "u_uid_u1");
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].option, 1);
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].peer.peerUid, "888002");
 
         // Simulate temporary Tier 2 degradation switching to Group 888003, then Tier 1 recovery back to Group 888002
         bridge.rendererSimulateSession = null;
@@ -2583,8 +2662,8 @@ async function runTests() {
         });
         assert.strictEqual(ipcCalls[0].tier, 2);
         assert.strictEqual(ipcCalls[0].cmd, "nodeIKernelMsgService/enterOrExitAio");
-        assert.strictEqual(ipcCalls[0].payload.info.peer.peerUid, "888002");
-        assert.strictEqual(ipcCalls[0].payload.info.enterType, 2);
+        assert.strictEqual(ipcCalls[0].payload.info_list[0].peer.peerUid, "888002");
+        assert.strictEqual(ipcCalls[0].payload.info_list[0].option, 2);
 
         // Restore Tier 1 renderer (whose local state was still stuck on 888002 before sync!) and send to 888002
         bridge.rendererExecute = (cmd, args) => rBridge.invokeNtApi(cmd, args);
@@ -2597,14 +2676,14 @@ async function runTests() {
         assert.strictEqual(ipcCalls[0].tier, 1);
         assert.strictEqual(ipcCalls[0].cmd, "nodeIKernelMsgService/enterOrExitAio");
         assert.strictEqual(
-          ipcCalls[0].payload.info.peer.peerUid,
+          ipcCalls[0].payload.info_list[0].peer.peerUid,
           "888003",
           "Tier 1 must sync knownActivePeer from main process and exit 888003"
         );
-        assert.strictEqual(ipcCalls[0].payload.info.enterType, 2);
-        assert.strictEqual(ipcCalls[2].cmd, "nodeIKernelMsgService/enterOrExitAio");
-        assert.strictEqual(ipcCalls[2].payload.info.peer.peerUid, "888002");
-        assert.strictEqual(ipcCalls[2].payload.info.enterType, 1);
+        assert.strictEqual(ipcCalls[0].payload.info_list[0].option, 2);
+        assert.strictEqual(ipcCalls[1].cmd, "nodeIKernelMsgService/enterOrExitAio");
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].peer.peerUid, "888002");
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].option, 1);
       } finally {
         await bridge.stopServers();
       }
@@ -2675,21 +2754,21 @@ async function runTests() {
           );
         }
 
-        // Verify between sendMsg(Group B) and sendMsg(Group A): enterOrExitAio(B, 2) -> addActiveChatByUid(A) -> enterOrExitAio(A, 1)
+        // Verify between sendMsg(Group B) and sendMsg(Group A): enterOrExitAio(B, option: 2) -> enterOrExitAio(A, option: 1)
         const idxSendB = ipcCalls.indexOf(sendCalls[0]);
         const idxSendA = ipcCalls.indexOf(sendCalls[1]);
         const betweenCmds = ipcCalls.slice(idxSendB + 1, idxSendA);
         const exitBIdx = betweenCmds.findIndex(
           (c) =>
             c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
-            c.payload.info.peer.peerUid === "900002" &&
-            c.payload.info.enterType === 2
+            c.payload.info_list?.[0]?.peer?.peerUid === "900002" &&
+            c.payload.info_list?.[0]?.option === 2
         );
         const enterAIdx = betweenCmds.findIndex(
           (c) =>
             c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
-            c.payload.info.peer.peerUid === "900001" &&
-            c.payload.info.enterType === 1
+            c.payload.info_list?.[0]?.peer?.peerUid === "900001" &&
+            c.payload.info_list?.[0]?.option === 1
         );
         assert.ok(exitBIdx >= 0, "Must exit Group B AIO after Group A finishes downloading image");
         assert.ok(enterAIdx > exitBIdx, "Must enter Group A AIO after exiting Group B AIO and before sendMsg(Group A)");
@@ -2730,14 +2809,14 @@ async function runTests() {
         const exitG1Idx = ipcCalls.findIndex(
           (c) =>
             c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
-            c.payload.info.peer.peerUid === "900011" &&
-            c.payload.info.enterType === 2
+            c.payload.info_list?.[0]?.peer?.peerUid === "900011" &&
+            c.payload.info_list?.[0]?.option === 2
         );
         const enterU1Idx = ipcCalls.findIndex(
           (c) =>
             c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
-            c.payload.info.peer.peerUid === "u_uid_u1" &&
-            c.payload.info.enterType === 1
+            c.payload.info_list?.[0]?.peer?.peerUid === "u_uid_u1" &&
+            c.payload.info_list?.[0]?.option === 1
         );
         const sendU1Idx = ipcCalls.findIndex((c) => c.cmd === "nodeIKernelMsgService/sendMsg");
         assert.ok(exitG1Idx >= 0, "Must exit preempting group G1 before sending private message");
@@ -2769,15 +2848,20 @@ async function runTests() {
           ipcCalls.some(
             (c) =>
               c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
-              c.payload.info.peer.peerUid === "900021" &&
-              c.payload.info.enterType === 2
+              c.payload.info_list?.[0]?.peer?.peerUid === "900021" &&
+              c.payload.info_list?.[0]?.option === 2
           ),
           true,
           "Must auto-exit AIO after aioIdleExitMs (60ms)"
         );
         assert.strictEqual(
           ipcCalls.some(
-            (c) => c.cmd === "nodeIKernelMsgService/setFocusOnBase" && c.payload.isFocus === false
+            (c) =>
+              c.cmd === "nodeIKernelMsgService/setFocusOnBase" &&
+              c.payload.chatType === 0 &&
+              c.payload.peerUid === "" &&
+              c.payload.peer?.chatType === 0 &&
+              c.payload.peer?.peerUid === ""
           ),
           false,
           "Window must still remain focused before focusIdleBlurMs (140ms)"
@@ -2787,14 +2871,21 @@ async function runTests() {
         await new Promise((r) => setTimeout(r, 85));
         assert.strictEqual(
           ipcCalls.some(
-            (c) => c.cmd === "nodeIKernelMsgService/setFocusOnBase" && c.payload.isFocus === false
+            (c) =>
+              c.cmd === "nodeIKernelMsgService/setFocusOnBase" &&
+              c.payload.chatType === 0 &&
+              c.payload.peerUid === "" &&
+              c.payload.peer?.chatType === 0 &&
+              c.payload.peer?.peerUid === ""
           ),
           true,
-          "Must auto-blur window via setFocusOnBase({ isFocus: false }) after focusIdleBlurMs (140ms)"
+          "Must auto-blur window via empty Contact setFocusOnBase payload after focusIdleBlurMs (140ms)"
         );
         assert.strictEqual(
           ipcCalls.filter(
-            (c) => c.cmd === "nodeIKernelMsgService/enterOrExitAio" && c.payload.info.enterType === 2
+            (c) =>
+              c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
+              c.payload.info_list?.[0]?.option === 2
           ).length,
           1,
           "Must not emit duplicate enterOrExitAio(2) when blur timer fires"
@@ -2807,10 +2898,14 @@ async function runTests() {
           message: "wake up from blur",
         });
         assert.strictEqual(ipcCalls[0].cmd, "nodeIKernelMsgService/setFocusOnBase");
-        assert.deepStrictEqual(ipcCalls[0].payload, { isFocus: true });
-        assert.strictEqual(ipcCalls[1].cmd, "nodeIKernelMsgService/addActiveChatByUid");
-        assert.strictEqual(ipcCalls[2].cmd, "nodeIKernelMsgService/enterOrExitAio");
-        assert.strictEqual(ipcCalls[2].payload.info.enterType, 1);
+        assert.deepStrictEqual(ipcCalls[0].payload, {
+          peer: { chatType: 2, peerUid: "900021", guildId: "" },
+          chatType: 2,
+          peerUid: "900021",
+          guildId: "",
+        });
+        assert.strictEqual(ipcCalls[1].cmd, "nodeIKernelMsgService/enterOrExitAio");
+        assert.strictEqual(ipcCalls[1].payload.info_list[0].option, 1);
 
         // Verify onKickedOffLine clears active AIO, focus state, and idle timers
         assert.ok(bridge._activeAioPeer !== null);
@@ -3614,7 +3709,6 @@ async function runTests() {
           ntKernelCalls.map((c) => c.cmd),
           [
             "nodeIKernelMsgService/setFocusOnBase",
-            "nodeIKernelMsgService/addActiveChatByUid",
             "nodeIKernelMsgService/enterOrExitAio",
             "nodeIKernelMsgService/setMsgRead",
             "nodeIKernelMsgService/sendShowInputStatusReq",
@@ -3716,6 +3810,7 @@ async function runTests() {
     //    while get_rkey remains accessible and get_essence_msg_list / _get_group_notice fall back to NT kernel APIs
     {
       assert.strictEqual(WEB_CREDENTIAL_ACTIONS.size, 11);
+      let failEssenceV2 = false;
       const calledKernelCmds = [];
       const defaultBridge = new mainMod.NtqqOneBotBridge({
         selfUin: "100010001",
@@ -3730,8 +3825,12 @@ async function runTests() {
                 if (prop === "nodeIKernelUnitedConfigService/loadUnitedConfig") {
                   return { configData: { content: "&rkey=test_cdn_rkey_123" } };
                 }
-                if (prop === "nodeIKernelGroupService/getGroupLatestEssenceList") {
+                if (prop === "nodeIKernelGroupService/fetchGroupEssenceListV2") {
+                  if (failEssenceV2) throw new Error("V2 unavailable on legacy build");
                   return { msgList: [{ msg_seq: 88, sender_uin: "100020002" }] };
+                }
+                if (prop === "nodeIKernelGroupService/getGroupLatestEssenceList") {
+                  return { msgList: [{ msg_seq: 89, sender_uin: "100020002" }] };
                 }
                 if (prop === "nodeIKernelGroupService/getGroupBulletin") {
                   return {
@@ -3768,13 +3867,36 @@ async function runTests() {
         assert.strictEqual(rkeyResp.data.rkeys.length, 2);
         assert.strictEqual(rkeyResp.data.rkeys[0].rkey, "&rkey=test_cdn_rkey_123");
 
+        calledKernelCmds.length = 0;
         const essenceResp = await defaultBridge.handleOneBotAction("get_essence_msg_list", {
           group_id: 654321,
         });
         assert.strictEqual(essenceResp.status, "ok");
         assert.strictEqual(Array.isArray(essenceResp.data), true);
         assert.strictEqual(essenceResp.data.length, 1);
-        assert.ok(calledKernelCmds.includes("nodeIKernelGroupService/getGroupLatestEssenceList"));
+        assert.strictEqual(essenceResp.data[0].msg_seq, 88);
+        assert.strictEqual(
+          calledKernelCmds[0],
+          "nodeIKernelGroupService/fetchGroupEssenceListV2",
+          "get_essence_msg_list must invoke fetchGroupEssenceListV2 first"
+        );
+        assert.strictEqual(
+          calledKernelCmds.includes("nodeIKernelGroupService/getGroupLatestEssenceList"),
+          false,
+          "get_essence_msg_list should not fall back when fetchGroupEssenceListV2 succeeds"
+        );
+
+        failEssenceV2 = true;
+        calledKernelCmds.length = 0;
+        const essenceFallbackResp = await defaultBridge.handleOneBotAction("get_essence_msg_list", {
+          group_id: 654321,
+        });
+        assert.strictEqual(essenceFallbackResp.status, "ok");
+        assert.strictEqual(essenceFallbackResp.data[0].msg_seq, 89);
+        assert.deepStrictEqual(calledKernelCmds, [
+          "nodeIKernelGroupService/fetchGroupEssenceListV2",
+          "nodeIKernelGroupService/getGroupLatestEssenceList",
+        ]);
 
         const noticeResp = await defaultBridge.handleOneBotAction("_get_group_notice", {
           group_id: 654321,
@@ -3852,7 +3974,7 @@ async function runTests() {
         ]);
         assert.strictEqual(calls.length, 0, "Passive receipt with autoReadAndTypeOnPrivateRecv=false should not invoke AIO commands yet");
 
-        // Step 2: set_input_status -> focus -> activeChat -> enterAio(1) -> setMsgRead -> sendShowInputStatusReq
+        // Step 2: set_input_status -> focus -> enterAio(option: 1) -> setMsgRead -> sendShowInputStatusReq
         const stRes = await bridge.handleOneBotAction("set_input_status", {
           user_id: 100020002,
           event_type: 1,
@@ -3862,7 +3984,6 @@ async function runTests() {
           calls.map((c) => c.cmd),
           [
             "nodeIKernelMsgService/setFocusOnBase",
-            "nodeIKernelMsgService/addActiveChatByUid",
             "nodeIKernelMsgService/enterOrExitAio",
             "nodeIKernelMsgService/setMsgRead",
             "nodeIKernelMsgService/sendShowInputStatusReq",
@@ -3914,14 +4035,19 @@ async function runTests() {
           calls.some(
             (c) =>
               c.cmd === "nodeIKernelMsgService/enterOrExitAio" &&
-              c.payload?.info?.enterType === 2 &&
-              c.payload?.info?.peer?.peerUid === "u_priv_1"
+              c.payload?.info_list?.[0]?.option === 2 &&
+              c.payload?.info_list?.[0]?.peer?.peerUid === "u_priv_1"
           ),
           "Unanswered typing session must cleanly exit AIO after idle timeout"
         );
         assert.ok(
           calls.some(
-            (c) => c.cmd === "nodeIKernelMsgService/setFocusOnBase" && c.payload?.isFocus === false
+            (c) =>
+              c.cmd === "nodeIKernelMsgService/setFocusOnBase" &&
+              c.payload?.chatType === 0 &&
+              c.payload?.peerUid === "" &&
+              c.payload?.peer?.chatType === 0 &&
+              c.payload?.peer?.peerUid === ""
           ),
           "Unanswered typing session must cleanly blur window after focus idle timeout"
         );
@@ -4463,14 +4589,14 @@ async function runTests() {
                 uin: "20001",
                 nick: "被禁言群友",
                 cardName: "禁言名片",
-                role: 2,
+                role: 3,
                 shutUpTime: nowSec + 600,
               },
               {
                 uid: "u_normal_2",
                 uin: "20002",
                 nick: "正常群友",
-                role: 0,
+                role: 2,
                 shutUpTime: 0,
               },
             ],
@@ -4627,8 +4753,10 @@ async function runTests() {
       assert.strictEqual(sentCall.payload.msgElements[1].textElement.content, "收到 ");
       assert.strictEqual(sentCall.payload.msgElements[2].faceElement.faceIndex, 14);
       assert.ok(ntCalls.some((c) => c.cmd === "nodeIKernelMsgService/recallMsg"));
-      const banCall = ntCalls.find((c) => c.cmd === "nodeIKernelGroupService/banMember");
-      assert.ok(banCall);
+      const banCall = ntCalls.find((c) => c.cmd === "nodeIKernelGroupService/setMemberShutUp");
+      assert.ok(banCall, "Expected setMemberShutUp from quick_operation ban");
+      assert.strictEqual(banCall.payload.groupCode, "777888");
+      assert.strictEqual(banCall.payload.memList[0].uid, "u_normal_2");
       assert.strictEqual(banCall.payload.memList[0].timeStamp, 300);
       assert.ok(ntCalls.some((c) => c.cmd === "nodeIKernelGroupService/kickMember"));
 
@@ -4715,6 +4843,15 @@ async function runTests() {
       assert.strictEqual(shutList.data.length, 1);
       assert.strictEqual(shutList.data[0].user_id, 20001);
       assert.strictEqual(shutList.data[0].role, "admin");
+
+      const memList777 = await compatBridge.handleOneBotAction("get_group_member_list", {
+        group_id: 777888,
+        no_cache: true,
+      });
+      assert.strictEqual(memList777.status, "ok");
+      const normalMem2 = memList777.data.find((m) => m.user_id === 20002);
+      assert.ok(normalMem2, "Expected u_normal_2 in get_group_member_list");
+      assert.strictEqual(normalMem2.role, "member", "MemberRole 2 must map to 'member', not 'admin'");
 
       const setRmk = await compatBridge.handleOneBotAction("set_group_remark", {
         group_id: 777888,
@@ -5976,6 +6113,327 @@ async function runTests() {
       else process.env.ROSMONTIS_TEMP_DIR = prevTempEnv;
       if (voiceBridge) voiceBridge.flushTempCleanup();
       fs.rmSync(tmpVoiceDir, { recursive: true, force: true });
+    }
+  });
+
+  console.log("=== 23. Testing Linux QQNT 3.2.32-52194 Verified Contracts & Tier 3 Positional Args ===");
+  await check("MemberRole (2/3/4), RichMedia getGroupFileList fileListForm, doubt buddy APIs, and Tier 3 wrapperSession positionalArgs", async () => {
+    const ntCalls = [];
+    const inboundEvents = [];
+    const contractBridge = new mainMod.NtqqOneBotBridge({
+      selfUin: "100010001",
+      selfUid: "u_rosmontis_self",
+      config: {
+        selfUin: "100010001",
+        httpServers: [],
+        wsServers: [],
+        wsClients: [],
+        humanSimulation: false,
+      },
+      ntApi: new Proxy(
+        {},
+        {
+          get(_t, prop) {
+            if (typeof prop !== "string" || !prop.includes("/")) return undefined;
+            return async (payload) => {
+              ntCalls.push({ cmd: prop, payload });
+              if (prop === "nodeIKernelGroupService/getAllMemberList") {
+                return {
+                  infos: [
+                    { uid: "u_role_2", uin: "30002", nick: "Member2", role: 2 },
+                    { uid: "u_role_3", uin: "30003", nick: "Admin3", role: 3 },
+                    { uid: "u_role_4", uin: "30004", nick: "Owner4", role: 4 },
+                  ],
+                };
+              }
+              if (prop === "nodeIKernelGroupService/getMemberInfo") {
+                const targetUid = payload?.uids?.[0];
+                const roleByUid = { u_role_2: 2, u_role_3: 3, u_role_4: 4 };
+                const uinByUid = { u_role_2: "30002", u_role_3: "30003", u_role_4: "30004" };
+                return {
+                  result: {
+                    infos: new Map([
+                      [
+                        targetUid,
+                        {
+                          uid: targetUid,
+                          uin: uinByUid[targetUid],
+                          nick: `Nick_${targetUid}`,
+                          role: roleByUid[targetUid],
+                        },
+                      ],
+                    ]),
+                  },
+                };
+              }
+              if (prop === "nodeIKernelRichMediaService/getGroupFileList") {
+                return {
+                  groupFileListResult: {
+                    item: [
+                      {
+                        type: 1,
+                        fileInfo: {
+                          fileId: "/f_contract_1",
+                          fileName: "spec.pdf",
+                          fileSize: 4096,
+                          busId: 102,
+                          uploadTime: 1710000100,
+                          deadTime: 0,
+                          modifyTime: 1710000100,
+                          downloadTimes: 3,
+                          uploaderUin: "30003",
+                          uploaderName: "Admin3",
+                        },
+                      },
+                    ],
+                  },
+                };
+              }
+              if (prop === "nodeIKernelBuddyService/getDoubtBuddyReq") {
+                return {
+                  result: 0,
+                  errMsg: "",
+                  doubtList: [{ uid: "u_doubt_1", nick: "DoubtUser", msg: "hello" }],
+                };
+              }
+              if (prop === "nodeIKernelBuddyService/approvalDoubtBuddyReq") {
+                return { result: 0, errMsg: "" };
+              }
+              return { result: 0, errMsg: "" };
+            };
+          },
+        }
+      ),
+    });
+    contractBridge.on("onebot_event", (ev) => inboundEvents.push(ev));
+    contractBridge.uinUidStore.record("30002", "u_role_2");
+    contractBridge.uinUidStore.record("30003", "u_role_3");
+    contractBridge.uinUidStore.record("30004", "u_role_4");
+
+    try {
+      // 1. MemberRole 2 -> "member", 3 -> "admin", 4 -> "owner" in get_group_member_list, get_group_member_info, and inbound sender.role
+      const listResp = await contractBridge.handleOneBotAction("get_group_member_list", {
+        group_id: 999001,
+        no_cache: true,
+      });
+      assert.strictEqual(listResp.status, "ok");
+      const roleMapFromList = Object.fromEntries(listResp.data.map((m) => [m.user_id, m.role]));
+      assert.deepStrictEqual(roleMapFromList, {
+        30002: "member",
+        30003: "admin",
+        30004: "owner",
+      });
+
+      for (const [uidNum, expectedRole] of [
+        [30002, "member"],
+        [30003, "admin"],
+        [30004, "owner"],
+      ]) {
+        const infoResp = await contractBridge.handleOneBotAction("get_group_member_info", {
+          group_id: 999001,
+          user_id: uidNum,
+          no_cache: true,
+        });
+        assert.strictEqual(infoResp.status, "ok");
+        assert.strictEqual(infoResp.data.role, expectedRole);
+      }
+
+      await contractBridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+        [
+          {
+            msgId: "7800000000000000002",
+            msgSeq: "202",
+            msgTime: "1710000202",
+            chatType: 2,
+            msgType: 2,
+            peerUid: "999001",
+            senderUid: "u_role_2",
+            senderUin: "30002",
+            sendNickName: "Member2",
+            roleType: 2,
+            elements: [{ elementType: 1, textElement: { content: "role 2 msg" } }],
+          },
+          {
+            msgId: "7800000000000000003",
+            msgSeq: "203",
+            msgTime: "1710000203",
+            chatType: 2,
+            msgType: 2,
+            peerUid: "999001",
+            senderUid: "u_role_3",
+            senderUin: "30003",
+            sendNickName: "Admin3",
+            roleType: 3,
+            elements: [{ elementType: 1, textElement: { content: "role 3 msg" } }],
+          },
+          {
+            msgId: "7800000000000000004",
+            msgSeq: "204",
+            msgTime: "1710000204",
+            chatType: 2,
+            msgType: 2,
+            peerUid: "999001",
+            senderUid: "u_role_4",
+            senderUin: "30004",
+            sendNickName: "Owner4",
+            roleType: 4,
+            elements: [{ elementType: 1, textElement: { content: "role 4 msg" } }],
+          },
+        ],
+      ]);
+      assert.strictEqual(inboundEvents.length, 3);
+      assert.strictEqual(inboundEvents[0].sender.role, "member");
+      assert.strictEqual(inboundEvents[1].sender.role, "admin");
+      assert.strictEqual(inboundEvents[2].sender.role, "owner");
+
+      // 2. get_group_root_files -> nodeIKernelRichMediaService/getGroupFileList with fileListForm
+      ntCalls.length = 0;
+      const rootFilesResp = await contractBridge.handleOneBotAction("get_group_root_files", {
+        group_id: 999001,
+        file_count: 25,
+      });
+      assert.strictEqual(rootFilesResp.status, "ok");
+      assert.strictEqual(rootFilesResp.data.files.length, 1);
+      assert.strictEqual(rootFilesResp.data.files[0].file_id, "/f_contract_1");
+      assert.strictEqual(
+        ntCalls.some((c) => c.cmd.startsWith("nodeIKernelGroupService/")),
+        false,
+        "get_group_root_files must NOT call nodeIKernelGroupService"
+      );
+      const fileListCall = ntCalls.find(
+        (c) => c.cmd === "nodeIKernelRichMediaService/getGroupFileList"
+      );
+      assert.ok(fileListCall, "get_group_root_files must call nodeIKernelRichMediaService/getGroupFileList");
+      assert.strictEqual(fileListCall.payload.groupId, "999001");
+      assert.strictEqual(fileListCall.payload.groupFileListForm, undefined);
+      assert.deepStrictEqual(fileListCall.payload.fileListForm, {
+        sortType: 1,
+        fileCount: 25,
+        startIndex: 0,
+        sortOrder: 2,
+        showOnlinedocFolder: false,
+        folderId: "/",
+      });
+
+      // 3. Doubt buddy request actions -> getDoubtBuddyReq & approvalDoubtBuddyReq
+      ntCalls.length = 0;
+      const doubtListResp = await contractBridge.handleOneBotAction(
+        "get_doubt_friends_add_request",
+        { count: 20 }
+      );
+      assert.strictEqual(doubtListResp.status, "ok");
+      assert.strictEqual(doubtListResp.data.length, 1);
+      assert.strictEqual(doubtListResp.data[0].uid, "u_doubt_1");
+      const getDoubtCall = ntCalls.find(
+        (c) => c.cmd === "nodeIKernelBuddyService/getDoubtBuddyReq"
+      );
+      assert.ok(getDoubtCall, "Expected nodeIKernelBuddyService/getDoubtBuddyReq");
+      assert.strictEqual(getDoubtCall.payload.reqNum, 20);
+
+      const approveDoubtResp = await contractBridge.handleOneBotAction(
+        "set_doubt_friends_add_request",
+        { flag: "u_doubt_1", approve: true, remark: "VerifiedFriend" }
+      );
+      assert.strictEqual(approveDoubtResp.status, "ok");
+      const approveDoubtCall = ntCalls.find(
+        (c) => c.cmd === "nodeIKernelBuddyService/approvalDoubtBuddyReq"
+      );
+      assert.ok(approveDoubtCall, "Expected nodeIKernelBuddyService/approvalDoubtBuddyReq");
+      assert.deepStrictEqual(approveDoubtCall.payload, {
+        uid: "u_doubt_1",
+        groupId: "",
+        remark: "VerifiedFriend",
+      });
+    } finally {
+      await contractBridge.stopServers();
+    }
+
+    // 4. Tier 3 wrapperSession.get*Service() fallback passes exact positionalArgs
+    const tier3Calls = [];
+    const tier3Bridge = new mainMod.NtqqOneBotBridge({
+      selfUin: "100010001",
+      selfUid: "u_rosmontis_self",
+      config: {
+        selfUin: "100010001",
+        httpServers: [],
+        wsServers: [],
+        wsClients: [],
+        humanSimulation: true,
+        dedupeWindowMs: 5000,
+      },
+    });
+    tier3Bridge.uinUidStore.record("100020002", "u_tier3_peer");
+    tier3Bridge.capturedServices.wrapperSession = {
+      getMsgService() {
+        return {
+          async setFocusOnBase(...args) {
+            tier3Calls.push({ svc: "MsgService", method: "setFocusOnBase", args });
+            return { result: 0, errMsg: "" };
+          },
+          async enterOrExitAio(...args) {
+            tier3Calls.push({ svc: "MsgService", method: "enterOrExitAio", args });
+            return { result: 0, errMsg: "" };
+          },
+          async setMsgRead(...args) {
+            tier3Calls.push({ svc: "MsgService", method: "setMsgRead", args });
+            return { result: 0, errMsg: "" };
+          },
+          async sendShowInputStatusReq(...args) {
+            tier3Calls.push({ svc: "MsgService", method: "sendShowInputStatusReq", args });
+            return { result: 0, errMsg: "" };
+          },
+        };
+      },
+      getNodeMiscService() {
+        return {
+          async querySystemProfile(...args) {
+            tier3Calls.push({ svc: "NodeMiscService", method: "querySystemProfile", args });
+            return { result: 0, os: "Linux" };
+          },
+        };
+      },
+    };
+
+    try {
+      const t3Typing = await tier3Bridge.handleOneBotAction("set_input_status", {
+        user_id: 100020002,
+        event_type: 1,
+      });
+      assert.strictEqual(t3Typing.status, "ok");
+
+      const focusCall = tier3Calls.find((c) => c.method === "setFocusOnBase");
+      assert.ok(focusCall);
+      assert.deepStrictEqual(focusCall.args, [
+        { chatType: 1, peerUid: "u_tier3_peer", guildId: "" },
+      ]);
+
+      const enterCall = tier3Calls.find((c) => c.method === "enterOrExitAio");
+      assert.ok(enterCall);
+      assert.strictEqual(enterCall.args.length, 1, "enterOrExitAio must receive 1 array positional arg");
+      assert.deepStrictEqual(enterCall.args[0], [
+        { peer: { chatType: 1, peerUid: "u_tier3_peer", guildId: "" }, option: 1 },
+      ]);
+
+      const typingCall = tier3Calls.find((c) => c.method === "sendShowInputStatusReq");
+      assert.ok(typingCall);
+      assert.strictEqual(
+        typingCall.args.length,
+        3,
+        "sendShowInputStatusReq must receive 3 separate positional args (chatType, eventType, peerUid)"
+      );
+      assert.deepStrictEqual(typingCall.args, [1, 1, "u_tier3_peer"]);
+
+      const miscRes = await tier3Bridge.invokeNt(
+        "nodeIKernelNodeMiscService/querySystemProfile",
+        { flag: 7, tag: "linux_qqnt" },
+        [7, "linux_qqnt"]
+      );
+      assert.strictEqual(miscRes.os, "Linux");
+      const miscCall = tier3Calls.find((c) => c.svc === "NodeMiscService");
+      assert.ok(miscCall, "nodeIKernelNodeMiscService must route via session.getNodeMiscService()");
+      assert.deepStrictEqual(miscCall.args, [7, "linux_qqnt"]);
+    } finally {
+      await tier3Bridge.stopServers();
     }
   });
 

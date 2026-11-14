@@ -12,6 +12,7 @@
  * 5. `src/core/session_controller.js` (`HumanSessionController` & causal step runners)
  * 6. `src/onebot/*` decomposed protocol modules & `MessageIdStore.prototype.resolve`
  * 7. Declarative action router collision & coverage guarantees + installer LF invariant
+ * 8. `src/core/renderer_ipc.js` (`SERVICE_GETTER_MAP`, `SIDE_EFFECT_NT_METHODS` & Tier-3/replay guards)
  */
 
 const assert = require("assert");
@@ -32,6 +33,7 @@ const {
   reviveBridgePayload,
   createActionRouter,
 } = require("../src/core/primitives");
+const ntNormalizerMod = require("../src/core/nt_normalizer");
 const {
   isPositiveUin,
   pickPositiveUin,
@@ -40,7 +42,7 @@ const {
   normalizeBuddyProfile,
   normalizeGroupMember,
   normalizeLoginIdentity,
-} = require("../src/core/nt_normalizer");
+} = ntNormalizerMod;
 const {
   EchoCorrelator,
   hasRichMediaElements,
@@ -50,6 +52,13 @@ const {
   runCausalActivateSteps,
   runCausalLeaveSteps,
 } = require("../src/core/session_controller");
+const {
+  SERVICE_GETTER_MAP,
+  SIDE_EFFECT_NT_METHODS,
+  isSideEffectNtCmd,
+  makeBridgeUnavailableError,
+  rendererIpcMixin,
+} = require("../src/core/renderer_ipc");
 const storesMod = require("../src/onebot/stores");
 const cqCodecMod = require("../src/onebot/cq_codec");
 const segmentConverterMod = require("../src/onebot/segment_converter");
@@ -325,7 +334,44 @@ async function runTests() {
     assert.strictEqual(member.group_id, 7654321);
     assert.strictEqual(member.uin, 13579);
     assert.strictEqual(member.role, "admin");
+    assert.strictEqual(member.roleNum, 3);
     assert.strictEqual(member.title, "Doctor");
+
+    // QQNT 3.2.32-52194 MemberRole mapping: 4 -> owner, 3 -> admin, 2 -> member (ordinary member), 0 -> member
+    const ownerMember = normalizeGroupMember({ uid: "u_m4", uin: "10004", role: 4 }, 7654321);
+    assert.strictEqual(ownerMember.role, "owner");
+    assert.strictEqual(ownerMember.roleNum, 4);
+    assert.strictEqual(normalizeGroupMember({ uid: "u_m4s", uin: "10014", role: "4" }, 7654321).role, "owner");
+    assert.strictEqual(normalizeGroupMember({ uid: "u_m3s", uin: "10013", role: "3" }, 7654321).role, "admin");
+
+    const ordinaryMember = normalizeGroupMember({ uid: "u_m2", uin: "10002", role: 2 }, 7654321);
+    assert.strictEqual(ordinaryMember.role, "member");
+    assert.strictEqual(ordinaryMember.roleNum, 2);
+    assert.strictEqual(normalizeGroupMember({ uid: "u_m2s", uin: "10012", role: "2" }, 7654321).role, "member");
+
+    const zeroRoleMember = normalizeGroupMember({ uid: "u_m0", uin: "10000", role: 0 }, 7654321);
+    assert.strictEqual(zeroRoleMember.role, "member");
+    assert.strictEqual(zeroRoleMember.roleNum, 0);
+    assert.strictEqual(normalizeGroupMember({ uid: "u_m0s", uin: "10010", role: "0" }, 7654321).role, "member");
+
+    const strOwner = normalizeGroupMember({ uid: "u_so", uin: "20004", role: "owner" }, 7654321);
+    assert.strictEqual(strOwner.role, "owner");
+    assert.strictEqual(strOwner.roleNum, 4);
+    const strAdmin = normalizeGroupMember({ uid: "u_sa", uin: "20003", role: "admin" }, 7654321);
+    assert.strictEqual(strAdmin.role, "admin");
+    assert.strictEqual(strAdmin.roleNum, 3);
+    const strMember = normalizeGroupMember({ uid: "u_sm", uin: "20002", role: "member" }, 7654321);
+    assert.strictEqual(strMember.role, "member");
+    assert.strictEqual(strMember.roleNum, 2);
+
+    if (typeof ntNormalizerMod.mapGroupRole === "function") {
+      assert.strictEqual(ntNormalizerMod.mapGroupRole(4), "owner");
+      assert.strictEqual(ntNormalizerMod.mapGroupRole(3), "admin");
+      assert.strictEqual(ntNormalizerMod.mapGroupRole(2), "member");
+      assert.strictEqual(ntNormalizerMod.mapGroupRole(0), "member");
+      assert.strictEqual(ntNormalizerMod.mapGroupRole("owner"), "owner");
+      assert.strictEqual(ntNormalizerMod.mapGroupRole("admin"), "admin");
+    }
 
     assert.deepStrictEqual(
       normalizeLoginIdentity({ uin: "0", selfInfo: { uin: "10001", uid: "u_self", nickName: "Bot" } }),
@@ -366,7 +412,7 @@ async function runTests() {
     assert.strictEqual(await pendingPromise, null);
     assert.strictEqual(correlator.waiters.size, 0);
 
-    // HumanSessionController causal steps & deduplication
+    // HumanSessionController causal steps & deduplication (QQNT 3.2.32-52194 contracts)
     const ntCalls = [];
     const controller = new HumanSessionController({
       getConfig: () => ({
@@ -377,12 +423,13 @@ async function runTests() {
         aioIdleExitMs: 0,
         focusIdleBlurMs: 0,
       }),
-      invokeNt: async (cmd, payload) => {
-        ntCalls.push({ cmd, payload });
+      invokeNt: async (cmd, payload, positionalArgs) => {
+        ntCalls.push({ cmd, payload, positionalArgs });
         return { result: 0 };
       },
     });
 
+    const peer1 = { chatType: 1, peerUid: "u_peer_1", guildId: "" };
     const firstAct = await controller.simulate({
       chatType: 1,
       peerUid: "u_peer_1",
@@ -393,6 +440,33 @@ async function runTests() {
     assert.strictEqual(firstAct.sendTyping, true);
     assert.strictEqual(controller.activeAioPeerKey, "1:u_peer_1:");
     assert.strictEqual(controller.windowFocused, true);
+    assert.strictEqual(
+      ntCalls.some((c) => c.cmd.includes("addActiveChatByUid")),
+      false,
+      "addActiveChatByUid must never be called in QQNT 3.2.32 causal steps"
+    );
+    assert.deepStrictEqual(ntCalls, [
+      {
+        cmd: "nodeIKernelMsgService/setFocusOnBase",
+        payload: { peer: peer1, ...peer1 },
+        positionalArgs: [peer1],
+      },
+      {
+        cmd: "nodeIKernelMsgService/enterOrExitAio",
+        payload: { info_list: [{ peer: peer1, option: 1 }] },
+        positionalArgs: [[{ peer: peer1, option: 1 }]],
+      },
+      {
+        cmd: "nodeIKernelMsgService/setMsgRead",
+        payload: { peer: peer1 },
+        positionalArgs: [peer1],
+      },
+      {
+        cmd: "nodeIKernelMsgService/sendShowInputStatusReq",
+        payload: { chatType: 1, eventType: 1, peerUid: "u_peer_1" },
+        positionalArgs: [1, 1, "u_peer_1"],
+      },
+    ]);
 
     // Immediate second call within dedupeWindowMs skips duplicate read & typing IPCs
     const secondAct = await controller.simulate({
@@ -404,14 +478,104 @@ async function runTests() {
     assert.strictEqual(secondAct.alreadyInAio, true);
     assert.strictEqual(secondAct.markRead, false);
     assert.strictEqual(secondAct.sendTyping, false);
+    assert.strictEqual(ntCalls.length, 4);
 
+    const blurPeer = { chatType: 0, peerUid: "", guildId: "" };
     const leaveRes = await controller.leave({ exitAio: true, blurWindow: true });
     assert.strictEqual(leaveRes.exitedAio, true);
     assert.strictEqual(leaveRes.blurredWindow, true);
     assert.strictEqual(controller.activeAioPeerKey, "");
     assert.strictEqual(controller.windowFocused, false);
-    assert.ok(typeof runCausalActivateSteps === "function");
-    assert.ok(typeof runCausalLeaveSteps === "function");
+    assert.deepStrictEqual(ntCalls.slice(4), [
+      {
+        cmd: "nodeIKernelMsgService/enterOrExitAio",
+        payload: { info_list: [{ peer: peer1, option: 2 }] },
+        positionalArgs: [[{ peer: peer1, option: 2 }]],
+      },
+      {
+        cmd: "nodeIKernelMsgService/setFocusOnBase",
+        payload: { peer: blurPeer, ...blurPeer },
+        positionalArgs: [blurPeer],
+      },
+    ]);
+
+    // Direct standalone step runners: AIO switch (exit option=2 -> enter option=1) + typing + leave
+    const directCalls = [];
+    const recordDirect = async (cmd, payload, positionalArgs) => {
+      directCalls.push({ cmd, payload, positionalArgs });
+      return { result: 0 };
+    };
+    const nextPeer = { chatType: 1, peerUid: "u_peer_2", guildId: "" };
+    const actStepRes = await runCausalActivateSteps({
+      peer: nextPeer,
+      peerKey: "1:u_peer_2:",
+      prevPeer: peer1,
+      prevPeerKey: "1:u_peer_1:",
+      windowFocused: false,
+      shouldMarkRead: true,
+      shouldSendTyping: true,
+      effEventType: 2,
+      readToTypingDelayMs: 0,
+      invokeNt: recordDirect,
+    });
+    assert.strictEqual(actStepRes.exitedPreviousAio, true);
+    assert.strictEqual(actStepRes.setFocusOnBase, true);
+    assert.strictEqual(actStepRes.markRead, true);
+    assert.strictEqual(actStepRes.sendTyping, true);
+    assert.deepStrictEqual(directCalls, [
+      {
+        cmd: "nodeIKernelMsgService/setFocusOnBase",
+        payload: { peer: nextPeer, ...nextPeer },
+        positionalArgs: [nextPeer],
+      },
+      {
+        cmd: "nodeIKernelMsgService/enterOrExitAio",
+        payload: { info_list: [{ peer: peer1, option: 2 }] },
+        positionalArgs: [[{ peer: peer1, option: 2 }]],
+      },
+      {
+        cmd: "nodeIKernelMsgService/enterOrExitAio",
+        payload: { info_list: [{ peer: nextPeer, option: 1 }] },
+        positionalArgs: [[{ peer: nextPeer, option: 1 }]],
+      },
+      {
+        cmd: "nodeIKernelMsgService/setMsgRead",
+        payload: { peer: nextPeer },
+        positionalArgs: [nextPeer],
+      },
+      {
+        cmd: "nodeIKernelMsgService/sendShowInputStatusReq",
+        payload: { chatType: 1, eventType: 2, peerUid: "u_peer_2" },
+        positionalArgs: [1, 2, "u_peer_2"],
+      },
+    ]);
+
+    directCalls.length = 0;
+    const leaveStepRes = await runCausalLeaveSteps({
+      shouldExitAio: true,
+      shouldBlur: true,
+      prevPeer: nextPeer,
+      invokeNt: recordDirect,
+    });
+    assert.strictEqual(leaveStepRes.exitedAio, true);
+    assert.strictEqual(leaveStepRes.blurredWindow, true);
+    assert.strictEqual(
+      directCalls.some((c) => c.cmd.includes("addActiveChatByUid")),
+      false
+    );
+    assert.deepStrictEqual(directCalls, [
+      {
+        cmd: "nodeIKernelMsgService/enterOrExitAio",
+        payload: { info_list: [{ peer: nextPeer, option: 2 }] },
+        positionalArgs: [[{ peer: nextPeer, option: 2 }]],
+      },
+      {
+        cmd: "nodeIKernelMsgService/setFocusOnBase",
+        payload: { peer: blurPeer, ...blurPeer },
+        positionalArgs: [blurPeer],
+      },
+    ]);
+
     controller.reset();
     console.log("  [PASS] Suite 4: EchoCorrelator & HumanSessionController lifecycle");
   }
@@ -743,7 +907,161 @@ async function runTests() {
     console.log("  [PASS] Suite 7: Pure-JS cross-platform plugin loader & desktop QQ media cache LFI");
   }
 
-  console.log("=== All 7 Core Architecture Module Suites Passed ===");
+  // --------------------------------------------------------------------------
+  // Suite 8: Renderer IPC Service Map & Side-Effect Non-Replay Contracts (`src/core/renderer_ipc.js`)
+  // --------------------------------------------------------------------------
+  {
+    assert.strictEqual(SERVICE_GETTER_MAP.nodeIKernelNodeMiscService, "getNodeMiscService");
+    assert.strictEqual(SERVICE_GETTER_MAP.nodeIKernelMiscService, "getNodeMiscService");
+    assert.strictEqual(SERVICE_GETTER_MAP.nodeIKernelMsgService, "getMsgService");
+    assert.strictEqual(SERVICE_GETTER_MAP.nodeIKernelGroupService, "getGroupService");
+    assert.strictEqual(SERVICE_GETTER_MAP.nodeIKernelRichMediaService, "getRichMediaService");
+
+    const expectedMutationMethods = [
+      "sendMsg",
+      "recallMsg",
+      "sendShowInputStatusReq",
+      "kickMember",
+      "setMemberShutUp",
+      "setGroupShutUp",
+      "quitGroup",
+      "delBuddy",
+      "approvalFriendRequest",
+      "approvalDoubtBuddyReq",
+      "delDoubtBuddyReq",
+      "operateSysNotify",
+      "createGroupFolder",
+      "deleteGroupFile",
+      "deleteGroupFolder",
+      "moveGroupFile",
+      "renameGroupFile",
+      "renameGroupFolder",
+      "transGroupFile",
+      "modifyGroupName",
+      "modifyGroupRemark",
+      "modifyGroupExtInfo",
+      "modifyMemberRole",
+      "modifyMemberCardName",
+      "setStatus",
+    ];
+    for (const method of expectedMutationMethods) {
+      assert.strictEqual(
+        SIDE_EFFECT_NT_METHODS.has(method),
+        true,
+        `Expected SIDE_EFFECT_NT_METHODS to contain ${method}`
+      );
+      assert.strictEqual(isSideEffectNtCmd(`nodeIKernelGroupService/${method}`), true);
+    }
+
+    for (const staleOrReadMethod of [
+      "banMember",
+      "setOnlineStatus",
+      "modifyMemberSpecialTitle",
+      "setIdentityTitleInfo",
+      "getMsgsIncludeSelf",
+      "getGroupFileList",
+      "wantWinScreenOCR",
+    ]) {
+      assert.strictEqual(
+        SIDE_EFFECT_NT_METHODS.has(staleOrReadMethod),
+        false,
+        `Did not expect SIDE_EFFECT_NT_METHODS to contain ${staleOrReadMethod}`
+      );
+      assert.strictEqual(isSideEffectNtCmd(`nodeIKernelMiscService/${staleOrReadMethod}`), false);
+    }
+
+    // Verify Tier 3 wrapperSession dispatch for nodeIKernelNodeMiscService & legacy alias + side-effect replay block
+    const tier3Calls = [];
+    const mockHost = Object.assign(
+      {
+        config: { quietLogs: true },
+        activeWebContents: null,
+        rendererExecute: null,
+        invokeStats: {
+          tier1: 0,
+          tier2: 0,
+          tier3: 0,
+          degraded: 0,
+          blockedReplays: 0,
+          failed: 0,
+        },
+        capturedServices: {
+          wrapperSession: {
+            getNodeMiscService: () => ({
+              wantWinScreenOCR: async (...args) => {
+                tier3Calls.push({ svc: "misc", method: "wantWinScreenOCR", args });
+                return { result: 0, texts: ["hello"] };
+              },
+            }),
+            getGroupService: () => ({
+              setMemberShutUp: async (...args) => {
+                tier3Calls.push({ svc: "group", method: "setMemberShutUp", args });
+                return { result: 0 };
+              },
+            }),
+          },
+        },
+      },
+      rendererIpcMixin
+    );
+
+    const ocrRes1 = await mockHost.invokeNt(
+      "nodeIKernelNodeMiscService/wantWinScreenOCR",
+      { url: "/tmp/ocr1.png" },
+      ["/tmp/ocr1.png"]
+    );
+    assert.deepStrictEqual(ocrRes1, { result: 0, texts: ["hello"] });
+
+    const ocrRes2 = await mockHost.invokeNt(
+      "nodeIKernelMiscService/wantWinScreenOCR",
+      { url: "/tmp/ocr2.png" },
+      ["/tmp/ocr2.png"]
+    );
+    assert.deepStrictEqual(ocrRes2, { result: 0, texts: ["hello"] });
+    assert.deepStrictEqual(tier3Calls, [
+      { svc: "misc", method: "wantWinScreenOCR", args: ["/tmp/ocr1.png"] },
+      { svc: "misc", method: "wantWinScreenOCR", args: ["/tmp/ocr2.png"] },
+    ]);
+
+    // Dispatched Tier 1 failure on a real mutation command must NOT replay onto Tier 3
+    mockHost.rendererExecute = async () => {
+      throw new Error("risk control timeout after dispatch");
+    };
+    await assert.rejects(
+      () =>
+        mockHost.invokeNt(
+          "nodeIKernelGroupService/setMemberShutUp",
+          { groupCode: "7654321", memList: [{ uid: "u_m2", timeStamp: 60 }] },
+          ["7654321", [{ uid: "u_m2", timeStamp: 60 }]]
+        ),
+      /risk control timeout after dispatch/
+    );
+    assert.strictEqual(mockHost.invokeStats.blockedReplays, 1);
+    assert.strictEqual(
+      tier3Calls.some((c) => c.method === "setMemberShutUp"),
+      false,
+      "Side-effect command must not replay on Tier 3 after dispatched Tier 1 error"
+    );
+
+    // Bridge-unavailable Tier 1 failure safely falls through to Tier 3 with exact positionalArgs
+    mockHost.rendererExecute = async () => {
+      throw makeBridgeUnavailableError("renderer gone before dispatch");
+    };
+    await mockHost.invokeNt(
+      "nodeIKernelGroupService/setMemberShutUp",
+      { groupCode: "7654321", memList: [{ uid: "u_m2", timeStamp: 60 }] },
+      ["7654321", [{ uid: "u_m2", timeStamp: 60 }]]
+    );
+    assert.deepStrictEqual(tier3Calls[tier3Calls.length - 1], {
+      svc: "group",
+      method: "setMemberShutUp",
+      args: ["7654321", [{ uid: "u_m2", timeStamp: 60 }]],
+    });
+
+    console.log("  [PASS] Suite 8: Renderer IPC service map & side-effect non-replay contracts");
+  }
+
+  console.log("=== All 8 Core Architecture Module Suites Passed ===");
 }
 
 runTests().catch((err) => {

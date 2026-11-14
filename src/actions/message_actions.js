@@ -342,7 +342,11 @@ async function getMessageHistory(bridge, p, context, isGroup) {
   const messages = [];
   for (const m of rawList) {
     try {
-      await bridge._hydrateNtMsgMedia(m);
+      await bridge._hydrateNtMsgMedia(m, {
+        skipRemoteDownload: true,
+        chatType: peer.chatType,
+        peerUid: peer.peerUid,
+      });
       const ev = formatNtMsgToOneBotEvent(m, {
         selfId: bridge.selfUin,
         uinUidStore: bridge.uinUidStore,
@@ -367,7 +371,7 @@ const ACTION_HANDLERS = {
   async get_login_info() {
     if (!this.selfUin || !this.selfUid || !this.selfNickname || this.selfNickname === "QQBot") {
       try {
-        const loginRes = await this.invokeNt("nodeIKernelLoginService/getLoginList", {});
+        const loginRes = await this.invokeNt("nodeIKernelLoginService/getLoginList", {}, []);
         const list = Array.isArray(loginRes?.LocalLoginInfoList)
           ? loginRes.LocalLoginInfoList
           : [];
@@ -428,7 +432,7 @@ const ACTION_HANDLERS = {
   async get_login_qrcode(p) {
     if (Boolean(p.refresh) || !this.lastQrCodeBase64) {
       try {
-        const qrRes = await this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {});
+        const qrRes = await this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {}, []);
         const directQr =
           qrRes?.pngBase64QrcodeData ||
           qrRes?.qrcodeImage ||
@@ -612,39 +616,98 @@ const ACTION_HANDLERS = {
 
   // ---- 3. Forward Messages & History ----
   async get_forward_msg(p) {
-    const resId = String(p.id || p.message_id || p.res_id || "");
-    if (!resId) throw new Error("id is required");
-    const entry = resolveMessageEntry(this, resId);
-    const peer = entry?.peer || { chatType: 2, peerUid: String(p.group_id || "0"), guildId: "" };
-    const rootMsgId = entry?.msgId || entry?.ntMsgId || resId;
+    const resId = String(p.id || p.res_id || p.forward_id || p.message_id || "").trim();
+    const explicitMsgId =
+      p.message_id !== undefined && p.message_id !== null ? String(p.message_id).trim() : "";
+    if (!resId && !explicitMsgId) throw new Error("id is required");
+
+    const fwdHit =
+      (resId && typeof this.messageIdStore?.lookupForward === "function"
+        ? this.messageIdStore.lookupForward(resId)
+        : null) ||
+      (explicitMsgId && typeof this.messageIdStore?.lookupForward === "function"
+        ? this.messageIdStore.lookupForward(explicitMsgId)
+        : null);
+    const entry =
+      resolveMessageEntry(this, resId) ||
+      (explicitMsgId ? resolveMessageEntry(this, explicitMsgId) : null) ||
+      (fwdHit?.shortId ? resolveMessageEntry(this, fwdHit.shortId) : null);
+
+    let peer =
+      (fwdHit?.peer && fwdHit.peer.peerUid ? fwdHit.peer : null) ||
+      (entry?.forwardPeer && entry.forwardPeer.peerUid ? entry.forwardPeer : null) ||
+      (entry?.peer && entry.peer.peerUid ? entry.peer : null);
+    if (!peer) {
+      if (p.group_id) {
+        peer = { chatType: 2, peerUid: String(p.group_id), guildId: "" };
+      } else if (p.user_id && typeof this._resolvePeerForUser === "function") {
+        peer = await this._resolvePeerForUser(p.user_id, p.group_id);
+      } else {
+        peer = { chatType: 2, peerUid: "0", guildId: "" };
+      }
+    }
+    const parentMsgId = String(
+      fwdHit?.parentMsgId || entry?.msgId || entry?.ntMsgId || explicitMsgId || resId
+    );
+    const rootMsgId = String(fwdHit?.rootMsgId || entry?.rootMsgId || parentMsgId);
     const res = await this.invokeNt(
       "nodeIKernelMsgService/getMultiMsg",
       {
         peer,
-        rootMsgId: String(rootMsgId),
-        parentMsgId: String(rootMsgId),
+        rootMsgId,
+        parentMsgId,
       },
-      [peer, String(rootMsgId), String(rootMsgId)]
+      [peer, rootMsgId, parentMsgId]
     );
     const msgList = Array.isArray(res?.msgList) ? res.msgList : [];
+    const totalHydrationBudgetMs = Math.max(
+      200,
+      Number(this.config?.forwardMediaHydrationBudgetMs ?? 3500) || 3500
+    );
+    const hydrationDeadlineMs = Date.now() + totalHydrationBudgetMs;
+    const perNodeAttemptMs = Math.min(1200, totalHydrationBudgetMs);
     const messages = [];
     for (const m of msgList) {
       try {
-        await this._hydrateNtMsgMedia(m);
+        await this._hydrateNtMsgMedia(m, {
+          downSourceType: 1,
+          timeoutMs: perNodeAttemptMs,
+          deadlineMs: hydrationDeadlineMs,
+          skipRemoteDownload: Date.now() >= hydrationDeadlineMs,
+          chatType: peer.chatType,
+          peerUid: peer.peerUid,
+        });
+        const nodeSenderUid = String(m.senderUid || m.senderUidStr || "").trim();
+        let uin = bridgeOneBot.pickPositiveUin(
+          m.senderUin,
+          nodeSenderUid ? this.uinUidStore?.getUinSync?.(nodeSenderUid) : 0
+        );
+        if (!uin && nodeSenderUid && typeof this._ensureUinForUid === "function") {
+          uin = bridgeOneBot.pickPositiveUin(await this._ensureUinForUid(nodeSenderUid));
+        }
+        const shortId = this.messageIdStore.register(
+          m.msgId,
+          {
+            chatType: Number(m.chatType || peer.chatType || 2),
+            peerUid: String(
+              m.peerUid && String(m.peerUid) !== "0" ? m.peerUid : peer.peerUid
+            ),
+            guildId: String(m.guildId || peer.guildId || ""),
+          },
+          m.msgSeq,
+          {
+            senderUin: uin,
+            senderUid: nodeSenderUid,
+            rawMsg: m,
+            rootMsgId,
+            forwardPeer: peer,
+          }
+        );
         const { segments, raw_message } = ntMsgToOneBotSegments(m, {
           uinUidStore: this.uinUidStore,
           messageIdStore: this.messageIdStore,
         });
-        const uin = Number(
-          m.senderUin || this.uinUidStore.getUinSync(m.senderUid) || 0
-        );
         const nickname = String(m.sendMemberName || m.sendNickName || uin || "群友");
-        const shortId = this.messageIdStore.register(
-          m.msgId,
-          { chatType: m.chatType || peer.chatType, peerUid: m.peerUid || peer.peerUid },
-          m.msgSeq,
-          { senderUin: uin, senderUid: m.senderUid, rawMsg: m }
-        );
         messages.push({
           type: "node",
           data: {
@@ -797,7 +860,7 @@ const ACTION_HANDLERS = {
       });
     } else if (action === "mark_all_as_read" || action === "_mark_all_as_read") {
       try {
-        await this.invokeNt("nodeIKernelMsgService/setAllC2CAndGroupMsgRead", {});
+        await this.invokeNt("nodeIKernelMsgService/setAllC2CAndGroupMsgRead", {}, []);
       } catch (_) {}
     }
     return {};
@@ -852,15 +915,20 @@ const ACTION_HANDLERS = {
     const msgSeq = String(entry?.msgSeq || p.msg_seq || "0");
     const emojiId = String(p.emoji_id || "");
     const emojiType = String(p.emoji_type || (Number(emojiId) > 999 ? "2" : "1"));
-    const res = await this.invokeNt("nodeIKernelMsgService/getMsgEmojiLikesList", {
-      peer,
-      msgSeq,
-      emojiId,
-      emojiType,
-      cookie: "",
-      isForward: false,
-      count: Number(p.count || 20),
-    });
+    const count = Number(p.count || 20);
+    const res = await this.invokeNt(
+      "nodeIKernelMsgService/getMsgEmojiLikesList",
+      {
+        peer,
+        msgSeq,
+        emojiId,
+        emojiType,
+        cookie: "",
+        isForward: false,
+        count,
+      },
+      [peer, msgSeq, emojiId, emojiType, "", false, count]
+    );
     return {
       emoji_like_list: res?.emojiLikesList || [],
     };
@@ -872,14 +940,17 @@ const ACTION_HANDLERS = {
       this.invokeNt.bind(this)
     );
     const count = Math.max(1, Math.min(Number(p.times || 1), 20));
-    await this.invokeNt("nodeIKernelProfileLikeService/setBuddyProfileLike", {
-      doLikeUserInfo: {
-        friendUid: targetUid,
-        sourceId: 71,
-        doLikeCount: count,
-        doLikeTollCount: 0,
-      },
-    });
+    const doLikeUserInfo = {
+      friendUid: targetUid,
+      sourceId: 71,
+      doLikeCount: count,
+      doLikeTollCount: 0,
+    };
+    await this.invokeNt(
+      "nodeIKernelProfileLikeService/setBuddyProfileLike",
+      { doLikeUserInfo },
+      [doLikeUserInfo]
+    );
     return {};
   },
 
@@ -887,18 +958,21 @@ const ACTION_HANDLERS = {
     const targetUid = p.user_id
       ? await this.uinUidStore.resolveUid(p.user_id, this.invokeNt.bind(this))
       : this.selfUid;
-    const res = await this.invokeNt("nodeIKernelProfileLikeService/getBuddyProfileLike", {
-      req: {
-        friendUids: [targetUid || ""],
-        basic: 1,
-        vote: 1,
-        favorite: 0,
-        userProfile: 1,
-        type: 2,
-        start: Number(p.start || 0),
-        limit: Number(p.count || 10),
-      },
-    });
+    const req = {
+      friendUids: [targetUid || ""],
+      basic: 1,
+      vote: 1,
+      favorite: 0,
+      userProfile: 1,
+      type: 2,
+      start: Number(p.start || 0),
+      limit: Number(p.count || 10),
+    };
+    const res = await this.invokeNt(
+      "nodeIKernelProfileLikeService/getBuddyProfileLike",
+      { req },
+      [req]
+    );
     const info = res?.info?.userLikeInfos?.[0] || {};
     return {
       uid: String(targetUid || ""),
