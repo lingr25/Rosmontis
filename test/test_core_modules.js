@@ -55,6 +55,7 @@ const cqCodecMod = require("../src/onebot/cq_codec");
 const segmentConverterMod = require("../src/onebot/segment_converter");
 const eventFormatterMod = require("../src/onebot/event_formatter");
 const bridgeOnebotFacade = require("../src/bridge_onebot");
+const audioCodecMod = require("../src/core/audio_codec");
 
 const messageActions = require("../src/actions/message_actions");
 const contactActions = require("../src/actions/contact_actions");
@@ -458,7 +459,291 @@ async function runTests() {
     );
   }
 
-  console.log("=== All 5 Core Architecture Module Suites Passed ===");
+  // --------------------------------------------------------------------------
+  // Suite 6: Pure-JS Audio Codec (SILK v3 / AMR-NB / WAV) & Normalization
+  // --------------------------------------------------------------------------
+  {
+    const os = require("os");
+    const crypto = require("crypto");
+    const tmpAudioDir = fs.mkdtempSync(path.join(os.tmpdir(), "rosmontis_audio_codec_"));
+
+    try {
+      // 6a. Build 250 frames (5.0s) of Tencent SILK v3 (\x02#!SILK_V3 + 2-byte LE blocks + 0xFFFF EOF)
+      const silkFrameChunks = [audioCodecMod.TENCENT_SILK_MAGIC];
+      for (let i = 0; i < 250; i++) {
+        const payloadLen = 12 + (i % 20);
+        const hdr = Buffer.alloc(2);
+        hdr.writeInt16LE(payloadLen, 0);
+        const payload = Buffer.alloc(payloadLen);
+        for (let j = 0; j < payloadLen; j++) {
+          payload[j] = (i * 17 + j * 31) & 0xff;
+        }
+        silkFrameChunks.push(hdr, payload);
+      }
+      const eofFooter = Buffer.alloc(2);
+      eofFooter.writeInt16LE(-1, 0);
+      silkFrameChunks.push(eofFooter);
+      const tencentSilkBuf = Buffer.concat(silkFrameChunks);
+
+      const silkInfo = audioCodecMod.inspectAudioBuffer(tencentSilkBuf);
+      assert.strictEqual(silkInfo.format, "silk_tencent");
+      assert.strictEqual(silkInfo.isNtNativeVoice, true);
+      assert.strictEqual(silkInfo.frameCount, 250);
+      assert.strictEqual(silkInfo.duration, 5);
+      assert.ok(
+        Array.isArray(silkInfo.waveAmplitudes) &&
+          silkInfo.waveAmplitudes.length >= 8 &&
+          silkInfo.waveAmplitudes.every((v) => Number.isInteger(v) && v >= 12 && v <= 95)
+      );
+
+      // 6b. Raw SILK v3 (#!SILK_V3 without leading 0x02, 200 frames = 4.0s) -> pure-JS 0x02 normalization
+      const rawSilkBody = tencentSilkBuf.subarray(1, 1 + 9); // "#!SILK_V3"
+      const rawFrames = [];
+      for (let i = 0; i < 200; i++) {
+        const hdr = Buffer.alloc(2);
+        hdr.writeInt16LE(16, 0);
+        rawFrames.push(hdr, Buffer.alloc(16, (i * 13) & 0xff));
+      }
+      const rawSilkBuf = Buffer.concat([rawSilkBody, ...rawFrames, eofFooter]);
+      const rawSilkPath = path.join(tmpAudioDir, "raw_voice.silk");
+      fs.writeFileSync(rawSilkPath, rawSilkBuf);
+      const rawSilkMd5 = crypto.createHash("md5").update(rawSilkBuf).digest("hex");
+
+      const normalizedSilk = await audioCodecMod.prepareVoiceMedia(
+        {
+          localPath: rawSilkPath,
+          fileName: "raw_voice.silk",
+          fileSize: rawSilkBuf.length,
+          md5HexStr: rawSilkMd5,
+        },
+        { tempDir: tmpAudioDir }
+      );
+      assert.strictEqual(normalizedSilk.format, "silk_tencent");
+      assert.strictEqual(normalizedSilk.duration, 4);
+      assert.strictEqual(normalizedSilk.fileSize, rawSilkBuf.length + 1);
+      assert.ok(normalizedSilk.extraTempMedia && normalizedSilk.extraTempMedia.isTempFile);
+      const normalizedBytes = fs.readFileSync(normalizedSilk.localPath);
+      assert.strictEqual(normalizedBytes[0], 0x02);
+      assert.strictEqual(
+        normalizedSilk.md5HexStr,
+        crypto.createHash("md5").update(normalizedBytes).digest("hex")
+      );
+
+      // 6c. AMR-NB (#!AMR\n + 150 mode-7 32-byte frames = 3.0s)
+      const amrFrames = [audioCodecMod.AMR_NB_MAGIC];
+      for (let i = 0; i < 150; i++) {
+        const frame = Buffer.alloc(32);
+        frame[0] = (7 << 3) | 0x04; // Mode 7 (12.2 kbps -> 32 bytes), Q=1
+        for (let j = 1; j < 32; j++) {
+          frame[j] = (i * 29 + j * 7) & 0xff;
+        }
+        amrFrames.push(frame);
+      }
+      const amrBuf = Buffer.concat(amrFrames);
+      const amrInfo = audioCodecMod.inspectAudioBuffer(amrBuf);
+      assert.strictEqual(amrInfo.format, "amr_nb");
+      assert.strictEqual(amrInfo.isNtNativeVoice, true);
+      assert.strictEqual(amrInfo.frameCount, 150);
+      assert.strictEqual(amrInfo.duration, 3);
+
+      // 6d. 16-bit PCM WAV (8000 Hz mono, 2.0s = 16000 samples) + clear error when ffmpeg binary is missing
+      const sampleRate = 8000;
+      const numSamples = sampleRate * 2;
+      const pcmBytes = numSamples * 2;
+      const wavBuf = Buffer.alloc(44 + pcmBytes);
+      wavBuf.write("RIFF", 0, "ascii");
+      wavBuf.writeUInt32LE(36 + pcmBytes, 4);
+      wavBuf.write("WAVE", 8, "ascii");
+      wavBuf.write("fmt ", 12, "ascii");
+      wavBuf.writeUInt32LE(16, 16);
+      wavBuf.writeUInt16LE(1, 20); // PCM
+      wavBuf.writeUInt16LE(1, 22); // mono
+      wavBuf.writeUInt32LE(sampleRate, 24);
+      wavBuf.writeUInt32LE(sampleRate * 2, 28);
+      wavBuf.writeUInt16LE(2, 32);
+      wavBuf.writeUInt16LE(16, 34);
+      wavBuf.write("data", 36, "ascii");
+      wavBuf.writeUInt32LE(pcmBytes, 40);
+      for (let i = 0; i < numSamples; i++) {
+        const sample = Math.round(Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 12000);
+        wavBuf.writeInt16LE(sample, 44 + i * 2);
+      }
+      const wavInfo = audioCodecMod.inspectAudioBuffer(wavBuf);
+      assert.strictEqual(wavInfo.format, "wav");
+      assert.strictEqual(wavInfo.isNtNativeVoice, false);
+      assert.strictEqual(wavInfo.sampleRate, 8000);
+      assert.strictEqual(wavInfo.duration, 2);
+
+      const wavPath = path.join(tmpAudioDir, "tone.wav");
+      fs.writeFileSync(wavPath, wavBuf);
+      await assert.rejects(
+        () =>
+          audioCodecMod.prepareVoiceMedia(
+            {
+              localPath: wavPath,
+              fileName: "tone.wav",
+              fileSize: wavBuf.length,
+              md5HexStr: crypto.createHash("md5").update(wavBuf).digest("hex"),
+            },
+            {
+              tempDir: tmpAudioDir,
+              ffmpegPath: path.join(tmpAudioDir, "nonexistent_ffmpeg_bin"),
+            }
+          ),
+        (err) => err && err.code === "ERR_VOICE_TRANSCODE_FAILED" && /WAV/.test(err.message)
+      );
+    } finally {
+      fs.rmSync(tmpAudioDir, { recursive: true, force: true });
+    }
+    console.log("  [PASS] Suite 6: Pure-JS SILK/AMR/WAV audio inspector & voice normalizer");
+  }
+
+  // --------------------------------------------------------------------------
+  // Suite 7: Pure-JS cross-platform plugin loader & desktop QQ media cache LFI
+  // --------------------------------------------------------------------------
+  {
+    const tmpPluginRoot = fs.mkdtempSync(path.join(require("os").tmpdir(), "rosmontis_plugin_test_"));
+    const prevTestMode = process.env.ROSMONTIS_TEST_MODE;
+    const prevDisable = process.env.ROSMONTIS_DISABLE;
+    const prevCfgDir = process.env.ROSMONTIS_CONFIG_DIR;
+    const prevHome = process.env.HOME;
+    try {
+      process.env.ROSMONTIS_TEST_MODE = "1";
+      delete process.env.ROSMONTIS_DISABLE;
+      delete process.env.ROSMONTIS_CONFIG_DIR;
+
+      const repoRoot = path.resolve(__dirname, "..");
+      const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "manifest.json"), "utf8"));
+      const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+      assert.strictEqual(manifest.manifest_version, 4);
+      assert.strictEqual(manifest.injects.main, "./src/plugin_loader.js");
+      assert.strictEqual(pkg.qwqnt.injects.main, "./src/plugin_loader.js");
+
+      const pluginLoader = require("../src/plugin_loader");
+      assert.strictEqual(
+        pluginLoader.getBridgeInstance(),
+        null,
+        "plugin_loader must not auto-boot when ROSMONTIS_TEST_MODE=1"
+      );
+
+      const llDataDir = path.join(tmpPluginRoot, "liteloader_data");
+      const qwqSaveRoot = path.join(tmpPluginRoot, "qwqnt_save");
+      const qwqPluginDir = path.join(qwqSaveRoot, "rosmontis");
+      const explicitDir = path.join(tmpPluginRoot, "explicit_cfg");
+      fs.mkdirSync(llDataDir, { recursive: true });
+      fs.mkdirSync(qwqPluginDir, { recursive: true });
+      fs.mkdirSync(explicitDir, { recursive: true });
+
+      assert.strictEqual(
+        pluginLoader.resolvePluginConfigDir({
+          qwqnt: { core: { configs: { core: { save: qwqSaveRoot } } } },
+        }),
+        qwqPluginDir
+      );
+      assert.strictEqual(
+        pluginLoader.resolvePluginConfigDir({
+          liteLoader: { plugins: { rosmontis: { path: { data: llDataDir } } } },
+          qwqnt: { core: { configs: { core: { save: qwqSaveRoot } } } },
+        }),
+        llDataDir
+      );
+      process.env.ROSMONTIS_CONFIG_DIR = explicitDir;
+      assert.strictEqual(pluginLoader.resolvePluginConfigDir({}), explicitDir);
+      delete process.env.ROSMONTIS_CONFIG_DIR;
+
+      process.env.ROSMONTIS_DISABLE = "1";
+      assert.strictEqual(pluginLoader.bootPluginBridge({ forceNew: true }), null);
+      delete process.env.ROSMONTIS_DISABLE;
+
+      const bootLogPath = path.join(tmpPluginRoot, "boot.log");
+      fs.writeFileSync(
+        path.join(explicitDir, "rosmontis.json"),
+        JSON.stringify({ selfUin: "10001", networks: { httpServers: [], wsServers: [] } })
+      );
+      const bridge = pluginLoader.bootPluginBridge({
+        forceNew: true,
+        configDir: explicitDir,
+        autoStartServers: false,
+        bootLogPath,
+      });
+      assert.ok(bridge && bridge.selfUin === "10001");
+      assert.ok(fs.existsSync(bootLogPath));
+      assert.match(fs.readFileSync(bootLogPath, "utf8"), /installMainBridge ok/);
+
+      let attachedWc = null;
+      const origAttach = bridge._attachToWebContents;
+      bridge._attachToWebContents = (wc) => {
+        attachedWc = wc;
+      };
+      const fakeWc = { id: 42 };
+      pluginLoader.onBrowserWindowCreated({ webContents: fakeWc });
+      assert.strictEqual(attachedWc, fakeWc);
+      bridge._attachToWebContents = origAttach;
+      bridge.releaseMapPrototypeHook("test_cleanup");
+
+      // Desktop Windows QQ "Documents/Tencent Files/<uin>/nt_qq/nt_data/Pic/..." cache whitelist vs nt_db block
+      const fakeHome = path.join(tmpPluginRoot, "win_home");
+      const winPicDir = path.join(
+        fakeHome,
+        "Documents",
+        "Tencent Files",
+        "10001",
+        "nt_qq",
+        "nt_data",
+        "Pic",
+        "2026-11",
+        "Ori"
+      );
+      const winDbDir = path.join(
+        fakeHome,
+        "Documents",
+        "Tencent Files",
+        "10001",
+        "nt_qq",
+        "nt_db"
+      );
+      fs.mkdirSync(winPicDir, { recursive: true });
+      fs.mkdirSync(winDbDir, { recursive: true });
+
+      const pngBytes = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        "base64"
+      );
+      const allowedPicFile = path.join(winPicDir, "cached.png");
+      const blockedSecretFile = path.join(winDbDir, "nt_msg.raw");
+      fs.writeFileSync(allowedPicFile, pngBytes);
+      fs.writeFileSync(blockedSecretFile, pngBytes);
+
+      process.env.HOME = fakeHome;
+      const { resolveMediaSource } = require("../src/core/media_security");
+      const resolvedPic = await resolveMediaSource(allowedPicFile, {
+        tempDir: path.join(tmpPluginRoot, "media_tmp"),
+      });
+      assert.strictEqual(resolvedPic.width, 1);
+      assert.strictEqual(resolvedPic.height, 1);
+
+      await assert.rejects(
+        () =>
+          resolveMediaSource(blockedSecretFile, {
+            tempDir: path.join(tmpPluginRoot, "media_tmp"),
+          }),
+        (err) => err && err.code === "ERR_LFI_BLOCKED"
+      );
+    } finally {
+      if (prevTestMode === undefined) delete process.env.ROSMONTIS_TEST_MODE;
+      else process.env.ROSMONTIS_TEST_MODE = prevTestMode;
+      if (prevDisable === undefined) delete process.env.ROSMONTIS_DISABLE;
+      else process.env.ROSMONTIS_DISABLE = prevDisable;
+      if (prevCfgDir === undefined) delete process.env.ROSMONTIS_CONFIG_DIR;
+      else process.env.ROSMONTIS_CONFIG_DIR = prevCfgDir;
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      fs.rmSync(tmpPluginRoot, { recursive: true, force: true });
+    }
+    console.log("  [PASS] Suite 7: Pure-JS cross-platform plugin loader & desktop QQ media cache LFI");
+  }
+
+  console.log("=== All 7 Core Architecture Module Suites Passed ===");
 }
 
 runTests().catch((err) => {
