@@ -15,6 +15,7 @@
 ## 目录结构与测试入口
 
 - `src/app_launcher_index.js`：Linux QQ `app_launcher` 纯 JS 引导入口
+- `src/plugin_loader.js` & `manifest.json`：跨平台纯 JS 外部插件框架（LiteLoaderQQNT v4 / QwQNT / 自定义主进程引导）轻量接入入口（仓库不内置任何原生 `.dll` / `.exe` 注入器）
 - `src/bridge_main.js`：Electron 主进程精简协调器，组合核心子系统与 OneBot v11 动作分发路由
 - `src/bridge_renderer.js`：注入 `BrowserWindow` 渲染层的受信任 IPC 桥接与客户端会话状态机
 - `src/types.js` & `jsconfig.json`：零编译开销的 JSDoc 协议与内部运行时类型契约及 IDE 检查配置
@@ -23,7 +24,7 @@
   - `cq_codec.js`：CQ 码转义/反转义与 OneBot v11 消息段/字符串双向归一化编解码
   - `segment_converter.js`：NTQQ 内核 `elements` 与 OneBot v11 消息段双向转换及富媒体路径解析
   - `event_formatter.js`：NTQQ 消息、灰条通知、群文件上传、好友/加群请求与元事件格式化器
-- `src/core/`：零依赖核心子模块（17 个）：
+- `src/core/`：零依赖核心子模块（18 个）：
   - `env.js`：`ROSMONTIS_*` / `ONEBOT_*` / `XIAO_BRIDGE_*` 多前缀环境变量统一解析器
   - `primitives.js`：有界 LRU `BoundedMap`、TTL 去重集（`TtlDedupeSet`）、临时文件清理环（`TempCleanupQueue`）、一次性事件等待器、限流日志（`BridgeLogger`）、跨进程 `Map`/`void` 无损编解码与声明式动作路由器（`createActionRouter`）
   - `nt_normalizer.js`：NTQQ 多版本内核数据结构防腐层（Peer、群摘要、好友资料、群成员、登录身份与正整数 UIN 强校验）
@@ -38,6 +39,7 @@
   - `ws_rfc6455.js`：RFC 6455 WebSocket 编解码、掩码校验、负载上限与反向 WS 客户端
   - `transport_security.js`：恒定时间鉴权、`Origin` 校验、非回环地址受保护模式（Protected Mode）自动鉴权与 HTTP 请求体上限
   - `media_security.js`：媒体源 SSRF 防护、本地目录白名单校验与临时文件生命周期管理
+  - `audio_codec.js`：纯 JS 语音帧解析（SILK v3 / AMR / WAV 时长与波形提取、`\x02#!SILK_V3` 规范化）与可选 `ffmpeg` 语音编解码器
   - `config.js`：多路径 JSON 配置与环境变量加载器
   - `web_http.js`：受限腾讯域重定向校验的 HTTPS Cookie / HTTP 文本与 JSONP 工具
   - `qzone_actions.js`：默认关闭（`enableWebCredentialApi` 显式门控）的 Web 凭据提取与 QQ 空间（QZone）动作模块

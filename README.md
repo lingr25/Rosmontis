@@ -121,6 +121,15 @@ sudo bash scripts/install_bridge.sh --uninstall
 
 如果你已有挂载了 `/app/.config` 登录态卷的无头 QQ 容器，只需将仓库只读挂载至 `/opt/rosmontis` 并将容器 `entrypoint` 指向 `["bash", "/opt/rosmontis/scripts/entrypoint.sh"]`。入口脚本会自动清空 `LD_PRELOAD`、剥离旧原生注入器并复用现有登录态直接上线，详见 [`docs/architecture.md`](./docs/architecture.md)。
 
+### 方式四：桌面端插件框架接入（Windows / macOS / Linux 外部加载器）
+
+Rosmontis 仓库严格坚守 **100% 纯 JavaScript、0 原生二进制** 边界，不内置、不分发任何针对桌面客户端签名校验的 `.dll` / `.exe` 注入器或补丁。但核心渲染层 IPC 桥接与会话状态机天然跨平台兼容，仓库已提供标准纯 JS 插件引导入口（`src/plugin_loader.js`、`manifest.json` 与 `package.json#qwqnt`）：
+
+1. 若已在桌面端安装社区插件框架（如 **LiteLoaderQQNT v4** 或 **QwQNT**），直接将本仓库放入对应 `plugins/Rosmontis` 目录；或由自定义主进程脚本直接 `require("<path>/src/plugin_loader.js")` 挂载。
+2. 将 [`config/rosmontis.example.json`](./config/rosmontis.example.json) 复制为仓库内 `config/rosmontis.json`（或放入插件框架数据目录 / 通过 `ROSMONTIS_CONFIG_DIR` 指定），按需设置绑定地址（单机推荐 `127.0.0.1`）与 `accessToken` 后启动客户端即可。
+
+> **生产部署建议**：桌面端第三方插件框架的底层引导机制由各框架自行维护，受客户端大版本更新影响较大；长期无人值守运行仍优先推荐 **方式一（官方原版 Linux QQ 容器零 Hook 部署）**。
+
 ---
 
 ## 配置说明
@@ -139,6 +148,8 @@ Rosmontis 支持**零配置开箱即用**、**环境变量配置**与 **JSON 配
 | `ROSMONTIS_COMPAT_PROFILE` / `ONEBOT_COMPAT_PROFILE` | `rosmontis` | 下游兼容画像（可选 `snowluma` / `napcat`，亦可在各网络端点单独配置 `compatProfile`） |
 | `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API` | `0` | 设为 `1` 时显式开启 `get_cookies` / `get_clientkey` / QZone 等高敏凭据接口（默认关闭） |
 | `ROSMONTIS_CONFIG_DIR` | `/app/data/config` | 配置文件搜索目录（详见 [`config/rosmontis.example.json`](./config/rosmontis.example.json)） |
+| `ROSMONTIS_FFMPEG_PATH` / `ONEBOT_FFMPEG_PATH` | `ffmpeg` | 可选 `ffmpeg` 可执行文件路径（SILK v3 / AMR-NB 原生直通免外部工具；WAV / MP3 / OGG 等格式自动调用 `ffmpeg` 转码） |
+| `ROSMONTIS_BOOT_LOG` | *(空)* | 可选插件引导诊断日志文件路径（供桌面端无控制台环境下排查 `plugin_loader.js` 启动状态） |
 | `ROSMONTIS_DISABLE` | `0` | 设为 `1` 时一键跳过桥接器加载，原样启动官方 QQ |
 
 ### 下游框架与插件兼容
