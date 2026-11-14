@@ -23,6 +23,13 @@ const {
 } = require("./core/media_security");
 
 const {
+  inspectAudioBuffer,
+  inspectAudioFile,
+  prepareVoiceMedia,
+  transcodeRecordOutFormat,
+} = require("./core/audio_codec");
+
+const {
   MessageIdStore,
   UinUidStore,
   pickPositiveUin,
@@ -66,6 +73,10 @@ module.exports = {
   parseCqCodeToSegments,
   normalizeOneBotMessage,
   inspectImageDimensions,
+  inspectAudioBuffer,
+  inspectAudioFile,
+  prepareVoiceMedia,
+  transcodeRecordOutFormat,
   getNtqqVersionMetadata,
   buildNtqqUserAgent,
   resolveMaxMediaBytes,

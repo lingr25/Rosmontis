@@ -164,6 +164,13 @@ function resolveTempDirFromEnv(explicitTempDir) {
   return pickPrefixedEnv("TEMP_DIR") || path.join(getTempBaseDir(), ".rosmontis_tmp");
 }
 
+function resolveFfmpegPathFromEnv(explicitFfmpegPath) {
+  if (typeof explicitFfmpegPath === "string" && explicitFfmpegPath.trim() !== "") {
+    return explicitFfmpegPath.trim();
+  }
+  return pickPrefixedEnv("FFMPEG_PATH", ["FFMPEG_PATH"]) || "ffmpeg";
+}
+
 function resolveConfigDirsFromEnv() {
   const env = _getEnv();
   return [
@@ -193,5 +200,6 @@ module.exports = {
   getTempBaseDir,
   getXdgConfigHome,
   resolveTempDirFromEnv,
+  resolveFfmpegPathFromEnv,
   resolveConfigDirsFromEnv,
 };

@@ -5,6 +5,7 @@ const path = require("path");
 const { pathToFileURL } = require("url");
 
 const { resolveMediaSource } = require("../core/media_security");
+const { transcodeRecordOutFormat } = require("../core/audio_codec");
 const { createActionRouter, createEventWaiter } = require("../core/primitives");
 const {
   computeBkn,
@@ -303,6 +304,29 @@ async function extractUploadedFileUuid(bridge, peer, sent) {
   return fileUuid;
 }
 
+function trackActionTempMedia(bridge, media) {
+  if (!media || !media.isTempFile || !media.localPath) return;
+  if (typeof bridge.tempFileCleaner?.track === "function") {
+    bridge.tempFileCleaner.track(media.localPath);
+  } else if (
+    !bridge.config?.cleanupTempImmediately &&
+    typeof bridge._scheduleMediaCleanup === "function"
+  ) {
+    bridge._scheduleMediaCleanup(media);
+  }
+}
+
+async function maybeTranscodeGetRecordOutput(bridge, action, rawOutFormat, localPath) {
+  if (action !== "get_record" || !rawOutFormat || !localPath) return null;
+  const converted = await transcodeRecordOutFormat(localPath, rawOutFormat, {
+    ...(typeof bridge._mediaSecurityOptions === "function" ? bridge._mediaSecurityOptions() : {}),
+    ffmpegPath: bridge.config?.ffmpegPath,
+  });
+  if (!converted) return null;
+  trackActionTempMedia(bridge, converted);
+  return converted;
+}
+
 async function resolveOneBotMediaAction(p, _context, action) {
   const rawFile = String(p.file || p.file_id || "").trim();
   const rawFileId = String(p.file_id || "").trim();
@@ -508,13 +532,24 @@ async function resolveOneBotMediaAction(p, _context, action) {
   }
 
   if (kernelStat) {
+    const converted = await maybeTranscodeGetRecordOutput(
+      this,
+      action,
+      p.out_format,
+      kernelLocalPath
+    );
+    const outPath = converted ? converted.localPath : kernelLocalPath;
+    const outSize = converted ? converted.fileSize : kernelStat.size;
+    const outName = converted
+      ? converted.fileName
+      : String(mediaDesc?.fileName || path.basename(kernelLocalPath));
     return {
-      file: kernelLocalPath,
-      url: pathToFileURL(kernelLocalPath).href,
-      file_size: String(kernelStat.size),
-      file_name: String(mediaDesc?.fileName || path.basename(kernelLocalPath)),
+      file: outPath,
+      url: pathToFileURL(outPath).href,
+      file_size: String(outSize),
+      file_name: outName,
       ...(includeB64
-        ? { base64: (await fs.promises.readFile(kernelLocalPath)).toString("base64") }
+        ? { base64: (await fs.promises.readFile(outPath)).toString("base64") }
         : {}),
     };
   }
@@ -566,16 +601,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
     throw notFound;
   }
 
-  if (resolved.isTempFile) {
-    if (typeof this.tempFileCleaner?.track === "function") {
-      this.tempFileCleaner.track(resolved.localPath);
-    } else if (
-      !this.config?.cleanupTempImmediately &&
-      typeof this._scheduleMediaCleanup === "function"
-    ) {
-      this._scheduleMediaCleanup(resolved);
-    }
-  }
+  trackActionTempMedia(this, resolved);
 
   let st;
   try {
@@ -587,13 +613,25 @@ async function resolveOneBotMediaAction(p, _context, action) {
     throw new Error("Media file not found or not accessible");
   }
 
+  const converted = await maybeTranscodeGetRecordOutput(
+    this,
+    action,
+    p.out_format,
+    resolved.localPath
+  );
+  const outPath = converted ? converted.localPath : resolved.localPath;
+  const outSize = converted ? converted.fileSize : st.size;
+  const outName = converted
+    ? converted.fileName
+    : String(resolved.fileName || path.basename(resolved.localPath));
+
   return {
-    file: resolved.localPath,
-    url: pathToFileURL(resolved.localPath).href,
-    file_size: String(st.size),
-    file_name: String(resolved.fileName || path.basename(resolved.localPath)),
+    file: outPath,
+    url: pathToFileURL(outPath).href,
+    file_size: String(outSize),
+    file_name: outName,
     ...(includeB64
-      ? { base64: (await fs.promises.readFile(resolved.localPath)).toString("base64") }
+      ? { base64: (await fs.promises.readFile(outPath)).toString("base64") }
       : {}),
   };
 }

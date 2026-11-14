@@ -17,6 +17,7 @@ RUN if [ "${REQUIRE_QQ_DEB_SHA256}" = "1" ] && [ -z "${QQ_DEB_SHA256}" ]; then \
     curl \
     dbus \
     dbus-x11 \
+    ffmpeg \
     fluxbox \
     fonts-noto-cjk \
     gosu \
@@ -24,6 +25,7 @@ RUN if [ "${REQUIRE_QQ_DEB_SHA256}" = "1" ] && [ -z "${QQ_DEB_SHA256}" ]; then \
     libatk-bridge2.0-0t64 \
     libatk1.0-0t64 \
     libatspi2.0-0t64 \
+    libavcodec-extra \
     libcairo2 \
     libcups2t64 \
     libdrm2 \

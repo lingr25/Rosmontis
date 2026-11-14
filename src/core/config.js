@@ -251,6 +251,7 @@ function loadBridgeConfig(customConfigDir) {
           "allowPrivateUrls",
           "allowArbitraryLocalFiles",
           "allowedFileDirs",
+          "ffmpegPath",
         ]) {
           if (raw && raw[optKey] !== undefined) {
             defaultConfig[optKey] = raw[optKey];
@@ -439,6 +440,14 @@ function loadBridgeConfig(customConfigDir) {
       "array") === "string"
       ? "string"
       : "array";
+
+  const envFfmpegPath = pickPrefixedEnv("FFMPEG_PATH", ["FFMPEG_PATH"]);
+  const rawFfmpegPath = String(
+    envFfmpegPath || loadedRaw.ffmpegPath || loadedRaw.ffmpeg_path || ""
+  ).trim();
+  if (rawFfmpegPath) {
+    defaultConfig.ffmpegPath = rawFfmpegPath;
+  }
 
   const envCompatProfile = pickPrefixedEnv("COMPAT_PROFILE").toLowerCase();
   const rawCompatProfile = String(

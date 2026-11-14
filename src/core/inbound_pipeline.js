@@ -1033,6 +1033,36 @@ const inboundPipelineMixin = {
           }
         }
 
+        if (!st && this._isNtReady() && ptt.md5HexStr) {
+          try {
+            const pathInfo = {
+              md5HexStr: String(ptt.md5HexStr),
+              fileName: String(ptt.fileName || `${ptt.md5HexStr}.amr`),
+              elementType: 4,
+              elementSubType: 0,
+              thumbSize: 0,
+              needCreate: false,
+              downloadType: 1,
+              file_uuid: String(ptt.fileUuid || ""),
+            };
+            const pathRes = await this.invokeNt(
+              "nodeIKernelMsgService/getRichMediaFilePathForGuild",
+              { path_info: pathInfo },
+              [pathInfo]
+            );
+            const resolvedPath = typeof pathRes === "string" ? pathRes : pathRes?.path || "";
+            if (resolvedPath) {
+              const cachedStat = await _statPositiveFile(String(resolvedPath));
+              if (cachedStat) {
+                localPath = String(resolvedPath);
+                st = cachedStat;
+              }
+            }
+          } catch (err) {
+            this.logger?.debug?.("inbound", err);
+          }
+        }
+
         if (st && st.size > 0 && localPath) {
           ptt.filePath = localPath;
           if (st.size <= maxPttBytes) {

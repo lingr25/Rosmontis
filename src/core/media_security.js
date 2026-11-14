@@ -1363,6 +1363,7 @@ module.exports = {
   createSsrfSafeLookup,
   pruneTempDir,
   pruneTempDirAsync,
+  writeTempMediaAtomically,
   downloadBufferFromUrl,
   downloadMediaStreamToTempDir,
   resolveMediaSource,

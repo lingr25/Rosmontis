@@ -78,6 +78,7 @@
  * @property {boolean} [allowPrivateUrls]
  * @property {boolean} [allowArbitraryLocalFiles]
  * @property {string[]} [allowedFileDirs]
+ * @property {string} [ffmpegPath]
  * @property {boolean} [enableWebCredentialApi]
  * @property {boolean} [allowUnauthenticatedPublicBind]
  * @property {boolean} [allowQueryAccessToken]

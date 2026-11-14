@@ -7,6 +7,7 @@ const { pathToFileURL } = require("url");
 const { segmentsToCqCode, normalizeOneBotMessage } = require("./cq_codec");
 const { pickPositiveUin, lookupCachedUin } = require("./stores");
 const { resolveMediaSource } = require("../core/media_security");
+const { prepareVoiceMedia, DEFAULT_WAVE_AMPLITUDES } = require("../core/audio_codec");
 
 function buildNtPicUrl(picElement, chatType) {
   if (!picElement || typeof picElement !== "object") return "";
@@ -687,34 +688,68 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
               allowedFileDirs: ctx.allowedFileDirs,
             });
       trackTempMedia(media);
-      let finalPath = media.localPath;
-      let duration = Math.max(1, Number(data.duration || 3));
+
+      const voiceMedia = await prepareVoiceMedia(media, {
+        tempDir: ctx.tempDir,
+        maxMediaBytes: ctx.maxMediaBytes,
+        ffmpegPath: ctx.ffmpegPath,
+        transcodeTimeoutMs: ctx.transcodeTimeoutMs,
+      });
+      if (voiceMedia.extraTempMedia) {
+        trackTempMedia(voiceMedia.extraTempMedia);
+      }
+
+      let finalPath = voiceMedia.localPath;
+      let md5HexStr = voiceMedia.md5HexStr;
+      let fileSize = voiceMedia.fileSize;
+      let fileName = voiceMedia.fileName || path.basename(finalPath);
+      let formatType = Number(voiceMedia.formatType || 1);
+      let waveAmplitudes = Array.isArray(voiceMedia.waveAmplitudes)
+        ? voiceMedia.waveAmplitudes
+        : [...DEFAULT_WAVE_AMPLITUDES];
+      const explicitDuration = Number(data.duration);
+      const hasExplicitDuration = Number.isFinite(explicitDuration) && explicitDuration > 0;
+      let duration = hasExplicitDuration
+        ? Math.max(1, Math.round(explicitDuration))
+        : Math.max(1, Number(voiceMedia.duration || 3));
+
       if (typeof ctx.prepareNtRecordPath === "function") {
-        const prepared = await ctx.prepareNtRecordPath(media);
+        const prepared = await ctx.prepareNtRecordPath(voiceMedia);
         if (prepared && typeof prepared === "object") {
-          if (prepared.localPath) finalPath = prepared.localPath;
-          if (prepared.duration) duration = prepared.duration;
-        } else if (typeof prepared === "string") {
+          if (prepared.localPath) finalPath = String(prepared.localPath);
+          if (prepared.fileName) fileName = String(prepared.fileName);
+          if (prepared.md5HexStr) md5HexStr = String(prepared.md5HexStr);
+          if (prepared.fileSize) fileSize = Number(prepared.fileSize);
+          if (!hasExplicitDuration && Number(prepared.duration) > 0) {
+            duration = Math.max(1, Math.round(Number(prepared.duration)));
+          }
+          if (Number(prepared.formatType) > 0) formatType = Number(prepared.formatType);
+          if (Array.isArray(prepared.waveAmplitudes) && prepared.waveAmplitudes.length > 0) {
+            waveAmplitudes = prepared.waveAmplitudes;
+          }
+        } else if (typeof prepared === "string" && prepared) {
           finalPath = prepared;
+          fileName = path.basename(prepared);
         }
       }
+
       elements.push({
         elementType: 4,
         elementId: "",
         pttElement: {
-          fileName: path.basename(finalPath),
+          fileName: fileName || path.basename(finalPath),
           filePath: finalPath,
-          md5HexStr: media.md5HexStr,
-          fileSize: String(media.fileSize),
+          md5HexStr,
+          fileSize: String(fileSize),
           duration,
-          formatType: 1,
+          formatType,
           voiceType: 1,
           voiceChangeType: Number(data.magic || 0),
           canConvert2Text: true,
           fileId: 0,
           fileUuid: "",
           text: "",
-          waveAmplitudes: [18, 42, 65, 51, 33, 72, 48, 25],
+          waveAmplitudes,
         },
       });
       continue;

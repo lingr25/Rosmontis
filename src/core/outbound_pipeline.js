@@ -155,6 +155,58 @@ const outboundPipelineMixin = {
     return media.localPath;
   },
 
+  async _prepareNtRecordPath(media) {
+    const fileName = media.fileName || `${media.md5HexStr}.amr`;
+    try {
+      const pathInfo = {
+        md5HexStr: media.md5HexStr,
+        fileName,
+        elementType: 4,
+        elementSubType: 0,
+        thumbSize: 0,
+        needCreate: true,
+        downloadType: 1,
+        file_uuid: "",
+      };
+      const pathRes = await this.invokeNt(
+        "nodeIKernelMsgService/getRichMediaFilePathForGuild",
+        { path_info: pathInfo },
+        [pathInfo]
+      );
+      const targetPath = typeof pathRes === "string" ? pathRes : pathRes?.path || "";
+      if (targetPath && targetPath !== media.localPath) {
+        try {
+          await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+          await fs.promises.copyFile(media.localPath, targetPath);
+          return {
+            localPath: targetPath,
+            fileName: path.basename(targetPath) || fileName,
+            md5HexStr: media.md5HexStr,
+            fileSize: media.fileSize,
+          };
+        } catch (_) {
+          await this.invokeNt(
+            "nodeIKernelFileAssistantService/copyFile",
+            { fromPath: media.localPath, toPath: targetPath },
+            [media.localPath, targetPath]
+          );
+          return {
+            localPath: targetPath,
+            fileName: path.basename(targetPath) || fileName,
+            md5HexStr: media.md5HexStr,
+            fileSize: media.fileSize,
+          };
+        }
+      }
+    } catch (_) {}
+    return {
+      localPath: media.localPath,
+      fileName,
+      md5HexStr: media.md5HexStr,
+      fileSize: media.fileSize,
+    };
+  },
+
   _sendPeerKey(peer) {
     return this._ensureEchoCorrelator().peerKey(peer);
   },
@@ -200,6 +252,8 @@ const outboundPipelineMixin = {
       messageIdStore: this.messageIdStore,
       invokeNt: this.invokeNt.bind(this),
       prepareNtImagePath: this._prepareNtImagePath.bind(this),
+      prepareNtRecordPath: this._prepareNtRecordPath.bind(this),
+      ffmpegPath: this.config.ffmpegPath,
       ...this._mediaSecurityOptions(),
     });
 
