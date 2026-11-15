@@ -333,12 +333,28 @@ const rendererIpcMixin = {
       app.on("web-contents-created", (_event, webContents) => {
         this._attachToWebContents(webContents);
       });
+      app.on("browser-window-created", (_event, win) => {
+        if (win && win.webContents) {
+          this._attachToWebContents(win.webContents);
+        }
+      });
     }
     try {
       const existing = electron.webContents?.getAllWebContents?.();
       if (Array.isArray(existing)) {
         for (const wc of existing) {
           this._attachToWebContents(wc);
+        }
+      }
+    } catch (_) {}
+    try {
+      const windows = electron.BrowserWindow?.getAllWindows?.();
+      if (Array.isArray(windows)) {
+        for (const win of windows) {
+          const wc = win && win.webContents;
+          if (wc && !this._knownWebContents.has(wc)) {
+            this._attachToWebContents(wc);
+          }
         }
       }
     } catch (_) {}
@@ -419,7 +435,9 @@ const rendererIpcMixin = {
     if (this._shouldPromoteWebContents(webContents)) {
       this.activeWebContents = webContents;
     }
+    let isWcDestroyed = false;
     const onDestroyed = () => {
+      isWcDestroyed = true;
       webContents.__rosmontisCmdChannelReady = false;
       this._rejectPendingRendererCmds(webContents, "renderer webContents destroyed");
       this._knownWebContents.delete(webContents);
@@ -453,7 +471,9 @@ const rendererIpcMixin = {
 
     const injectScript = () => {
       try {
-        if (!this._isWebContentsAlive(webContents)) return;
+        if (isWcDestroyed || !this._knownWebContents.has(webContents) || !this._isWebContentsAlive(webContents)) {
+          return;
+        }
         let rawUrl = "";
         try {
           if (typeof webContents.getURL === "function") {
@@ -497,7 +517,12 @@ const rendererIpcMixin = {
         injectPending = true;
         Promise.resolve(webContents.executeJavaScript(script, true))
           .then(() => {
-            if (genAtStart !== injectGen || !this._isWebContentsAlive(webContents)) {
+            if (
+              isWcDestroyed ||
+              genAtStart !== injectGen ||
+              !this._knownWebContents.has(webContents) ||
+              !this._isWebContentsAlive(webContents)
+            ) {
               return;
             }
             if (typeof webContents.getURL === "function") {
@@ -530,6 +555,25 @@ const rendererIpcMixin = {
     webContents.on("dom-ready", injectScript);
     webContents.on("did-finish-load", injectScript);
     webContents.on("did-navigate-in-page", injectScript);
+
+    try {
+      const isLoading =
+        typeof webContents.isLoadingMainFrame === "function"
+          ? Boolean(webContents.isLoadingMainFrame())
+          : typeof webContents.isLoading === "function"
+          ? Boolean(webContents.isLoading())
+          : false;
+      if (!isLoading && typeof webContents.executeJavaScript === "function") {
+        let shouldInjectNow = true;
+        if (typeof webContents.getURL === "function") {
+          const currentUrl = String(webContents.getURL() || "").trim();
+          shouldInjectNow = Boolean(currentUrl) && this._isTrustedRendererUrl(currentUrl);
+        }
+        if (shouldInjectNow) {
+          injectScript();
+        }
+      }
+    } catch (_) {}
   },
 
   async _tryAutoQuickLogin({ uin: explicitUin = "", force = false, webContents = null } = {}) {

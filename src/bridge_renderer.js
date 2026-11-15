@@ -26,6 +26,7 @@
 
 const DEFAULT_REGISTERED_EVENTS = [
   "nodeIKernelMsgListener/onRecvMsg",
+  "nodeIKernelMsgListener/onRecvActiveMsg",
   "nodeIKernelMsgListener/onMsgInfoListUpdate",
   "nodeIKernelMsgListener/onAddSendMsg",
   "nodeIKernelMsgListener/onRichMediaDownloadComplete",

@@ -45,6 +45,18 @@
         "reportSelfMessage": false,
         "reconnectIntervalMs": 5000
       }
+    ],
+    "httpClients": [
+      {
+        "enable": false,
+        "name": "http-webhook",
+        "url": "http://127.0.0.1:8080/onebot/v11/http",
+        "secret": "",
+        "accessToken": "",
+        "timeoutMs": 5000,
+        "messageFormat": "array",
+        "reportSelfMessage": false
+      }
     ]
   }
 }

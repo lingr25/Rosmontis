@@ -198,40 +198,338 @@ const ntCaptureMixin = {
   },
 
   _hookWrapperExports(wrapperExports) {
-    if (!wrapperExports || typeof wrapperExports !== "object") return false;
-    const self = this;
+    if (
+      !wrapperExports ||
+      (typeof wrapperExports !== "object" && typeof wrapperExports !== "function")
+    ) {
+      return false;
+    }
+    let matched = false;
     const SessionClass = wrapperExports.NodeIQQNTWrapperSession;
-    if (!SessionClass) return false;
-    if (!SessionClass.__rosmontisHookedSessionClass__) {
+    const isWrapperSessionObj = (val) => {
+      if (!val || typeof val !== "object" || val === SessionClass) return false;
       try {
-        Object.defineProperty(SessionClass, "__rosmontisHookedSessionClass__", {
-          value: true,
-          enumerable: false,
-        });
-        for (const staticFn of ["get", "create", "getNTWrapperSession"]) {
-          if (typeof SessionClass[staticFn] === "function") {
-            const origFn = SessionClass[staticFn].bind(SessionClass);
-            SessionClass[staticFn] = function (...args) {
-              const inst = origFn(...args);
-              if (inst && typeof inst === "object") {
-                self.capturedServices.wrapperSession = inst;
-                self._maybeScheduleMapHookRelease();
-              }
-              return inst;
-            };
+        if (typeof SessionClass === "function" && val instanceof SessionClass) {
+          return true;
+        }
+      } catch (_) {}
+      try {
+        const proto = Object.getPrototypeOf(val) || {};
+        return (
+          typeof val.getMsgService === "function" ||
+          typeof proto.getMsgService === "function"
+        );
+      } catch (_) {
+        return false;
+      }
+    };
+
+    if (SessionClass && (typeof SessionClass === "function" || typeof SessionClass === "object")) {
+      matched = true;
+      let hookState = SessionClass.__rosmontisSessionHookState__;
+      if (!hookState) {
+        hookState = { owner: this };
+        try {
+          Object.defineProperty(SessionClass, "__rosmontisSessionHookState__", {
+            value: hookState,
+            enumerable: false,
+            configurable: true,
+          });
+        } catch (_) {}
+      } else {
+        hookState.owner = this;
+      }
+
+      if (!SessionClass.__rosmontisHookedSessionClass__) {
+        try {
+          Object.defineProperty(SessionClass, "__rosmontisHookedSessionClass__", {
+            value: true,
+            enumerable: false,
+            configurable: true,
+          });
+          for (const staticFn of ["get", "create", "getNTWrapperSession"]) {
+            if (typeof SessionClass[staticFn] === "function") {
+              const origFn = SessionClass[staticFn].bind(SessionClass);
+              SessionClass[staticFn] = function (...args) {
+                const inst = origFn(...args);
+                const owner = hookState.owner;
+                if (owner && inst && typeof inst === "object") {
+                  owner.capturedServices.wrapperSession = inst;
+                  owner._maybeScheduleMapHookRelease();
+                }
+                return inst;
+              };
+            }
+          }
+        } catch (err) {
+          this.logger?.debug?.("nt_capture", err);
+        }
+      }
+
+      try {
+        const clsKeys = Reflect.ownKeys(SessionClass).slice(0, 32);
+        for (const key of clsKeys) {
+          if (key === "arguments" || key === "caller" || key === "prototype") continue;
+          const desc = Object.getOwnPropertyDescriptor(SessionClass, key);
+          if (!desc || !("value" in desc)) continue;
+          if (isWrapperSessionObj(desc.value)) {
+            this.capturedServices.wrapperSession = desc.value;
+            this._maybeScheduleMapHookRelease();
+            break;
           }
         }
       } catch (err) {
         this.logger?.debug?.("nt_capture", err);
       }
     }
-    return true;
+
+    try {
+      const expKeys = Reflect.ownKeys(wrapperExports).slice(0, 64);
+      for (const key of expKeys) {
+        if (key === "arguments" || key === "caller" || key === "prototype") continue;
+        const desc = Object.getOwnPropertyDescriptor(wrapperExports, key);
+        if (!desc || !("value" in desc)) continue;
+        if (isWrapperSessionObj(desc.value)) {
+          this.capturedServices.wrapperSession = desc.value;
+          this._maybeScheduleMapHookRelease();
+          matched = true;
+          break;
+        }
+      }
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
+
+    return matched;
+  },
+
+  probeExistingRuntime(options = {}) {
+    const summary = {
+      wrapperModulesFound: 0,
+      mapsScanned: 0,
+      rmIpcChannels: [],
+    };
+    const opts = options && typeof options === "object" ? options : {};
+    const seenMaps = new WeakSet();
+    const seenObjs = new WeakSet();
+    const MAX_MAPS = 128;
+    const MAX_MAP_ENTRIES = 2000;
+
+    const scanMap = (map) => {
+      if (!(map instanceof Map) || seenMaps.has(map) || summary.mapsScanned >= MAX_MAPS) {
+        return;
+      }
+      seenMaps.add(map);
+      summary.mapsScanned += 1;
+      let count = 0;
+      try {
+        for (const [k, v] of map.entries()) {
+          if (count >= MAX_MAP_ENTRIES) break;
+          count += 1;
+          const prevInspecting = MAP_HOOK_STATE.inspecting;
+          MAP_HOOK_STATE.inspecting = true;
+          try {
+            this._inspectMapEntry(map, k, v);
+          } catch (err) {
+            try {
+              this.logger?.debug?.("nt_capture", err);
+            } catch (_) {}
+          } finally {
+            MAP_HOOK_STATE.inspecting = prevInspecting;
+          }
+        }
+      } catch (err) {
+        this.logger?.debug?.("nt_capture", err);
+      }
+    };
+
+    const inspectShallowObjectForMaps = (obj, maxKeys = 32) => {
+      if (!obj || (typeof obj !== "object" && typeof obj !== "function") || seenObjs.has(obj)) {
+        return;
+      }
+      seenObjs.add(obj);
+      if (typeof obj === "object") {
+        try {
+          this._inspectInversifyCache(obj);
+        } catch (_) {}
+      }
+      try {
+        const keys = Reflect.ownKeys(obj).slice(0, maxKeys);
+        for (const key of keys) {
+          if (key === "arguments" || key === "caller" || key === "prototype") continue;
+          let desc;
+          try {
+            desc = Object.getOwnPropertyDescriptor(obj, key);
+          } catch (_) {
+            continue;
+          }
+          if (!desc || !("value" in desc)) continue;
+          const val = desc.value;
+          if (val instanceof Map) {
+            scanMap(val);
+          } else if (key === "_bindingDictionary" && val && typeof val === "object") {
+            try {
+              const mapDesc = Object.getOwnPropertyDescriptor(val, "_map");
+              if (mapDesc && "value" in mapDesc && mapDesc.value instanceof Map) {
+                scanMap(mapDesc.value);
+              }
+            } catch (_) {}
+          } else if (val && typeof val === "object" && !Array.isArray(val)) {
+            try {
+              const bdDesc = Object.getOwnPropertyDescriptor(val, "_bindingDictionary");
+              if (bdDesc && "value" in bdDesc && bdDesc.value && typeof bdDesc.value === "object") {
+                const mapDesc = Object.getOwnPropertyDescriptor(bdDesc.value, "_map");
+                if (mapDesc && "value" in mapDesc && mapDesc.value instanceof Map) {
+                  scanMap(mapDesc.value);
+                }
+              }
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    };
+
+    // 1. Retrospective Module._cache scan for already-loaded wrapper.node
+    try {
+      const Module = require("module");
+      const cache = opts.moduleCache || (Module && Module._cache);
+      if (cache && typeof cache === "object") {
+        const cacheKeys = Object.keys(cache);
+        const limit = Math.min(cacheKeys.length, 5000);
+        for (let i = 0; i < limit; i += 1) {
+          const cacheKey = cacheKeys[i];
+          try {
+            const desc = Object.getOwnPropertyDescriptor(cache, cacheKey);
+            if (!desc || !("value" in desc)) continue;
+            const mod = desc.value;
+            const filename = mod && typeof mod.filename === "string" ? mod.filename : "";
+            const modId = mod && typeof mod.id === "string" ? mod.id : "";
+            if (
+              /wrapper\.node$/i.test(cacheKey) ||
+              /wrapper\.node$/i.test(filename) ||
+              /wrapper\.node$/i.test(modId)
+            ) {
+              const exp = mod ? mod.exports : null;
+              if (exp && (typeof exp === "object" || typeof exp === "function")) {
+                if (this._hookWrapperExports(exp)) {
+                  summary.wrapperModulesFound += 1;
+                }
+              }
+            }
+          } catch (err) {
+            this.logger?.debug?.("nt_capture", err);
+          }
+        }
+      }
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
+
+    // 2. Read-only inspection of electron.ipcMain (_events & own data properties)
+    try {
+      let ipcMain = opts.ipcMain || opts.electron?.ipcMain || null;
+      if (!ipcMain && process.versions?.electron) {
+        try {
+          const electronMod = require("electron");
+          if (electronMod && typeof electronMod === "object") {
+            ipcMain = electronMod.ipcMain || null;
+          }
+        } catch (_) {}
+      }
+      if (ipcMain && typeof ipcMain === "object") {
+        try {
+          const eventsDesc = Object.getOwnPropertyDescriptor(ipcMain, "_events");
+          const eventsObj = eventsDesc && "value" in eventsDesc ? eventsDesc.value : null;
+          if (eventsObj && typeof eventsObj === "object") {
+            const evKeys = Reflect.ownKeys(eventsObj).slice(0, 256);
+            for (const evKey of evKeys) {
+              if (typeof evKey === "string" && evKey.startsWith("RM_IPCFROM_RENDERER")) {
+                summary.rmIpcChannels.push(evKey);
+              }
+              let evDesc;
+              try {
+                evDesc = Object.getOwnPropertyDescriptor(eventsObj, evKey);
+              } catch (_) {
+                continue;
+              }
+              if (!evDesc || !("value" in evDesc) || !evDesc.value) continue;
+              const listeners = Array.isArray(evDesc.value) ? evDesc.value : [evDesc.value];
+              for (const fn of listeners.slice(0, 32)) {
+                inspectShallowObjectForMaps(fn, 32);
+              }
+            }
+          }
+        } catch (_) {}
+        inspectShallowObjectForMaps(ipcMain, 128);
+      }
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
+
+    // 3. Safe own-key scan of globalThis (strictly skipping getters)
+    try {
+      const targetGlobal =
+        opts.globalObject || (typeof globalThis !== "undefined" ? globalThis : global);
+      if (targetGlobal && typeof targetGlobal === "object") {
+        const gKeys = Reflect.ownKeys(targetGlobal).slice(0, 2000);
+        for (const gKey of gKeys) {
+          if (
+            gKey === "global" ||
+            gKey === "globalThis" ||
+            gKey === "process" ||
+            gKey === "console"
+          ) {
+            continue;
+          }
+          let desc;
+          try {
+            desc = Object.getOwnPropertyDescriptor(targetGlobal, gKey);
+          } catch (_) {
+            continue;
+          }
+          if (!desc || !("value" in desc)) continue;
+          const gVal = desc.value;
+          if (gVal instanceof Map) {
+            scanMap(gVal);
+          } else if (
+            gVal &&
+            typeof gVal === "object" &&
+            !Array.isArray(gVal) &&
+            !(typeof Buffer !== "undefined" && Buffer.isBuffer(gVal))
+          ) {
+            try {
+              this._inspectInversifyCache(gVal);
+            } catch (_) {}
+            if (
+              typeof gKey === "symbol" ||
+              (typeof gKey === "string" && /nt|qq|ipc|inversify|container|store/i.test(gKey))
+            ) {
+              inspectShallowObjectForMaps(gVal, 32);
+            } else {
+              try {
+                const bdDesc = Object.getOwnPropertyDescriptor(gVal, "_bindingDictionary");
+                if (bdDesc && "value" in bdDesc && bdDesc.value && typeof bdDesc.value === "object") {
+                  const mapDesc = Object.getOwnPropertyDescriptor(bdDesc.value, "_map");
+                  if (mapDesc && "value" in mapDesc && mapDesc.value instanceof Map) {
+                    scanMap(mapDesc.value);
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        }
+      }
+    } catch (err) {
+      this.logger?.debug?.("nt_capture", err);
+    }
+
+    return summary;
   },
 
   _inspectMapEntry(_mapInstance, k, v) {
     // 1. String keys in Inversify or globalIPCMainMap or listenerEventEmitterMap
     if (typeof k === "string") {
-      if (k === "ntApi" && v) {
+      if (k === "ntApi" && v && !Array.isArray(v)) {
         // First registration is the direct ntApi route Proxy; second registration in
         // globalIPCMainMap is `{ emit: Proxy, invoke: Proxy }` where `v.invoke` is the route Proxy.
         if (typeof v["nodeIKernelMsgService/sendMsg"] === "function") {
@@ -312,7 +610,7 @@ const ntCaptureMixin = {
     }
   },
 
-  _updateSelfIdentity({ uin, uid, nick, markOnline = false } = {}) {
+  _updateSelfIdentity({ uin, uid, nick, nickname, markOnline = false } = {}) {
     const prevUin = this.selfUin;
     if (uin && /^\d+$/.test(String(uin))) {
       this.selfUin = String(uin);
@@ -320,12 +618,17 @@ const ntCaptureMixin = {
     if (uid && String(uid).trim()) {
       this.selfUid = String(uid).trim();
     }
-    if (nick && String(nick).trim()) {
-      this.selfNickname = String(nick).trim();
+    const incomingNick =
+      nick !== undefined && nick !== null && String(nick).trim() !== "" ? nick : nickname;
+    if (incomingNick && String(incomingNick).trim()) {
+      this.selfNickname = String(incomingNick).trim();
     }
     if (this.selfUin && this.selfUid) {
-      this.uinUidStore.record(this.selfUin, this.selfUid, {
-        nick: this.selfNickname !== "QQBot" ? this.selfNickname : "",
+      const cleanNick =
+        this.selfNickname && this.selfNickname !== "QQBot" ? this.selfNickname : "";
+      this.uinUidStore?.record?.(this.selfUin, this.selfUid, {
+        nickname: cleanNick,
+        nick: cleanNick,
       });
     }
     if (markOnline) {
@@ -428,6 +731,20 @@ const ntCaptureMixin = {
       this.capturedServices.wrapperSession = obj;
       this._maybeScheduleMapHookRelease();
     }
+
+    // Check if obj is a direct or wrapped ntApi router inside an Inversify binding cache
+    try {
+      if (typeof obj["nodeIKernelMsgService/sendMsg"] === "function") {
+        this.capturedServices.ntApi = obj;
+        this._maybeScheduleMapHookRelease();
+      } else if (
+        obj.invoke &&
+        typeof obj.invoke["nodeIKernelMsgService/sendMsg"] === "function"
+      ) {
+        this.capturedServices.ntApi = obj.invoke;
+        this._maybeScheduleMapHookRelease();
+      }
+    } catch (_) {}
   },
 
   _inspectNtStore(ntStore) {

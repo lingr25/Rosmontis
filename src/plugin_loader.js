@@ -85,6 +85,9 @@ function bootPluginBridge(options = {}) {
     return null;
   }
   if (activeBridge && !options.forceNew) {
+    try {
+      activeBridge.probeExistingRuntime?.({ electron: options.electron });
+    } catch (_) {}
     return activeBridge;
   }
 
@@ -109,6 +112,9 @@ function bootPluginBridge(options = {}) {
       autoStartServers: options.autoStartServers !== false,
     };
     activeBridge = bridgeMain.installMainBridge(installOpts);
+    try {
+      activeBridge?.probeExistingRuntime?.({ electron: options.electron });
+    } catch (_) {}
     _appendBootLog(
       bootLogPath,
       `installMainBridge ok (configDir=${configDir || "auto"}, selfUin=${activeBridge?.selfUin || ""})`
@@ -125,11 +131,15 @@ function bootPluginBridge(options = {}) {
 }
 
 function onBrowserWindowCreated(window) {
-  const bridge = activeBridge || (!isTestModeFromEnv() ? bootPluginBridge() : null);
+  if (isBridgeDisabledFromEnv()) {
+    return;
+  }
+  const bridge =
+    activeBridge || bootPluginBridge({ autoStartServers: !isTestModeFromEnv() });
   const wc = window && (window.webContents || window);
-  if (bridge && wc && typeof bridge._attachToWebContents === "function") {
+  if (bridge && wc) {
     try {
-      bridge._attachToWebContents(wc);
+      bridge._attachToWebContents?.(wc);
     } catch (_) {}
   }
 }

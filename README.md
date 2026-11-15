@@ -46,13 +46,13 @@
 
 ```text
   OneBot v11 Clients (NoneBot2 / Koishi / AstrBot / SnowLuma / Custom Agent)
-          ▲                     ▲                     │
-          │ HTTP (:3000)        │ Forward WS (:3001)  │ Reverse WS Client
-          ▼                     ▼                     ▼
+      ▲                 ▲                 │                  │
+      │ HTTP (:3000)    │ Forward WS      │ Reverse WS       │ HTTP POST Webhook
+      ▼                 ▼ (:3001)         ▼                  ▼ (HMAC-SHA1 + Quick-Op)
 +-------------------------------------------------------------------------+
 | Rosmontis Main Coordinator (src/bridge_main.js + src/core/* + actions/*)|
 |  - 75+ OneBot v11 Actions / Send Echo msgId Correlator / Media Hydrator |
-|  - Ephemeral DI Capture (restores native Map.prototype.set once ready)  |
+|  - Ephemeral DI Capture + Late-Load Runtime Probe + Store Persistence   |
 +-------------------------------------------------------------------------+
           │ Structured CMD/ACK IPC                     ▲
           ▼                                            │ Kernel Events
@@ -143,12 +143,16 @@ Rosmontis 支持**零配置开箱即用**、**环境变量配置**与 **JSON 配
 | `ROSMONTIS_HTTP_PORT` / `ONEBOT_HTTP_PORT` | `3000` | OneBot v11 HTTP API 监听端口 |
 | `ROSMONTIS_WS_PORT` / `ONEBOT_WS_PORT` | `3001` | OneBot v11 正向 WebSocket 监听端口 |
 | `ROSMONTIS_REVERSE_WS_URL` / `ONEBOT_REVERSE_WS_URL` | *(空)* | 反向 WebSocket 目标地址（如 `ws://127.0.0.1:8080/onebot/v11/ws`） |
+| `ROSMONTIS_HTTP_POST_URL` / `ONEBOT_HTTP_POST_URL` | *(空)* | 标准 OneBot v11 HTTP POST 事件推送（Webhook）目标地址（支持 200 JSON 快速操作响应） |
+| `ROSMONTIS_HTTP_SECRET` / `ONEBOT_HTTP_SECRET` | *(空)* | HTTP POST 事件推送的 HMAC-SHA1 签名密钥（自动计算请求头 `X-Signature: sha1=...`） |
 | `ROSMONTIS_ACCESS_TOKEN` / `ONEBOT_ACCESS_TOKEN` | *(非回环自动生成)* | Bearer 鉴权 Token（绑定非回环地址且留空时，Protected Mode 自动生成 256-bit 随机 Token 并输出至日志） |
 | `ROSMONTIS_HOST` / `ONEBOT_HOST` | `0.0.0.0` | HTTP / 正向 WS 绑定地址（宿主机单机部署推荐 `127.0.0.1`） |
+| `ROSMONTIS_STATE_DIR` / `ONEBOT_STATE_DIR` | *(空)* | 可选状态持久化目录（跨重启自动保存与恢复 `MessageIdStore` 消息映射及 `UinUidStore` 双向索引） |
 | `ROSMONTIS_COMPAT_PROFILE` / `ONEBOT_COMPAT_PROFILE` | `rosmontis` | 下游兼容画像（可选 `snowluma` / `napcat`，亦可在各网络端点单独配置 `compatProfile`） |
 | `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API` | `0` | 设为 `1` 时显式开启 `get_cookies` / `get_clientkey` / QZone 等高敏凭据接口（默认关闭） |
 | `ROSMONTIS_CONFIG_DIR` | `/app/data/config` | 配置文件搜索目录（详见 [`config/rosmontis.example.json`](./config/rosmontis.example.json)） |
-| `ROSMONTIS_FFMPEG_PATH` / `ONEBOT_FFMPEG_PATH` | `ffmpeg` | 可选 `ffmpeg` 可执行文件路径（SILK v3 / AMR-NB 原生直通免外部工具；WAV / MP3 / OGG 等格式自动调用 `ffmpeg` 转码） |
+| `ROSMONTIS_FFMPEG_PATH` / `ONEBOT_FFMPEG_PATH` | `ffmpeg` | 可选 `ffmpeg` 可执行文件路径（SILK v3 / AMR-NB 原生直通免外部工具；WAV / MP3 / OGG 及短视频封面自动调用 `ffmpeg`） |
+| `ROSMONTIS_SILK_ENCODER_PATH` / `ROSMONTIS_SILK_DECODER_PATH` | *(空)* | 可选外部高清 24kHz SILK v3 编解码 CLI 路径（未配置时无缝回退至 AMR-NB / `ffmpeg`） |
 | `ROSMONTIS_BOOT_LOG` | *(空)* | 可选插件引导诊断日志文件路径（供桌面端无控制台环境下排查 `plugin_loader.js` 启动状态） |
 | `ROSMONTIS_DISABLE` | `0` | 设为 `1` 时一键跳过桥接器加载，原样启动官方 QQ |
 
@@ -178,7 +182,7 @@ Rosmontis 默认原生兼容 **NoneBot2**、**Koishi**、**AstrBot** 等标准 O
 
 ## 开发与测试
 
-本项目包含完整的协议契约、安全边界与模拟 Electron 渲染窗口/主进程的端到端测试套件（34 组测试，零外部依赖）：
+本项目包含完整的协议契约、安全边界与模拟 Electron 渲染窗口/主进程的端到端测试套件（51 组测试，零外部依赖）：
 
 ```bash
 npm test

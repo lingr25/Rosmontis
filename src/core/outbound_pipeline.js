@@ -207,6 +207,93 @@ const outboundPipelineMixin = {
     };
   },
 
+  async _prepareNtVideoPath(media, thumbInfo) {
+    const videoFileName = media.fileName || `${media.md5HexStr}.mp4`;
+    const result = {
+      videoPath: media.localPath,
+      fileName: videoFileName,
+      videoMd5: media.md5HexStr,
+      fileSize: media.fileSize,
+      thumbPath: thumbInfo?.localPath || "",
+      thumbMd5: thumbInfo?.md5HexStr || "",
+      thumbSize: Number(thumbInfo?.fileSize || 0),
+    };
+    try {
+      const videoPathInfo = {
+        md5HexStr: media.md5HexStr,
+        fileName: videoFileName,
+        elementType: 5,
+        elementSubType: 2,
+        thumbSize: 0,
+        needCreate: true,
+        downloadType: 1,
+        file_uuid: "",
+      };
+      const videoPathRes = await this.invokeNt(
+        "nodeIKernelMsgService/getRichMediaFilePathForGuild",
+        { path_info: videoPathInfo },
+        [videoPathInfo]
+      );
+      const targetVideoPath =
+        typeof videoPathRes === "string" ? videoPathRes : videoPathRes?.path || "";
+      if (targetVideoPath && targetVideoPath !== media.localPath) {
+        try {
+          await fs.promises.mkdir(path.dirname(targetVideoPath), { recursive: true });
+          await fs.promises.copyFile(media.localPath, targetVideoPath);
+          result.videoPath = targetVideoPath;
+          result.fileName = path.basename(targetVideoPath) || videoFileName;
+        } catch (_) {
+          await this.invokeNt(
+            "nodeIKernelFileAssistantService/copyFile",
+            { fromPath: media.localPath, toPath: targetVideoPath },
+            [media.localPath, targetVideoPath]
+          );
+          result.videoPath = targetVideoPath;
+          result.fileName = path.basename(targetVideoPath) || videoFileName;
+        }
+      }
+    } catch (_) {}
+
+    if (thumbInfo?.localPath && thumbInfo?.md5HexStr) {
+      const thumbExt = path.extname(thumbInfo.localPath) || ".jpg";
+      const thumbFileName = `${thumbInfo.md5HexStr}_0${thumbExt}`;
+      try {
+        const thumbPathInfo = {
+          md5HexStr: thumbInfo.md5HexStr,
+          fileName: thumbFileName,
+          elementType: 5,
+          elementSubType: 1,
+          thumbSize: 0,
+          needCreate: true,
+          downloadType: 1,
+          file_uuid: "",
+        };
+        const thumbPathRes = await this.invokeNt(
+          "nodeIKernelMsgService/getRichMediaFilePathForGuild",
+          { path_info: thumbPathInfo },
+          [thumbPathInfo]
+        );
+        const targetThumbPath =
+          typeof thumbPathRes === "string" ? thumbPathRes : thumbPathRes?.path || "";
+        if (targetThumbPath && targetThumbPath !== thumbInfo.localPath) {
+          try {
+            await fs.promises.mkdir(path.dirname(targetThumbPath), { recursive: true });
+            await fs.promises.copyFile(thumbInfo.localPath, targetThumbPath);
+            result.thumbPath = targetThumbPath;
+          } catch (_) {
+            await this.invokeNt(
+              "nodeIKernelFileAssistantService/copyFile",
+              { fromPath: thumbInfo.localPath, toPath: targetThumbPath },
+              [thumbInfo.localPath, targetThumbPath]
+            );
+            result.thumbPath = targetThumbPath;
+          }
+        }
+      } catch (_) {}
+    }
+    return result;
+  },
+
   _sendPeerKey(peer) {
     return this._ensureEchoCorrelator().peerKey(peer);
   },
@@ -254,7 +341,9 @@ const outboundPipelineMixin = {
       invokeNt: this.invokeNt.bind(this),
       prepareNtImagePath: this._prepareNtImagePath.bind(this),
       prepareNtRecordPath: this._prepareNtRecordPath.bind(this),
+      prepareNtVideoPath: this._prepareNtVideoPath.bind(this),
       ffmpegPath: this.config.ffmpegPath,
+      silkEncoderPath: this.config.silkEncoderPath,
       ...this._mediaSecurityOptions(),
     });
 

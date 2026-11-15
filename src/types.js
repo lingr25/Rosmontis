@@ -50,12 +50,29 @@
  */
 
 /**
+ * Outbound HTTP POST (Webhook) event push client configuration.
+ * @typedef {object} HttpPostClientConfig
+ * @property {string} [name]
+ * @property {string} url
+ * @property {string} [secret]
+ * @property {string} [accessToken]
+ * @property {number} [timeoutMs]
+ * @property {boolean} [reportSelfMessage]
+ * @property {boolean} [enableHeartbeat]
+ * @property {MessageFormat} [messageFormat]
+ * @property {CompatProfile} [compatProfile]
+ * @property {boolean} [enable]
+ * @property {boolean} [enabled]
+ */
+
+/**
  * Resolved Rosmontis bridge runtime configuration.
  * @typedef {object} BridgeConfig
  * @property {string} [selfUin]
  * @property {EndpointServerConfig[]} httpServers
  * @property {EndpointServerConfig[]} wsServers
  * @property {ReverseWsClientConfig[]} wsClients
+ * @property {HttpPostClientConfig[]} [httpClients]
  * @property {number} heartbeatIntervalMs
  * @property {MessageFormat} [messageFormat]
  * @property {boolean} [humanSimulation]
@@ -79,6 +96,16 @@
  * @property {boolean} [allowArbitraryLocalFiles]
  * @property {string[]} [allowedFileDirs]
  * @property {string} [ffmpegPath]
+ * @property {string} [silkDecoderPath]
+ * @property {string} [silkEncoderPath]
+ * @property {string} [stateDir]
+ * @property {boolean} [persistStores]
+ * @property {number} [statePersistDebounceMs]
+ * @property {number} [maxForwardCustomNodes]
+ * @property {number} [forwardStageDelayMs]
+ * @property {number} [inboundMediaConcurrency]
+ * @property {number} [uploadFileUuidWaitMs]
+ * @property {number} [httpPostTimeoutMs]
  * @property {boolean} [enableWebCredentialApi]
  * @property {boolean} [allowUnauthenticatedPublicBind]
  * @property {boolean} [allowQueryAccessToken]

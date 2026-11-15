@@ -81,26 +81,176 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
     };
   }
 
-  // 2. XML / JSON gray tip (poke, essence, etc.)
+  // 2. XML / JSON gray tip (title, lucky_king, poke, essence, etc.)
   const xmlContent = gt.xmlElement?.content || gt.jsonGrayTipElement?.jsonStr || "";
   const busiId = String(gt.xmlElement?.busiId || gt.jsonGrayTipElement?.busiId || "");
   const rawTempl =
     gt.xmlElement?.templParam ||
+    gt.jsonGrayTipElement?.templParam ||
     gt.jsonGrayTipElement?.xmlToJsonParam?.templParam ||
+    gt.aioOpGrayTipElement?.templParam ||
     null;
   const getTemplParam = (key) => {
     if (!rawTempl) return undefined;
     if (rawTempl instanceof Map) return rawTempl.get(key);
+    if (Array.isArray(rawTempl)) {
+      for (const item of rawTempl) {
+        if (Array.isArray(item) && item[0] === key) return item[1];
+        if (item && typeof item === "object" && (item.key === key || item.name === key)) {
+          return item.value ?? item.val;
+        }
+      }
+      return undefined;
+    }
     if (typeof rawTempl === "object") return rawTempl[key];
     return undefined;
   };
   const isEssenceTip =
     busiId === "2401" || busiId === "2407" || xmlContent.includes("精华消息");
+  const isTitleTip =
+    busiId === "2403" ||
+    xmlContent.includes("群头衔") ||
+    xmlContent.includes("专属头衔") ||
+    Boolean(gt.groupElement?.memberTitle) ||
+    Boolean(gt.groupElement?.memberTitleNotify);
+  const isLuckyKingTip =
+    xmlContent.includes("运气王") || Boolean(gt.aioOpGrayTipElement);
   const hasTemplActor =
     getTemplParam("uin_str1") !== undefined || getTemplParam("uid_str1") !== undefined;
 
+  // Group Exclusive Title (notify / title)
+  if (isGroup && isTitleTip) {
+    const ge = gt.groupElement || {};
+    const mtObj = ge.memberTitle && typeof ge.memberTitle === "object" ? ge.memberTitle : null;
+    const mtnObj =
+      ge.memberTitleNotify && typeof ge.memberTitleNotify === "object"
+        ? ge.memberTitleNotify
+        : null;
+    let targetUin = pickPositiveUin(
+      getTemplParam("uin_str2"),
+      getTemplParam("uid_str2") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str2")) : 0,
+      getTemplParam("uin_str1"),
+      getTemplParam("uid_str1") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str1")) : 0,
+      mtnObj?.memberUin,
+      mtnObj?.memberUid ? lookupCachedUin(uinUidStore, mtnObj.memberUid) : 0,
+      mtObj?.memberUin,
+      mtObj?.memberUid ? lookupCachedUin(uinUidStore, mtObj.memberUid) : 0,
+      ge.memberUin,
+      ge.memberUid ? lookupCachedUin(uinUidStore, ge.memberUid) : 0
+    );
+    if (!targetUin && xmlContent) {
+      const uinMatches = [...xmlContent.matchAll(/(?:uin|qq|jp)="?(\d{5,12})"?/gi)]
+        .map((m) => pickPositiveUin(m[1]))
+        .filter((n) => n > 0);
+      if (uinMatches.length >= 2) {
+        targetUin = uinMatches[1];
+      } else if (uinMatches.length === 1) {
+        targetUin = uinMatches[0];
+      }
+      if (!targetUin && uinUidStore) {
+        const uidMatches = [
+          ...xmlContent.matchAll(/(?:uid(?:_str\d+)?|memberUid|targetUid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi),
+        ]
+          .map((m) => pickPositiveUin(lookupCachedUin(uinUidStore, m[1])))
+          .filter((n) => n > 0);
+        if (uidMatches.length >= 2) {
+          targetUin = uidMatches[1];
+        } else if (uidMatches.length === 1) {
+          targetUin = uidMatches[0];
+        }
+      }
+    }
+    if (!targetUin) targetUin = senderUin;
+
+    const titleMatch =
+      xmlContent.match(/获得(?:群主授予的)?["“]([^"”]+)["”](?:群|专属)?头衔/) ||
+      xmlContent.match(/(?:授予|获得)[^"“”\n]*["“]([^"”]+)["”][^"“”\n]*(?:群|专属)?头衔/);
+    const rawMemberTitle =
+      typeof ge.memberTitle === "string"
+        ? ge.memberTitle
+        : mtObj?.title ?? mtnObj?.title ?? "";
+    const title =
+      getTemplParam("title") ??
+      getTemplParam("str1") ??
+      (titleMatch ? titleMatch[1] : undefined) ??
+      rawMemberTitle ??
+      "";
+    return {
+      time,
+      self_id: selfId,
+      post_type: "notice",
+      notice_type: "notify",
+      sub_type: "title",
+      group_id: groupId,
+      user_id: targetUin,
+      title: String(title || ""),
+    };
+  }
+
+  // Red-Packet Lucky King (notify / lucky_king)
+  if (isGroup && isLuckyKingTip) {
+    const ao = gt.aioOpGrayTipElement || {};
+    let fromUin = pickPositiveUin(
+      getTemplParam("uin_str1"),
+      getTemplParam("uid_str1") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str1")) : 0,
+      ao.fromUin,
+      ao.senderUin,
+      ao.peerUin,
+      ao.fromUid ? lookupCachedUin(uinUidStore, ao.fromUid) : 0,
+      ao.senderUid ? lookupCachedUin(uinUidStore, ao.senderUid) : 0
+    );
+    let toUin = pickPositiveUin(
+      getTemplParam("uin_str2"),
+      getTemplParam("uid_str2") ? lookupCachedUin(uinUidStore, getTemplParam("uid_str2")) : 0,
+      ao.targetUin,
+      ao.luckyKingUin,
+      ao.memberUin,
+      ao.receiverUin,
+      ao.targetUid ? lookupCachedUin(uinUidStore, ao.targetUid) : 0,
+      ao.luckyKingUid ? lookupCachedUin(uinUidStore, ao.luckyKingUid) : 0,
+      ao.memberUid ? lookupCachedUin(uinUidStore, ao.memberUid) : 0
+    );
+    if ((!fromUin || !toUin) && xmlContent) {
+      const uinMatches = [...xmlContent.matchAll(/(?:uin|qq|jp)="?(\d{5,12})"?/gi)]
+        .map((m) => pickPositiveUin(m[1]))
+        .filter((n) => n > 0);
+      if (uinMatches.length >= 2) {
+        if (!fromUin) fromUin = uinMatches[0];
+        if (!toUin) toUin = uinMatches[1];
+      } else if (uinMatches.length === 1 && !toUin) {
+        toUin = uinMatches[0];
+      }
+      if ((!fromUin || !toUin) && uinUidStore) {
+        const uidMatches = [
+          ...xmlContent.matchAll(/(?:uid(?:_str\d+)?|memberUid|targetUid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi),
+        ]
+          .map((m) => pickPositiveUin(lookupCachedUin(uinUidStore, m[1])))
+          .filter((n) => n > 0);
+        if (uidMatches.length >= 2) {
+          if (!fromUin) fromUin = uidMatches[0];
+          if (!toUin) toUin = uidMatches[1];
+        } else if (uidMatches.length === 1 && !toUin) {
+          toUin = uidMatches[0];
+        }
+      }
+    }
+    if (!fromUin) fromUin = senderUin;
+    return {
+      time,
+      self_id: selfId,
+      post_type: "notice",
+      notice_type: "notify",
+      sub_type: "lucky_king",
+      group_id: groupId,
+      user_id: fromUin,
+      target_id: toUin,
+    };
+  }
+
   if (
     !isEssenceTip &&
+    !isTitleTip &&
+    !isLuckyKingTip &&
     (busiId === "1061" ||
       xmlContent.includes("poke") ||
       xmlContent.includes("戳了戳") ||

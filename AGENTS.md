@@ -20,10 +20,10 @@
 - `src/bridge_renderer.js`：注入 `BrowserWindow` 渲染层的受信任 IPC 桥接与客户端会话状态机
 - `src/types.js` & `jsconfig.json`：零编译开销的 JSDoc 协议与内部运行时类型契约及 IDE 检查配置
 - `src/bridge_onebot.js`：OneBot v11 协议与富媒体转换统一门面导出，底层拆分为 `src/onebot/`（4 个高内聚子模块）：
-  - `stores.js`：有界 LRU 31-bit 消息 ID 映射（`MessageIdStore`）与 UIN/UID 双向索引缓存（`UinUidStore`）
+  - `stores.js`：有界 LRU 31-bit 消息 ID 映射（`MessageIdStore`）与 UIN/UID 双向索引缓存（`UinUidStore`），支持防抖原子快照持久化与重启恢复
   - `cq_codec.js`：CQ 码转义/反转义与 OneBot v11 消息段/字符串双向归一化编解码
-  - `segment_converter.js`：NTQQ 内核 `elements` 与 OneBot v11 消息段双向转换及富媒体路径解析
-  - `event_formatter.js`：NTQQ 消息、灰条通知、群文件上传、好友/加群请求与元事件格式化器
+  - `segment_converter.js`：NTQQ 内核 `elements` 与 OneBot v11 消息段双向转换、非阻塞 `file://` 富媒体 URL 构建及短视频缩略图合成
+  - `event_formatter.js`：NTQQ 消息、灰条通知（撤回/戳一戳/精华/专属头衔/运气王）、群名片变更、消息表情回应、群文件上传、好友/加群请求与元事件格式化器
 - `src/core/`：零依赖核心子模块（18 个）：
   - `env.js`：`ROSMONTIS_*` / `ONEBOT_*` / `XIAO_BRIDGE_*` 多前缀环境变量统一解析器
   - `primitives.js`：有界 LRU `BoundedMap`、TTL 去重集（`TtlDedupeSet`）、临时文件清理环（`TempCleanupQueue`）、一次性事件等待器、限流日志（`BridgeLogger`）、跨进程 `Map`/`void` 无损编解码与声明式动作路由器（`createActionRouter`）
@@ -31,15 +31,15 @@
   - `echo_correlator.js`：出站 `sendMsg` 与异步 `onAddSendMsg` 真实 64-bit `msgId` 签名匹配关联器（`EchoCorrelator`）
   - `session_controller.js`：独立人类会话因果控制器（`HumanSessionController`，统筹渲染层钩子、跨进程指令回退、已读/输入去重与两级空闲退场）
   - `session_scheduler.js`：会话级亲和公平互斥锁、AIO 切换冷却、已读→输入抖动与私聊延迟响应调度器（`CausalSessionScheduler`）
-  - `nt_capture.js`：`Map.prototype.set` / `Module._load` 瞬态无痕捕获与 V8 原生原型链自动归还
-  - `renderer_ipc.js`：渲染窗口注入、受信任 IPC 鉴权、三级 `invokeNt` 调度与防重复发送保护
-  - `inbound_pipeline.js`：内核事件监听（消息、群通知、好友/加群请求、富媒体水合）与入站事件分发管线
-  - `outbound_pipeline.js`：两阶段出站发送管线（锁外富媒体准备 + 会话激活、`sendMsg` 派发与回显关联）
-  - `server_runtime.js`：内置 HTTP API、正向 WebSocket、反向 WebSocket 客户端重连与心跳/事件广播运行时
+  - `nt_capture.js`：`Map.prototype.set` / `Module._load` 瞬态无痕捕获、外部插件晚加载存量探测（`probeExistingRuntime`）与 V8 原生原型链自动归还
+  - `renderer_ipc.js`：渲染窗口注入（含已就绪窗口立即注入）、受信任 IPC 鉴权、三级 `invokeNt` 调度与防重复发送保护
+  - `inbound_pipeline.js`：内核事件监听、按会话因果串行+跨会话有界并发富媒体水合、表情回应/群名片变更及入站事件分发管线
+  - `outbound_pipeline.js`：两阶段出站发送管线（锁外图片/语音/短视频富媒体暂存 + 会话激活、`sendMsg` 派发与回显关联）
+  - `server_runtime.js`：内置 HTTP API、正向 WebSocket、反向 WebSocket 客户端重连、HTTP POST Webhook（HMAC-SHA1 `X-Signature` + Quick Operation 快速响应）与心跳/事件广播运行时
   - `ws_rfc6455.js`：RFC 6455 WebSocket 编解码、掩码校验、负载上限与反向 WS 客户端
   - `transport_security.js`：恒定时间鉴权、`Origin` 校验、非回环地址受保护模式（Protected Mode）自动鉴权与 HTTP 请求体上限
-  - `media_security.js`：媒体源 SSRF 防护、本地目录白名单校验与临时文件生命周期管理
-  - `audio_codec.js`：纯 JS 语音帧解析（SILK v3 / AMR / WAV 时长与波形提取、`\x02#!SILK_V3` 规范化）与可选 `ffmpeg` 语音编解码器
+  - `media_security.js`：媒体源 SSRF 防护、本地目录白名单校验、敏感凭据/持久化快照防泄露与临时文件生命周期管理
+  - `audio_codec.js`：纯 JS 语音帧解析（SILK v3 / AMR / WAV 时长与波形提取、`\x02#!SILK_V3` 规范化、PCM→WAV 封装）与可选外部 SILK CLI / `ffmpeg` 语音编解码器
   - `config.js`：多路径 JSON 配置与环境变量加载器
   - `web_http.js`：受限腾讯域重定向校验的 HTTPS Cookie / HTTP 文本与 JSONP 工具
   - `qzone_actions.js`：默认关闭（`enableWebCredentialApi` 显式门控）的 Web 凭据提取与 QQ 空间（QZone）动作模块

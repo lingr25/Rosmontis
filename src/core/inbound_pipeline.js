@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const { pathToFileURL } = require("url");
 
 const bridgeOnebot = require("../bridge_onebot");
 const {
@@ -29,6 +30,18 @@ function _pickPositiveUin(...candidates) {
   return picked > 0 ? String(picked) : "";
 }
 
+function _defineLocalFileUrl(target, localPath) {
+  if (!target || typeof target !== "object" || !localPath) return;
+  try {
+    Object.defineProperty(target, "__localFileUrl", {
+      value: pathToFileURL(String(localPath)).href,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch (_) {}
+}
+
 function _stripTransientMedia(ntMsg) {
   if (typeof bridgeOnebot.stripTransientNtMedia === "function") {
     try {
@@ -38,11 +51,17 @@ function _stripTransientMedia(ntMsg) {
   if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
   for (const el of ntMsg.elements) {
     if (!el || typeof el !== "object") continue;
-    if (el.picElement && "__base64Uri" in el.picElement) {
-      delete el.picElement.__base64Uri;
+    if (el.picElement && typeof el.picElement === "object") {
+      if ("__base64Uri" in el.picElement) delete el.picElement.__base64Uri;
+      if ("__localFileUrl" in el.picElement) delete el.picElement.__localFileUrl;
     }
-    if (el.pttElement && "__base64Uri" in el.pttElement) {
-      delete el.pttElement.__base64Uri;
+    if (el.pttElement && typeof el.pttElement === "object") {
+      if ("__base64Uri" in el.pttElement) delete el.pttElement.__base64Uri;
+      if ("__localFileUrl" in el.pttElement) delete el.pttElement.__localFileUrl;
+    }
+    if (el.videoElement && typeof el.videoElement === "object") {
+      if ("__base64Uri" in el.videoElement) delete el.videoElement.__base64Uri;
+      if ("__localFileUrl" in el.videoElement) delete el.videoElement.__localFileUrl;
     }
   }
 }
@@ -77,7 +96,15 @@ function _collectTemplParamUids(templParam, out) {
   if (!templParam) return;
   const checkPair = (k, v) => {
     const keyStr = String(k || "");
-    if ((keyStr === "uid_str1" || keyStr === "uid_str2") && v != null && v !== "") {
+    if (
+      (keyStr === "uid_str1" ||
+        keyStr === "uid_str2" ||
+        keyStr === "memberUid" ||
+        keyStr === "targetUid" ||
+        keyStr === "uid") &&
+      v != null &&
+      v !== ""
+    ) {
       out.push(String(v));
     }
   };
@@ -277,6 +304,47 @@ const inboundPipelineMixin = {
                 ge.shutUp.admin.uin = String(uin);
               });
             }
+            if (ge.adminNotify?.uid && !_isPositiveUin(ge.adminNotify.uin)) {
+              queueUid(ge.adminNotify.uid, (uin) => {
+                ge.adminNotify.uin = String(uin);
+              });
+            }
+            if (ge.memberTitleNotify?.memberUid && !_isPositiveUin(ge.memberTitleNotify.memberUin)) {
+              queueUid(ge.memberTitleNotify.memberUid, (uin) => {
+                ge.memberTitleNotify.memberUin = String(uin);
+              });
+            }
+            if (
+              ge.memberTitle &&
+              typeof ge.memberTitle === "object" &&
+              ge.memberTitle.memberUid &&
+              !_isPositiveUin(ge.memberTitle.memberUin)
+            ) {
+              queueUid(ge.memberTitle.memberUid, (uin) => {
+                ge.memberTitle.memberUin = String(uin);
+              });
+            }
+            if (ge.targetUid && !_isPositiveUin(ge.targetUin)) {
+              queueUid(ge.targetUid, (uin) => {
+                ge.targetUin = String(uin);
+              });
+            }
+          }
+
+          if (gt.aioOpGrayTipElement && typeof gt.aioOpGrayTipElement === "object") {
+            const ao = gt.aioOpGrayTipElement;
+            const fromUid = ao.fromUid || ao.senderUid;
+            if (fromUid && !_isPositiveUin(ao.fromUin) && !_isPositiveUin(ao.senderUin)) {
+              queueUid(fromUid, (uin) => {
+                ao.fromUin = String(uin);
+              });
+            }
+            const targetUid = ao.targetUid || ao.luckyKingUid || ao.memberUid || ao.receiverUid;
+            if (targetUid && !_isPositiveUin(ao.targetUin) && !_isPositiveUin(ao.luckyKingUin)) {
+              queueUid(targetUid, (uin) => {
+                ao.targetUin = String(uin);
+              });
+            }
           }
 
           if (gt.buddyElement && typeof gt.buddyElement === "object") {
@@ -293,9 +361,10 @@ const inboundPipelineMixin = {
           _collectTemplParamUids(gt.xmlElement?.templParam, templUids);
           _collectTemplParamUids(gt.jsonGrayTipElement?.templParam, templUids);
           _collectTemplParamUids(gt.jsonGrayTipElement?.xmlToJsonParam?.templParam, templUids);
+          _collectTemplParamUids(gt.aioOpGrayTipElement?.templParam, templUids);
           const rawTipBody = `${gt.xmlElement?.content || ""}\n${gt.jsonGrayTipElement?.jsonStr || ""}`;
           if (rawTipBody.includes("u_")) {
-            for (const m of rawTipBody.matchAll(/(?:uid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi)) {
+            for (const m of rawTipBody.matchAll(/(?:uid(?:_str\d+)?|memberUid|targetUid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi)) {
               if (m[1]) templUids.push(m[1]);
             }
           }
@@ -328,6 +397,74 @@ const inboundPipelineMixin = {
     }
   },
 
+  _getInboundMediaMaxConcurrent() {
+    const raw = Number(this.config?.inboundMediaConcurrency || 4);
+    return Number.isFinite(raw) && raw >= 1 ? Math.max(1, Math.trunc(raw)) : 4;
+  },
+
+  _acquireInboundMediaSlot() {
+    const maxConcurrent = this._getInboundMediaMaxConcurrent();
+    if (!Number.isFinite(this._inboundMediaActive) || this._inboundMediaActive < 0) {
+      this._inboundMediaActive = 0;
+    }
+    if (!Array.isArray(this._inboundMediaWaiters)) {
+      this._inboundMediaWaiters = [];
+    }
+    if (this._inboundMediaActive < maxConcurrent) {
+      this._inboundMediaActive += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this._inboundMediaWaiters.push(resolve);
+    });
+  },
+
+  _releaseInboundMediaSlot() {
+    if (!Array.isArray(this._inboundMediaWaiters)) {
+      this._inboundMediaWaiters = [];
+    }
+    const maxConcurrent = this._getInboundMediaMaxConcurrent();
+    this._inboundMediaActive = Math.max(0, (Number(this._inboundMediaActive) || 1) - 1);
+    while (this._inboundMediaActive < maxConcurrent && this._inboundMediaWaiters.length > 0) {
+      this._inboundMediaActive += 1;
+      const next = this._inboundMediaWaiters.shift();
+      next();
+    }
+  },
+
+  _enqueueInboundNtMessage(ntMsg) {
+    if (!ntMsg || typeof ntMsg !== "object") {
+      return Promise.resolve();
+    }
+    if (!(this._inboundPeerChains instanceof Map)) {
+      this._inboundPeerChains = new Map();
+    }
+    const peerChains = this._inboundPeerChains;
+    const peerKey = `${ntMsg?.chatType || 0}:${ntMsg?.peerUid || ""}`;
+    const prev = peerChains.get(peerKey) || null;
+
+    let chainEntry;
+    const taskPromise = (async () => {
+      if (prev) {
+        await prev;
+      }
+      await this._acquireInboundMediaSlot();
+      try {
+        await this._processIncomingNtMessage(ntMsg);
+      } finally {
+        this._releaseInboundMediaSlot();
+      }
+    })();
+
+    chainEntry = taskPromise.catch(() => {}).finally(() => {
+      if (peerChains.get(peerKey) === chainEntry) {
+        peerChains.delete(peerKey);
+      }
+    });
+    peerChains.set(peerKey, chainEntry);
+    return taskPromise;
+  },
+
   async _handleKernelEvent(_listenerName, eventName, args) {
     const firstArg = args && args.length > 0 ? args[0] : undefined;
 
@@ -338,8 +475,9 @@ const inboundPipelineMixin = {
         : Array.isArray(firstArg?.msgList)
         ? firstArg.msgList
         : [];
-      for (const ntMsg of msgList) {
-        await this._processIncomingNtMessage(ntMsg);
+      if (msgList.length > 0) {
+        const tasksForThisBatch = msgList.map((ntMsg) => this._enqueueInboundNtMessage(ntMsg));
+        await Promise.all(tasksForThisBatch);
       }
       return;
     }
@@ -374,11 +512,15 @@ const inboundPipelineMixin = {
     }
 
     // 3. Message updates (recalls, PTT transcription completion, emoji likes, async media updates)
-    if (eventName === "onMsgInfoListUpdate") {
+    if (eventName === "onMsgInfoListUpdate" || eventName === "onMsgEmojiLikesListChanged") {
       const msgList = Array.isArray(firstArg)
         ? firstArg
         : Array.isArray(firstArg?.msgList)
         ? firstArg.msgList
+        : firstArg &&
+          typeof firstArg === "object" &&
+          (firstArg.msgId || Array.isArray(firstArg.emojiLikesList))
+        ? [firstArg]
         : [];
       for (const ntMsg of msgList) {
         if (!ntMsg || typeof ntMsg !== "object") continue;
@@ -393,7 +535,7 @@ const inboundPipelineMixin = {
           }
         }
 
-        if (_isRecallMsg(ntMsg)) {
+        if (eventName === "onMsgInfoListUpdate" && _isRecallMsg(ntMsg)) {
           const recallTag =
             ntMsg.recallTime && String(ntMsg.recallTime) !== "0"
               ? String(ntMsg.recallTime)
@@ -416,8 +558,10 @@ const inboundPipelineMixin = {
           }
         } else {
           await this._resolveNtMsgUids(ntMsg);
+          let hit = null;
+          let oneBotId = 0;
           try {
-            const hit =
+            hit =
               this.messageIdStore?.resolveByNtKey?.(ntMsg.chatType, ntMsg.peerUid, ntMsg.msgId) ||
               (ntMsg.msgId ? this.messageIdStore?.getByMsgId?.(ntMsg.msgId) : null) ||
               (ntMsg.peerUid && ntMsg.msgSeq
@@ -428,28 +572,98 @@ const inboundPipelineMixin = {
                   )
                 : null);
             if (hit) {
-              if (hit.rawMsg !== null && hit.rawMsg !== undefined) {
-                hit.rawMsg = ntMsg;
-              } else {
-                this.messageIdStore?.register?.(
-                  ntMsg.msgId,
-                  {
-                    chatType: Number(ntMsg.chatType || 1),
-                    peerUid: String(ntMsg.peerUid || ""),
-                    guildId: String(ntMsg.guildId || ""),
-                  },
-                  ntMsg.msgSeq,
-                  {
-                    ...(ntMsg.senderUin ? { senderUin: String(ntMsg.senderUin) } : {}),
-                    ...(ntMsg.senderUid ? { senderUid: String(ntMsg.senderUid) } : {}),
-                    rawMsg: ntMsg,
-                  }
-                );
+              if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
+                if (hit.rawMsg !== null && hit.rawMsg !== undefined) {
+                  hit.rawMsg = ntMsg;
+                } else {
+                  this.messageIdStore?.register?.(
+                    ntMsg.msgId,
+                    {
+                      chatType: Number(ntMsg.chatType || 1),
+                      peerUid: String(ntMsg.peerUid || ""),
+                      guildId: String(ntMsg.guildId || ""),
+                    },
+                    ntMsg.msgSeq,
+                    {
+                      ...(ntMsg.senderUin ? { senderUin: String(ntMsg.senderUin) } : {}),
+                      ...(ntMsg.senderUid ? { senderUid: String(ntMsg.senderUid) } : {}),
+                      rawMsg: ntMsg,
+                    }
+                  );
+                }
               }
-              const oneBotId = hit.oneBotId ?? hit.shortId;
-              this.messageIdStore?.indexMsgMedia?.(ntMsg, oneBotId);
-            } else {
+              oneBotId = hit.oneBotId ?? hit.shortId;
+              if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
+                this.messageIdStore?.indexMsgMedia?.(ntMsg, oneBotId);
+              }
+            } else if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
               this.messageIdStore?.indexMsgMedia?.(ntMsg);
+            }
+
+            if (Array.isArray(ntMsg.emojiLikesList)) {
+              if (!(this._emojiLikesSnapshot instanceof Map)) {
+                this._emojiLikesSnapshot = new Map();
+              }
+              const snapshotKey = String(
+                ntMsg.msgId || `${ntMsg.chatType || 0}:${ntMsg.peerUid || ""}:${ntMsg.msgSeq || ""}`
+              );
+              const likes = ntMsg.emojiLikesList
+                .filter((item) => item && typeof item === "object")
+                .map((item) => ({
+                  emoji_id: String(item.emojiId ?? item.emoji_id ?? ""),
+                  emoji_type: Number(item.emojiType ?? item.emoji_type ?? 1),
+                  count: Number(item.likesCnt ?? item.count ?? 1),
+                }));
+              if (likes.length === 0) {
+                if (snapshotKey) {
+                  this._emojiLikesSnapshot.delete(snapshotKey);
+                }
+              } else {
+                const serializedSnapshot = likes
+                  .map((x) => `${x.emoji_type}:${x.emoji_id}:${x.count}`)
+                  .sort()
+                  .join(",");
+                const prevSnapshot = snapshotKey
+                  ? this._emojiLikesSnapshot.get(snapshotKey)
+                  : undefined;
+                if (
+                  prevSnapshot !== serializedSnapshot ||
+                  eventName === "onMsgEmojiLikesListChanged"
+                ) {
+                  if (snapshotKey) {
+                    setBoundedMap(this._emojiLikesSnapshot, snapshotKey, serializedSnapshot, 2000);
+                  }
+                  const effectiveChatType = Number(ntMsg.chatType || hit?.peer?.chatType || 0);
+                  const groupId = pickPositiveUin(
+                    ntMsg.peerUid,
+                    ntMsg.peerUin,
+                    hit?.peer?.peerUid,
+                    hit?.groupId
+                  );
+                  if (effectiveChatType === 2 && groupId > 0) {
+                    const userId = Number(
+                      pickPositiveUin(
+                        ntMsg.senderUin,
+                        ntMsg.senderUid ? this.uinUidStore?.getUinSync?.(ntMsg.senderUid) : 0,
+                        hit?.senderUin,
+                        hit?.senderUid ? this.uinUidStore?.getUinSync?.(hit.senderUid) : 0
+                      ) || 0
+                    );
+                    this._dispatchInboundEvent(
+                      formatNoticeEvent(
+                        "group_msg_emoji_like",
+                        {
+                          group_id: groupId,
+                          user_id: userId,
+                          message_id: Number(oneBotId || 0),
+                          likes,
+                        },
+                        { selfId: this.selfUin }
+                      )
+                    );
+                  }
+                }
+              }
             }
           } finally {
             _stripTransientMedia(ntMsg);
@@ -736,10 +950,143 @@ const inboundPipelineMixin = {
 
     // 8. Group member info change
     if (eventName === "onMemberInfoChange") {
-      const groupCode = String(firstArg || "");
-      const members = args[2] || args[1];
+      const rawObj = firstArg && typeof firstArg === "object" ? firstArg : null;
+      const groupCode = String(
+        (rawObj
+          ? rawObj.groupCode ?? rawObj.groupUin ?? rawObj.group_id ?? ""
+          : firstArg) || ""
+      );
+      const members =
+        args[2] ||
+        args[1] ||
+        (rawObj
+          ? rawObj.members ??
+            rawObj.infos ??
+            rawObj.result?.infos ??
+            (rawObj.cardName !== undefined ||
+            rawObj.cardNew !== undefined ||
+            rawObj.card_new !== undefined
+              ? [rawObj]
+              : null)
+          : null);
       if (groupCode && members) {
         this.uinUidStore.rememberFromGroupMemberList(groupCode, members);
+
+        const groupId = pickPositiveUin(groupCode);
+        if (groupId > 0) {
+          if (!(this._memberCardCache instanceof Map)) {
+            this._memberCardCache = new Map();
+          }
+          let infos = members;
+          if (members && typeof members === "object") {
+            if (members.result && members.result.infos) {
+              infos = members.result.infos;
+            } else if (members.infos) {
+              infos = members.infos;
+            }
+          }
+          const entries =
+            infos instanceof Map
+              ? Array.from(infos.entries())
+              : Array.isArray(infos)
+              ? infos.map((m, idx) => [m?.uid || String(idx), m])
+              : infos && typeof infos === "object"
+              ? Object.entries(infos)
+              : [];
+          const explicitBatchCardChange = Boolean(
+            args[1] === "card" ||
+              rawObj?.changeType === "card" ||
+              rawObj?.subType === "card" ||
+              rawObj?.sub_type === "card"
+          );
+
+          for (const [entryKey, m] of entries) {
+            if (!m || typeof m !== "object") continue;
+            const hasCardField =
+              m.cardName !== undefined ||
+              m.card !== undefined ||
+              m.memberCard !== undefined ||
+              m.cardNew !== undefined ||
+              m.card_new !== undefined;
+            if (!hasCardField) continue;
+
+            const cardNew = String(
+              m.cardName ?? m.cardNew ?? m.card_new ?? m.card ?? m.memberCard?.memberCard ?? ""
+            );
+            const uid = String(
+              m.uid || (typeof entryKey === "string" && entryKey.startsWith("u_") ? entryKey : "") || ""
+            );
+            let uin = pickPositiveUin(
+              m.uin,
+              m.user_id,
+              uid ? this.uinUidStore?.getUinSync?.(uid) : 0,
+              typeof entryKey === "string" && /^\d+$/.test(entryKey) ? entryKey : 0
+            );
+
+            const uinCacheKey = uin > 0 ? `${groupId}:${uin}` : "";
+            const uidCacheKey = uid ? `${groupId}:${uid}` : "";
+            const existingKey =
+              (uinCacheKey && this._memberCardCache.has(uinCacheKey) ? uinCacheKey : "") ||
+              (uidCacheKey && this._memberCardCache.has(uidCacheKey) ? uidCacheKey : "");
+            const hasExplicitOld =
+              m.cardOld !== undefined || m.card_old !== undefined || m.oldCardName !== undefined;
+
+            if (existingKey) {
+              const cardOld = String(this._memberCardCache.get(existingKey) ?? "");
+              if (!uin && uid) {
+                const resolved = await this._ensureUinForUid(uid);
+                uin = pickPositiveUin(resolved);
+              }
+              const targetCacheKey = uin > 0 ? `${groupId}:${uin}` : existingKey;
+              if (existingKey !== targetCacheKey) {
+                this._memberCardCache.delete(existingKey);
+              }
+              setBoundedMap(this._memberCardCache, targetCacheKey, cardNew, 5000);
+              if (cardNew !== cardOld && uin > 0) {
+                this._dispatchInboundEvent(
+                  formatNoticeEvent(
+                    "group_card",
+                    {
+                      group_id: Number(groupId),
+                      user_id: uin,
+                      card_new: cardNew,
+                      card_old: cardOld,
+                    },
+                    { selfId: this.selfUin }
+                  )
+                );
+              }
+            } else {
+              if ((hasExplicitOld || explicitBatchCardChange) && !uin && uid) {
+                const resolved = await this._ensureUinForUid(uid);
+                uin = pickPositiveUin(resolved);
+              }
+              const targetCacheKey = uin > 0 ? `${groupId}:${uin}` : uidCacheKey;
+              if (targetCacheKey) {
+                setBoundedMap(this._memberCardCache, targetCacheKey, cardNew, 5000);
+              }
+              if ((hasExplicitOld || explicitBatchCardChange) && uin > 0) {
+                const cardOld = hasExplicitOld
+                  ? String(m.cardOld ?? m.card_old ?? m.oldCardName ?? "")
+                  : "";
+                if (!hasExplicitOld || cardNew !== cardOld) {
+                  this._dispatchInboundEvent(
+                    formatNoticeEvent(
+                      "group_card",
+                      {
+                        group_id: Number(groupId),
+                        user_id: uin,
+                        card_new: cardNew,
+                        card_old: cardOld,
+                      },
+                      { selfId: this.selfUin }
+                    )
+                  );
+                }
+              }
+            }
+          }
+        }
       }
       return;
     }
@@ -977,10 +1324,9 @@ const inboundPipelineMixin = {
         ) {
           continue;
         }
-        if (Number(pe.fileSize || 0) > maxPicBytes) continue;
-
         let localPath = String(pe.sourcePath || "").trim();
         let st = await _statPositiveFile(localPath);
+        if (!st && Number(pe.fileSize || 0) > maxPicBytes) continue;
 
         if (!st && !localPath && pe.md5HexStr && this._isNtReady()) {
           try {
@@ -1073,6 +1419,7 @@ const inboundPipelineMixin = {
 
         if (st && st.size > 0 && localPath) {
           pe.sourcePath = localPath;
+          _defineLocalFileUrl(pe, localPath);
           if (st.size <= maxPicBytes) {
             try {
               const buf = await fs.promises.readFile(localPath);
@@ -1154,6 +1501,7 @@ const inboundPipelineMixin = {
 
         if (st && st.size > 0 && localPath) {
           ptt.filePath = localPath;
+          _defineLocalFileUrl(ptt, localPath);
           if (st.size <= maxPttBytes) {
             try {
               const buf = await fs.promises.readFile(localPath);
@@ -1168,6 +1516,19 @@ const inboundPipelineMixin = {
             }
           }
         }
+        continue;
+      }
+
+      if (elType === 5 && el.videoElement) {
+        const ve = el.videoElement;
+        if (ve.__localFileUrl) continue;
+        const localPath = String(ve.filePath || ve.sourcePath || "").trim();
+        const st = await _statPositiveFile(localPath);
+        if (st && st.size > 0 && localPath) {
+          ve.filePath = localPath;
+          _defineLocalFileUrl(ve, localPath);
+        }
+        continue;
       }
     }
 

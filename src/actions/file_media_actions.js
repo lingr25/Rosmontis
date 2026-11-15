@@ -511,29 +511,100 @@ async function listGroupFiles(bridge, groupId, folderId, options = {}) {
   return { files, folders };
 }
 
+function inspectMsgFileElement(msg) {
+  const fileElement = msg?.elements?.find((e) => e?.fileElement)?.fileElement || null;
+  const fileUuid = fileElement ? String(fileElement.fileUuid || "") : "";
+  return { fileElement, fileUuid };
+}
+
 async function extractUploadedFileUuid(bridge, peer, sent) {
   const entry = resolveMessageEntry(bridge, sent.message_id);
-  let fileUuid = String(
-    entry?.rawMsg?.elements?.find((e) => e?.fileElement)?.fileElement?.fileUuid || ""
-  );
+  let { fileElement: storeFileEl, fileUuid } = inspectMsgFileElement(entry?.rawMsg);
+  if (fileUuid) return fileUuid;
+
   if (
-    !fileUuid &&
-    sent.real_id &&
-    !/^(sent_|fwd_|echo_timeout_)/.test(String(sent.real_id))
+    !sent.real_id ||
+    /^(sent_|fwd_|echo_timeout_)/.test(String(sent.real_id))
   ) {
+    return "";
+  }
+
+  const msgIdStr = String(sent.real_id);
+  let fetchedFileEl = null;
+  let hasMsgList = false;
+  let invokeFailed = false;
+  try {
+    const res = await bridge.invokeNt(
+      "nodeIKernelMsgService/getMsgsByMsgId",
+      { peer, msgIds: [msgIdStr] },
+      [peer, [msgIdStr]]
+    );
+    hasMsgList = Array.isArray(res?.msgList) && res.msgList.length > 0;
+    const inspected = inspectMsgFileElement(res?.msgList?.[0]);
+    fetchedFileEl = inspected.fileElement;
+    fileUuid = inspected.fileUuid;
+  } catch (_) {
+    invokeFailed = true;
+  }
+  if (fileUuid) return fileUuid;
+
+  const rawMaxWait = Number(bridge.config?.uploadFileUuidWaitMs ?? 2000);
+  const maxWaitMs = Number.isFinite(rawMaxWait) && rawMaxWait > 0 ? rawMaxWait : 0;
+  if (maxWaitMs <= 0) return "";
+
+  const explicitWaitConfigured =
+    bridge.config?.uploadFileUuidWaitMs !== undefined &&
+    Number(bridge.config.uploadFileUuidWaitMs) > 0;
+  const pollIntervals = [80, 160, 320, 500, 800];
+  let elapsed = 0;
+  let attempt = 0;
+
+  while (elapsed < maxWaitMs) {
+    const stepMs =
+      attempt < pollIntervals.length
+        ? pollIntervals[attempt]
+        : pollIntervals[pollIntervals.length - 1];
+    const waitMs = Math.min(stepMs, maxWaitMs - elapsed);
+    if (waitMs <= 0) break;
+
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    elapsed += waitMs;
+    attempt += 1;
+
+    const updatedEntry = resolveMessageEntry(bridge, sent.message_id);
+    const storeInspected = inspectMsgFileElement(updatedEntry?.rawMsg);
+    if (storeInspected.fileUuid) return storeInspected.fileUuid;
+    storeFileEl = storeInspected.fileElement;
+
+    invokeFailed = false;
+    hasMsgList = false;
+    fetchedFileEl = null;
     try {
       const res = await bridge.invokeNt(
         "nodeIKernelMsgService/getMsgsByMsgId",
-        { peer, msgIds: [String(sent.real_id)] },
-        [peer, [String(sent.real_id)]]
+        { peer, msgIds: [msgIdStr] },
+        [peer, [msgIdStr]]
       );
-      const fetched = res?.msgList?.[0];
-      fileUuid = String(
-        fetched?.elements?.find((e) => e?.fileElement)?.fileElement?.fileUuid || ""
-      );
-    } catch (_) {}
+      hasMsgList = Array.isArray(res?.msgList) && res.msgList.length > 0;
+      const inspected = inspectMsgFileElement(res?.msgList?.[0]);
+      if (inspected.fileUuid) return inspected.fileUuid;
+      fetchedFileEl = inspected.fileElement;
+    } catch (_) {
+      invokeFailed = true;
+    }
+
+    const activeFileEl = fetchedFileEl || storeFileEl;
+    if (invokeFailed && !storeFileEl) break;
+    if (!hasMsgList && !activeFileEl) break;
+    if (!activeFileEl) break;
+    if (!explicitWaitConfigured && activeFileEl.transferStatus !== undefined) {
+      const statusNum = Number(activeFileEl.transferStatus);
+      // Stop early if NTQQ reports terminal failure/cancel status with no fileUuid
+      if (statusNum === 5 || statusNum === 6) break;
+    }
   }
-  return fileUuid;
+
+  return "";
 }
 
 function trackActionTempMedia(bridge, media) {
@@ -553,6 +624,7 @@ async function maybeTranscodeGetRecordOutput(bridge, action, rawOutFormat, local
   const converted = await transcodeRecordOutFormat(localPath, rawOutFormat, {
     ...(typeof bridge._mediaSecurityOptions === "function" ? bridge._mediaSecurityOptions() : {}),
     ffmpegPath: bridge.config?.ffmpegPath,
+    silkDecoderPath: bridge.config?.silkDecoderPath,
   });
   if (!converted) return null;
   trackActionTempMedia(bridge, converted);
@@ -1129,22 +1201,67 @@ const ACTION_HANDLERS = {
     ]);
     const fileUuid = await extractUploadedFileUuid(this, peer, sent);
     if (folder && folder !== "/" && fileUuid) {
-      try {
-        const { busId } = await resolveGroupFileMeta(this, groupIdStr, fileUuid, p.busid);
-        const busIdList = [busId];
-        const fileIdList = [String(fileUuid)];
-        await this.invokeNt(
-          "nodeIKernelRichMediaService/moveGroupFile",
-          {
-            groupId: groupIdStr,
-            busIdList,
-            fileIdList,
-            curFolderId: "/",
-            dstFolderId: folder,
-          },
-          [groupIdStr, busIdList, fileIdList, "/", folder]
+      const retryBackoffs = [120, 250];
+      let lastMoveErr = null;
+      for (let attempt = 0; attempt <= retryBackoffs.length; attempt += 1) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, retryBackoffs[attempt - 1]));
+        }
+        try {
+          const { busId } = await resolveGroupFileMeta(this, groupIdStr, fileUuid, p.busid);
+          const busIdList = [busId];
+          const fileIdList = [String(fileUuid)];
+          const moveRes = await this.invokeNt(
+            "nodeIKernelRichMediaService/moveGroupFile",
+            {
+              groupId: groupIdStr,
+              busIdList,
+              fileIdList,
+              curFolderId: "/",
+              dstFolderId: folder,
+            },
+            [groupIdStr, busIdList, fileIdList, "/", folder]
+          );
+          const topResult =
+            moveRes &&
+            typeof moveRes === "object" &&
+            moveRes.result !== undefined &&
+            moveRes.result !== null &&
+            typeof moveRes.result !== "object"
+              ? Number(moveRes.result)
+              : 0;
+          const innerRetCode = Number(moveRes?.moveGroupFileResult?.result?.retCode ?? 0);
+          const errCode =
+            Number.isFinite(topResult) && topResult !== 0
+              ? topResult
+              : Number.isFinite(innerRetCode) && innerRetCode !== 0
+              ? innerRetCode
+              : 0;
+          if (errCode !== 0) {
+            const errMsg = String(
+              moveRes?.errMsg ||
+                moveRes?.moveGroupFileResult?.result?.retMsg ||
+                `result=${errCode}`
+            );
+            lastMoveErr = new Error(`moveGroupFile failed (${errMsg})`);
+            continue;
+          }
+          lastMoveErr = null;
+          break;
+        } catch (err) {
+          lastMoveErr = err;
+        }
+      }
+      if (lastMoveErr) {
+        this.logger?.warn?.(
+          `[Rosmontis] upload_group_file failed to move file ${fileUuid} into folder ${folder} in group ${groupIdStr}: ${
+            lastMoveErr?.message || lastMoveErr
+          }`
         );
-      } catch (_) {}
+        if (this.config?.strictUploadGroupFileFolderMove) {
+          throw lastMoveErr;
+        }
+      }
     }
     return {
       file_id: String(fileUuid || sent.real_id || sent.message_id),

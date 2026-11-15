@@ -187,6 +187,31 @@ function resolveFfmpegPathFromEnv(explicitFfmpegPath) {
   return pickPrefixedEnv("FFMPEG_PATH", ["FFMPEG_PATH"]) || "ffmpeg";
 }
 
+function resolveSilkDecoderPathFromEnv(explicitPath) {
+  if (typeof explicitPath === "string" && explicitPath.trim() !== "") {
+    return explicitPath.trim();
+  }
+  return (
+    pickPrefixedEnv("SILK_DECODER_PATH", ["SILK_DECODER_PATH"]) ||
+    pickPrefixedEnv("SILK_CODEC_PATH", ["SILK_CODEC_PATH"]) ||
+    ""
+  );
+}
+
+function resolveSilkEncoderPathFromEnv(explicitPath) {
+  if (typeof explicitPath === "string" && explicitPath.trim() !== "") {
+    return explicitPath.trim();
+  }
+  return pickPrefixedEnv("SILK_ENCODER_PATH", ["SILK_ENCODER_PATH"]) || "";
+}
+
+function resolveStateDirFromEnv(explicitStateDir) {
+  if (typeof explicitStateDir === "string" && explicitStateDir.trim() !== "") {
+    return explicitStateDir.trim();
+  }
+  return pickPrefixedEnv("STATE_DIR") || "";
+}
+
 function resolveConfigDirsFromEnv() {
   const env = _getEnv();
   return [
@@ -218,5 +243,8 @@ module.exports = {
   getXdgConfigHome,
   resolveTempDirFromEnv,
   resolveFfmpegPathFromEnv,
+  resolveSilkDecoderPathFromEnv,
+  resolveSilkEncoderPathFromEnv,
+  resolveStateDirFromEnv,
   resolveConfigDirsFromEnv,
 };

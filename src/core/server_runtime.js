@@ -1,6 +1,7 @@
 "use strict";
 
 const http = require("http");
+const https = require("https");
 const crypto = require("crypto");
 
 const { formatMetaEvent } = require("../bridge_onebot");
@@ -55,6 +56,30 @@ function buildFailedActionReply(retcode, message, echo = undefined) {
     wording: msg,
     ...(echo !== undefined ? { echo } : {}),
   };
+}
+
+const MAX_WEBHOOK_RESPONSE_BYTES = 1024 * 1024;
+const QUICK_OP_KEYS = Object.freeze([
+  "reply",
+  "auto_escape",
+  "at_sender",
+  "delete",
+  "kick",
+  "ban",
+  "ban_duration",
+  "approve",
+  "reason",
+  "remark",
+]);
+
+function hasMeaningfulQuickOperation(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  for (const key of QUICK_OP_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(obj, key) && obj[key] !== undefined) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const serverRuntimeMixin = {
@@ -503,6 +528,159 @@ const serverRuntimeMixin = {
     connectOnce();
   },
 
+  _dispatchHttpWebhookEvent(event) {
+    const clients = this.config?.httpClients;
+    if (!Array.isArray(clients) || clients.length === 0) return [];
+    const tasks = [];
+    for (const clientCfg of clients) {
+      if (!clientCfg || clientCfg.enable === false || clientCfg.enabled === false) continue;
+      if (!clientCfg.url) continue;
+      if (event.post_type === "message_sent" && !clientCfg.reportSelfMessage) continue;
+      if (
+        event.post_type === "meta_event" &&
+        event.meta_event_type === "heartbeat" &&
+        clientCfg.enableHeartbeat === false
+      ) {
+        continue;
+      }
+      tasks.push(
+        this._postEventToHttpClient(clientCfg, event).catch((err) => {
+          const warnKey = `webhook-err:${clientCfg.name || clientCfg.url}`;
+          this._logWarn?.(
+            warnKey,
+            `HTTP POST webhook delivery failed (${clientCfg.url}): ${err?.message || err}`,
+            60000
+          );
+        })
+      );
+    }
+    return tasks;
+  },
+
+  async _postEventToHttpClient(clientCfg, event) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(String(clientCfg.url));
+    } catch (_) {
+      return null;
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      return null;
+    }
+
+    const defaultFormat = this.config?.messageFormat || "array";
+    const targetFormat = clientCfg.messageFormat || defaultFormat;
+    const formatted =
+      typeof this._formatEventForEndpoint === "function"
+        ? this._formatEventForEndpoint(event, targetFormat)
+        : event;
+    const bodyBuf = Buffer.from(JSON.stringify(formatted), "utf8");
+    const headers = {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": String(bodyBuf.length),
+      "X-Self-ID": sanitizeHeaderValue(String(formatted?.self_id || this.selfUin || "0")),
+      "User-Agent": "OneBot/11 Rosmontis/1.0.0",
+    };
+    if (clientCfg.accessToken) {
+      headers["Authorization"] = `Bearer ${sanitizeHeaderValue(clientCfg.accessToken)}`;
+    }
+    if (clientCfg.secret !== undefined && clientCfg.secret !== null && String(clientCfg.secret) !== "") {
+      const sig = crypto
+        .createHmac("sha1", String(clientCfg.secret))
+        .update(bodyBuf)
+        .digest("hex");
+      headers["X-Signature"] = `sha1=${sig}`;
+    }
+
+    const timeoutMs = Math.max(
+      500,
+      Number(clientCfg.timeoutMs || this.config?.httpPostTimeoutMs || 5000)
+    );
+    const transport = parsedUrl.protocol === "https:" ? https : http;
+    if (!(this._activeWebhookReqs instanceof Set)) {
+      this._activeWebhookReqs = new Set();
+    }
+
+    const resp = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (err, val) => {
+        if (settled) return;
+        settled = true;
+        this._activeWebhookReqs.delete(req);
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      const req = transport.request(
+        parsedUrl,
+        {
+          method: "POST",
+          headers,
+          timeout: timeoutMs,
+        },
+        (res) => {
+          const chunks = [];
+          let total = 0;
+          let overflow = false;
+          res.on("data", (chunk) => {
+            if (overflow) return;
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            total += buf.length;
+            if (total > MAX_WEBHOOK_RESPONSE_BYTES) {
+              overflow = true;
+              res.destroy();
+              finish(new Error("Webhook response exceeded 1 MiB limit"));
+              return;
+            }
+            chunks.push(buf);
+          });
+          res.on("end", () => {
+            if (overflow) return;
+            finish(null, {
+              statusCode: Number(res.statusCode || 0),
+              bodyText: Buffer.concat(chunks).toString("utf8"),
+            });
+          });
+          res.on("error", (err) => finish(err));
+        }
+      );
+
+      this._activeWebhookReqs.add(req);
+      req.on("timeout", () => {
+        req.destroy(new Error(`Webhook request timed out after ${timeoutMs}ms`));
+      });
+      req.on("error", (err) => finish(err));
+      req.end(bodyBuf);
+    });
+
+    if (
+      resp &&
+      resp.statusCode >= 200 &&
+      resp.statusCode < 300 &&
+      resp.statusCode !== 204 &&
+      resp.bodyText &&
+      resp.bodyText.trim()
+    ) {
+      let quickOp = null;
+      try {
+        quickOp = JSON.parse(resp.bodyText);
+      } catch (_) {}
+      if (
+        hasMeaningfulQuickOperation(quickOp) &&
+        (formatted.post_type === "message" || formatted.post_type === "request")
+      ) {
+        const actionContext = buildEndpointActionContext(clientCfg, defaultFormat);
+        await this.handleOneBotAction(
+          ".handle_quick_operation",
+          { context: formatted, operation: quickOp },
+          undefined,
+          actionContext
+        );
+      }
+    }
+    return resp;
+  },
+
   async stopServers() {
     this._aioInteractionSeq += 1;
     this._clearIdleTimers();
@@ -536,6 +714,19 @@ const serverRuntimeMixin = {
     }
     this._httpServers = [];
     this._wsServers = [];
+    if (this._activeWebhookReqs instanceof Set) {
+      for (const req of Array.from(this._activeWebhookReqs)) {
+        try {
+          req.destroy();
+        } catch (_) {}
+      }
+      this._activeWebhookReqs.clear();
+    }
+    if (typeof this.flushStateStores === "function") {
+      try {
+        await this.flushStateStores();
+      } catch (_) {}
+    }
     this.flushTempCleanup();
   },
 };

@@ -3,8 +3,16 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { pathToFileURL } = require("url");
 
 function buildNtMarketFaceUrl(marketFaceElement) {
+  if (typeof marketFaceElement === "string") {
+    const emojiId = marketFaceElement.trim().toLowerCase();
+    if (/^[0-9a-f]{4,64}$/.test(emojiId)) {
+      return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw300.gif`;
+    }
+    return "";
+  }
   if (!marketFaceElement || typeof marketFaceElement !== "object") return "";
   if (typeof marketFaceElement.__base64Uri === "string" && marketFaceElement.__base64Uri) {
     return marketFaceElement.__base64Uri;
@@ -20,21 +28,16 @@ function buildNtMarketFaceUrl(marketFaceElement) {
   const candidatePaths = [
     marketFaceElement.dynamicFacePath,
     marketFaceElement.staticFacePath,
-  ]
-    .map((p) => String(p || "").trim())
-    .filter(Boolean);
-  for (const localPath of candidatePaths) {
+  ];
+  for (const rawPath of candidatePaths) {
+    if (typeof rawPath !== "string") continue;
+    const localPath = rawPath.trim();
+    if (!localPath) continue;
     try {
-      if (fs.existsSync(localPath)) {
-        const st = fs.statSync(localPath);
-        if (st.isFile() && st.size > 0) {
-          if (st.size <= 10 * 1024 * 1024) {
-            return `base64://${fs.readFileSync(localPath).toString("base64")}`;
-          }
-          return `file://${localPath}`;
-        }
-      }
-    } catch (_) {}
+      return pathToFileURL(localPath).href;
+    } catch (_) {
+      return `file://${localPath}`;
+    }
   }
   return "";
 }
@@ -51,25 +54,158 @@ function pickPositiveUin(...candidates) {
   return 0;
 }
 
+function createPersistState() {
+  return {
+    enabled: false,
+    filePath: "",
+    debounceMs: 2000,
+    timer: null,
+    dirty: false,
+    running: false,
+    pendingBatch: null,
+    queue: [],
+  };
+}
+
+async function atomicWriteSnapshot(filePath, getSnapshot) {
+  const dir = path.dirname(filePath);
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  const payload = JSON.stringify(getSnapshot());
+  try {
+    await fs.promises.writeFile(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
+    try {
+      await fs.promises.rename(tmpPath, filePath);
+    } catch (renameErr) {
+      if (
+        renameErr &&
+        (renameErr.code === "EEXIST" ||
+          renameErr.code === "EPERM" ||
+          renameErr.code === "EACCES")
+      ) {
+        try {
+          await fs.promises.unlink(filePath);
+        } catch (unlinkErr) {
+          if (unlinkErr && unlinkErr.code !== "ENOENT") {
+            throw renameErr;
+          }
+        }
+        await fs.promises.rename(tmpPath, filePath);
+      } else {
+        throw renameErr;
+      }
+    }
+  } catch (err) {
+    try {
+      await fs.promises.unlink(tmpPath);
+    } catch (_) {}
+    throw err;
+  }
+}
+
+async function drainPersistQueue(state, getSnapshot) {
+  if (state.running) return;
+  state.running = true;
+  try {
+    while (state.queue.length > 0) {
+      const batch = state.queue.shift();
+      if (state.pendingBatch === batch) {
+        state.pendingBatch = null;
+      }
+      try {
+        await atomicWriteSnapshot(batch.filePath, getSnapshot);
+        batch.resolve(true);
+      } catch (err) {
+        batch.reject(err);
+      }
+    }
+  } finally {
+    state.running = false;
+  }
+}
+
+function enqueueCoalescedSave(state, filePath, getSnapshot) {
+  const targetPath = typeof filePath === "string" ? filePath.trim() : "";
+  if (!targetPath) {
+    return Promise.reject(new Error("saveToFile requires a non-empty filePath"));
+  }
+  if (state.running && state.pendingBatch && state.pendingBatch.filePath === targetPath) {
+    return state.pendingBatch.promise;
+  }
+  let resolveBatch;
+  let rejectBatch;
+  const promise = new Promise((resolve, reject) => {
+    resolveBatch = resolve;
+    rejectBatch = reject;
+  });
+  const batch = {
+    filePath: targetPath,
+    promise,
+    resolve: resolveBatch,
+    reject: rejectBatch,
+  };
+  state.queue.push(batch);
+  if (state.running) {
+    state.pendingBatch = batch;
+  } else {
+    drainPersistQueue(state, getSnapshot);
+  }
+  return promise;
+}
+
 // ============================================================================
 // 1. MessageIdStore (Bounded LRU, 32-bit positive integer OneBot message_id)
 // ============================================================================
 
 class MessageIdStore {
-  constructor(maxEntries = 10000, maxRawEntries = 256) {
+  constructor(maxEntries = 10000, maxRawEntries = 256, options = {}) {
+    if (maxEntries && typeof maxEntries === "object") {
+      options = maxEntries;
+      maxEntries = options.maxEntries ?? 10000;
+      maxRawEntries = options.maxRawEntries ?? 256;
+    }
     this.maxEntries = Math.max(2, Number(maxEntries) || 10000);
     const parsedMaxRaw =
       maxRawEntries !== undefined && maxRawEntries !== null ? Number(maxRawEntries) : 256;
     this.maxRawEntries =
       Number.isFinite(parsedMaxRaw) && parsedMaxRaw >= 0 ? Math.trunc(parsedMaxRaw) : 256;
+    const rawMaxMedia =
+      typeof options === "number"
+        ? options
+        : options && typeof options === "object"
+        ? options.maxMediaKeys
+        : undefined;
+    this.maxMediaKeys =
+      rawMaxMedia !== undefined && rawMaxMedia !== null && Number(rawMaxMedia) > 0
+        ? Math.max(1, Math.trunc(Number(rawMaxMedia)))
+        : Math.max(64, this.maxEntries * 4);
     this.byShortId = new Map();
     this.byOneBotId = this.byShortId;
     this.byMsgId = new Map();
+    this.byPeerMsgId = this.byMsgId;
     this.byPeerSeq = new Map();
     this._rawIds = new Set();
     this.byMediaKey = new Map();
     this.byForwardId = new Map();
     this._seqCounter = 100000;
+    this._persist = createPersistState();
+  }
+
+  _setMediaKey(key, desc) {
+    this.byMediaKey.delete(key);
+    this.byMediaKey.set(key, desc);
+    while (this.byMediaKey.size > this.maxMediaKeys) {
+      const oldestKey = this.byMediaKey.keys().next().value;
+      if (oldestKey === undefined) break;
+      const evicted = this.byMediaKey.get(oldestKey);
+      this.byMediaKey.delete(oldestKey);
+      if (evicted && evicted.oneBotId != null) {
+        const owner = this.byShortId.get(evicted.oneBotId);
+        if (owner && owner._mediaKeys) {
+          owner._mediaKeys.delete(oldestKey);
+        }
+      }
+    }
   }
 
   static _peerSeqKey(chatType, peerUid, msgSeq) {
@@ -218,8 +354,8 @@ class MessageIdStore {
           return;
         }
       }
-      this.byMediaKey.set(trimmed, desc);
       if (entry) entry._mediaKeys.add(trimmed);
+      this._setMediaKey(trimmed, desc);
     };
 
     for (const el of ntMsg.elements) {
@@ -497,11 +633,20 @@ class MessageIdStore {
       if (extra.groupId !== undefined && (extra.groupId || !existing.groupId)) {
         existing.groupId = String(extra.groupId);
       }
-      if (extra.msgTime !== undefined) existing.msgTime = Number(extra.msgTime);
+      if (extra.msgTime !== undefined) {
+        existing.msgTime = Number(extra.msgTime);
+        existing.time = existing.msgTime;
+      } else if (extra.time !== undefined) {
+        existing.msgTime = Number(extra.time);
+        existing.time = existing.msgTime;
+      }
       if (msgRandom && !existing.msgRandom) existing.msgRandom = msgRandom;
       if (extra.rootMsgId) existing.rootMsgId = String(extra.rootMsgId);
       if (extra.forwardPeer && extra.forwardPeer.peerUid) {
         existing.forwardPeer = extra.forwardPeer;
+      }
+      if (extra.emojiLikesSnapshot !== undefined) {
+        existing.emojiLikesSnapshot = extra.emojiLikesSnapshot;
       }
       if (!existing._mediaKeys) existing._mediaKeys = new Set();
       if (!existing._forwardKeys) existing._forwardKeys = new Set();
@@ -512,10 +657,14 @@ class MessageIdStore {
       }
       if (extra.oneBotEvent) existing.oneBotEvent = extra.oneBotEvent;
       this._touch(existing);
+      this.schedulePersist();
       return existing.shortId;
     }
 
     const shortId = this._computeShortId(msgIdStr, normPeer, msgSeqStr);
+    const resolvedTime = Number(
+      extra.msgTime ?? extra.time ?? Math.floor(Date.now() / 1000)
+    );
     const entry = {
       shortId,
       oneBotId: shortId,
@@ -531,9 +680,12 @@ class MessageIdStore {
       senderUin: extra.senderUin !== undefined ? String(extra.senderUin) : "",
       senderUid: extra.senderUid !== undefined ? String(extra.senderUid) : "",
       groupId: extra.groupId !== undefined ? String(extra.groupId) : "",
-      msgTime: Number(extra.msgTime || Math.floor(Date.now() / 1000)),
+      msgTime: resolvedTime,
+      time: resolvedTime,
       rawMsg,
       oneBotEvent: extra.oneBotEvent || null,
+      emojiLikesSnapshot:
+        extra.emojiLikesSnapshot !== undefined ? extra.emojiLikesSnapshot : null,
       createdAt: Date.now(),
       _mediaKeys: new Set(),
       _forwardKeys: new Set(),
@@ -551,7 +703,206 @@ class MessageIdStore {
       this.indexMsgMedia(rawMsg, shortId);
     }
     this._evictIfNeeded();
+    this.schedulePersist();
     return shortId;
+  }
+
+  toSnapshot(maxItems) {
+    let limit = this.maxEntries;
+    if (maxItems !== undefined && maxItems !== null) {
+      const parsed = Math.trunc(Number(maxItems));
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        limit = Math.min(this.maxEntries, parsed);
+      }
+    }
+    const allEntries = Array.from(this.byShortId.values());
+    const slice =
+      limit === 0
+        ? []
+        : allEntries.length > limit
+        ? allEntries.slice(-limit)
+        : allEntries;
+    const entries = slice.map((entry) => {
+      const item = {
+        shortId: entry.shortId,
+        msgId: entry.msgId || "",
+        peer: {
+          chatType: Number(entry.peer?.chatType ?? entry.chatType ?? 1),
+          peerUid: String(entry.peer?.peerUid ?? entry.peerUid ?? ""),
+          guildId: String(entry.peer?.guildId ?? ""),
+        },
+        msgSeq: String(entry.msgSeq || "0"),
+        msgRandom: entry.msgRandom || null,
+        senderUin: String(entry.senderUin || ""),
+        senderUid: String(entry.senderUid || ""),
+        time: Number(entry.msgTime ?? entry.time ?? 0) || 0,
+      };
+      if (entry.emojiLikesSnapshot != null) {
+        item.emojiLikesSnapshot = entry.emojiLikesSnapshot;
+      }
+      return item;
+    });
+    return {
+      version: 1,
+      entries,
+    };
+  }
+
+  loadSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object" || !Array.isArray(snapshot.entries)) {
+      return false;
+    }
+    const slice =
+      snapshot.entries.length > this.maxEntries
+        ? snapshot.entries.slice(-this.maxEntries)
+        : snapshot.entries;
+    for (const item of slice) {
+      if (!item || typeof item !== "object") continue;
+      const msgIdStr =
+        item.msgId !== undefined && item.msgId !== null && String(item.msgId) !== "0"
+          ? String(item.msgId)
+          : "";
+      const normPeer = {
+        chatType: Number(item.peer?.chatType ?? item.chatType ?? 1),
+        peerUid: String(item.peer?.peerUid ?? item.peerUid ?? ""),
+        guildId: String(item.peer?.guildId ?? item.guildId ?? ""),
+      };
+      const msgSeqStr =
+        item.msgSeq !== undefined && item.msgSeq !== null ? String(item.msgSeq) : "0";
+      const parsedShort = Number(item.shortId);
+      const shortId =
+        Number.isInteger(parsedShort) && parsedShort > 0 && parsedShort <= 0x7fffffff
+          ? parsedShort
+          : this._computeShortId(msgIdStr, normPeer, msgSeqStr);
+      const msgTime =
+        Number(item.time ?? item.msgTime ?? 0) || Math.floor(Date.now() / 1000);
+      const msgRandom =
+        item.msgRandom !== undefined && item.msgRandom !== null && item.msgRandom !== ""
+          ? String(item.msgRandom)
+          : null;
+      const entry = {
+        shortId,
+        oneBotId: shortId,
+        msgId: msgIdStr || String(shortId),
+        rootMsgId: String(item.rootMsgId || msgIdStr || ""),
+        forwardPeer:
+          item.forwardPeer && item.forwardPeer.peerUid ? item.forwardPeer : null,
+        peer: normPeer,
+        chatType: normPeer.chatType,
+        peerUid: normPeer.peerUid,
+        msgSeq: msgSeqStr || "0",
+        msgRandom,
+        senderUin: item.senderUin !== undefined ? String(item.senderUin) : "",
+        senderUid: item.senderUid !== undefined ? String(item.senderUid) : "",
+        groupId:
+          item.groupId !== undefined
+            ? String(item.groupId)
+            : normPeer.chatType === 2 && /^\d+$/.test(normPeer.peerUid)
+            ? normPeer.peerUid
+            : "",
+        msgTime,
+        time: msgTime,
+        rawMsg: null,
+        oneBotEvent: null,
+        emojiLikesSnapshot:
+          item.emojiLikesSnapshot !== undefined ? item.emojiLikesSnapshot : null,
+        createdAt: Date.now(),
+        _mediaKeys: new Set(),
+        _forwardKeys: new Set(),
+      };
+      this.byShortId.delete(shortId);
+      this.byShortId.set(shortId, entry);
+      if (msgIdStr) {
+        this.byMsgId.delete(msgIdStr);
+        this.byMsgId.set(msgIdStr, entry);
+      }
+      const psKey = MessageIdStore._peerSeqKey(
+        normPeer.chatType,
+        normPeer.peerUid,
+        msgSeqStr
+      );
+      if (psKey) {
+        this.byPeerSeq.delete(psKey);
+        this.byPeerSeq.set(psKey, entry);
+      }
+    }
+    this._evictIfNeeded();
+    return true;
+  }
+
+  loadFromFileSync(filePath) {
+    if (!filePath || typeof filePath !== "string" || !filePath.trim()) {
+      return false;
+    }
+    try {
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      return Boolean(this.loadSnapshot(parsed));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async saveToFile(filePath) {
+    return enqueueCoalescedSave(this._persist, filePath, () => this.toSnapshot());
+  }
+
+  enableAutoPersist(filePath, { debounceMs = 2000 } = {}) {
+    const targetPath = typeof filePath === "string" ? filePath.trim() : "";
+    if (!targetPath) {
+      this.disableAutoPersist();
+      return false;
+    }
+    this._persist.filePath = targetPath;
+    const parsedDebounce = Number(debounceMs);
+    this._persist.debounceMs =
+      Number.isFinite(parsedDebounce) && parsedDebounce >= 0
+        ? Math.trunc(parsedDebounce)
+        : 2000;
+    this._persist.enabled = true;
+    return true;
+  }
+
+  disableAutoPersist() {
+    this._persist.enabled = false;
+    this._persist.dirty = false;
+    if (this._persist.timer) {
+      clearTimeout(this._persist.timer);
+      this._persist.timer = null;
+    }
+  }
+
+  schedulePersist() {
+    if (!this._persist.enabled || !this._persist.filePath) return false;
+    this._persist.dirty = true;
+    if (this._persist.timer) {
+      clearTimeout(this._persist.timer);
+    }
+    const targetPath = this._persist.filePath;
+    const timer = setTimeout(() => {
+      this._persist.timer = null;
+      if (!this._persist.enabled || !this._persist.dirty) return;
+      this._persist.dirty = false;
+      this.saveToFile(targetPath).catch(() => {});
+    }, this._persist.debounceMs);
+    if (timer && typeof timer.unref === "function") {
+      timer.unref();
+    }
+    this._persist.timer = timer;
+    return true;
+  }
+
+  async flushPersist() {
+    if (this._persist.timer) {
+      clearTimeout(this._persist.timer);
+      this._persist.timer = null;
+    }
+    if (!this._persist.enabled || !this._persist.filePath) {
+      return false;
+    }
+    this._persist.dirty = false;
+    await this.saveToFile(this._persist.filePath);
+    return true;
   }
 
   get(shortId) {
@@ -598,6 +949,11 @@ class MessageIdStore {
   getByPeerSeq(chatType, peerUid, msgSeq) {
     return this.getByPeerAndSeq(chatType, peerUid, msgSeq);
   }
+
+  resolveByOneBotId(rawId) {
+    const res = this.resolve(rawId);
+    return res ? res.entry : this.getByShortId(rawId);
+  }
 }
 
 // ============================================================================
@@ -605,23 +961,68 @@ class MessageIdStore {
 // ============================================================================
 
 class UinUidStore {
-  constructor(maxEntries = 20000) {
-    this.maxEntries = Math.max(500, Number(maxEntries) || 20000);
+  constructor(maxEntries = 20000, options = {}) {
+    if (maxEntries && typeof maxEntries === "object") {
+      options = maxEntries;
+      maxEntries = options.maxEntries ?? 20000;
+    }
+    const opts = options && typeof options === "object" ? options : {};
+    this.maxEntries = Math.max(2, Number(maxEntries) || 20000);
+    this.maxUserMetaEntries = Math.max(
+      2,
+      Number(opts.maxUserMetaEntries) || this.maxEntries
+    );
+    this.maxGroupMemberMetaEntries = Math.max(
+      4,
+      Number(opts.maxGroupMemberMetaEntries) || this.maxEntries * 2
+    );
     this.uinToUid = new Map();
     this.uidToUin = new Map();
     this.userMeta = new Map(); // uin -> { uin, uid, nickname, remark, sex, age }
     this.groupMemberMeta = new Map(); // `${groupId}:${uin}` -> { uin, uid, nickname, card, role, title }
+    this._persist = createPersistState();
   }
 
   _evictIfNeeded() {
     while (this.uinToUid.size > this.maxEntries) {
-      const oldestUin = this.uinToUid.keys().next().value;
-      if (oldestUin === undefined) break;
-      const uid = this.uinToUid.get(oldestUin);
-      this.uinToUid.delete(oldestUin);
-      if (uid && this.uidToUin.get(uid) === oldestUin) {
+      const oldUin = this.uinToUid.keys().next().value;
+      if (oldUin === undefined) break;
+      const uid = this.uinToUid.get(oldUin);
+      this.uinToUid.delete(oldUin);
+      if (uid && this.uidToUin.get(uid) === oldUin) {
         this.uidToUin.delete(uid);
       }
+      this.userMeta.delete(oldUin);
+    }
+    while (this.userMeta.size > this.maxUserMetaEntries) {
+      const oldestKey = this.userMeta.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.userMeta.delete(oldestKey);
+    }
+    while (this.groupMemberMeta.size > this.maxGroupMemberMetaEntries) {
+      const oldestKey = this.groupMemberMeta.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.groupMemberMeta.delete(oldestKey);
+    }
+  }
+
+  _setUserMeta(uinStr, value) {
+    this.userMeta.delete(uinStr);
+    this.userMeta.set(uinStr, value);
+    while (this.userMeta.size > this.maxUserMetaEntries) {
+      const oldestKey = this.userMeta.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.userMeta.delete(oldestKey);
+    }
+  }
+
+  _setGroupMemberMeta(gKey, value) {
+    this.groupMemberMeta.delete(gKey);
+    this.groupMemberMeta.set(gKey, value);
+    while (this.groupMemberMeta.size > this.maxGroupMemberMetaEntries) {
+      const oldestKey = this.groupMemberMeta.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.groupMemberMeta.delete(oldestKey);
     }
   }
 
@@ -633,11 +1034,49 @@ class UinUidStore {
     return this.remember(uin, uid, meta);
   }
 
+  recordGroupMember(groupId, uin, uid = "", meta = null) {
+    if (groupId && typeof groupId === "object") {
+      const obj = groupId;
+      const gId = obj.groupId ?? obj.group_id ?? obj.groupCode ?? "";
+      return this.recordGroupMember(gId, obj.uin ?? obj.user_id, obj.uid ?? "", obj);
+    }
+    if (uin && typeof uin === "object") {
+      const m = uin;
+      const roleNum = m.role ?? m.permission;
+      const role =
+        typeof roleNum === "string" && !/^\d+$/.test(roleNum.trim())
+          ? roleNum
+          : Number(roleNum) === 4
+          ? "owner"
+          : Number(roleNum) === 3
+          ? "admin"
+          : m.role !== undefined || m.permission !== undefined
+          ? "member"
+          : "";
+      return this.remember(m.uin ?? m.user_id, m.uid ?? "", {
+        groupId,
+        nickname: m.nick ?? m.nickname ?? m.memberName ?? "",
+        card: m.cardName ?? m.card ?? m.memberCard?.memberCard ?? "",
+        ...(role ? { role } : {}),
+        title: m.memberSpecialTitle ?? m.specialTitle ?? m.title ?? "",
+      });
+    }
+    if (uid && typeof uid === "object") {
+      meta = uid;
+      uid = meta.uid ?? "";
+    }
+    return this.remember(uin, uid, {
+      ...(meta && typeof meta === "object" ? meta : {}),
+      groupId,
+    });
+  }
+
   remember(uin, uid, meta = null) {
     const uinStr = uin !== undefined && uin !== null ? String(uin).trim() : "";
     const uidStr = uid !== undefined && uid !== null ? String(uid).trim() : "";
     const validUin = /^\d+$/.test(uinStr) && Number(uinStr) > 0;
     const validUid = uidStr.length > 0 && uidStr !== "0";
+    let mutated = false;
 
     if (validUin && validUid) {
       this.uinToUid.delete(uinStr);
@@ -645,14 +1084,16 @@ class UinUidStore {
       this.uidToUin.delete(uidStr);
       this.uidToUin.set(uidStr, uinStr);
       this._evictIfNeeded();
+      mutated = true;
     }
 
     if (validUin && meta && typeof meta === "object") {
+      const nickVal = meta.nickname ?? meta.nick;
       const prev = this.userMeta.get(uinStr) || { uin: Number(uinStr), uid: uidStr };
-      this.userMeta.set(uinStr, {
+      this._setUserMeta(uinStr, {
         ...prev,
         ...(validUid ? { uid: uidStr } : {}),
-        ...(meta.nickname ? { nickname: String(meta.nickname) } : {}),
+        ...(nickVal ? { nickname: String(nickVal) } : {}),
         ...(meta.remark !== undefined ? { remark: String(meta.remark) } : {}),
         ...(meta.sex ? { sex: String(meta.sex) } : {}),
         ...(meta.age !== undefined ? { age: Number(meta.age) } : {}),
@@ -660,17 +1101,22 @@ class UinUidStore {
       if (meta.groupId && /^\d+$/.test(String(meta.groupId))) {
         const gKey = `${meta.groupId}:${uinStr}`;
         const prevG = this.groupMemberMeta.get(gKey) || {};
-        this.groupMemberMeta.set(gKey, {
+        this._setGroupMemberMeta(gKey, {
           ...prevG,
           group_id: Number(meta.groupId),
           user_id: Number(uinStr),
           uid: validUid ? uidStr : prevG.uid || "",
-          nickname: String(meta.nickname ?? prevG.nickname ?? ""),
+          nickname: String(nickVal ?? prevG.nickname ?? ""),
           card: String(meta.card ?? prevG.card ?? ""),
           role: String(meta.role ?? prevG.role ?? ""),
           title: String(meta.title ?? prevG.title ?? ""),
         });
       }
+      mutated = true;
+    }
+
+    if (mutated) {
+      this.schedulePersist();
     }
   }
 
@@ -900,6 +1346,181 @@ class UinUidStore {
       } catch (_) {}
     }
     return "";
+  }
+
+  toSnapshot(maxItems) {
+    let pairLimit = this.maxEntries;
+    let metaLimit = Math.min(this.maxEntries, this.maxUserMetaEntries);
+    if (maxItems !== undefined && maxItems !== null) {
+      const parsed = Math.trunc(Number(maxItems));
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        pairLimit = Math.min(this.maxEntries, parsed);
+        metaLimit = Math.min(metaLimit, parsed);
+      }
+    }
+    const allPairs = Array.from(this.uinToUid.entries());
+    const pairs = (
+      pairLimit === 0
+        ? []
+        : allPairs.length > pairLimit
+        ? allPairs.slice(-pairLimit)
+        : allPairs
+    ).map(([uin, uid]) => [String(uin), String(uid)]);
+
+    const allMeta = Array.from(this.userMeta.entries());
+    const userMeta = (
+      metaLimit === 0
+        ? []
+        : allMeta.length > metaLimit
+        ? allMeta.slice(-metaLimit)
+        : allMeta
+    ).map(([uin, meta]) => [String(uin), { ...meta }]);
+
+    return {
+      version: 1,
+      pairs,
+      userMeta,
+    };
+  }
+
+  loadSnapshot(snapshot) {
+    if (
+      !snapshot ||
+      typeof snapshot !== "object" ||
+      (!Array.isArray(snapshot.pairs) && !Array.isArray(snapshot.userMeta))
+    ) {
+      return false;
+    }
+    if (Array.isArray(snapshot.pairs)) {
+      const pairSlice =
+        snapshot.pairs.length > this.maxEntries
+          ? snapshot.pairs.slice(-this.maxEntries)
+          : snapshot.pairs;
+      for (const item of pairSlice) {
+        if (!Array.isArray(item) || item.length < 2) continue;
+        const uinStr =
+          item[0] !== undefined && item[0] !== null ? String(item[0]).trim() : "";
+        const uidStr =
+          item[1] !== undefined && item[1] !== null ? String(item[1]).trim() : "";
+        const validUin = /^\d+$/.test(uinStr) && Number(uinStr) > 0;
+        const validUid = uidStr.length > 0 && uidStr !== "0";
+        if (validUin && validUid) {
+          this.uinToUid.delete(uinStr);
+          this.uinToUid.set(uinStr, uidStr);
+          this.uidToUin.delete(uidStr);
+          this.uidToUin.set(uidStr, uinStr);
+        }
+      }
+    }
+    if (Array.isArray(snapshot.userMeta)) {
+      const metaCap = Math.min(this.maxEntries, this.maxUserMetaEntries);
+      const metaSlice =
+        snapshot.userMeta.length > metaCap
+          ? snapshot.userMeta.slice(-metaCap)
+          : snapshot.userMeta;
+      for (const item of metaSlice) {
+        if (!Array.isArray(item) || item.length < 2) continue;
+        const uinStr =
+          item[0] !== undefined && item[0] !== null ? String(item[0]).trim() : "";
+        const meta = item[1];
+        const validUin = /^\d+$/.test(uinStr) && Number(uinStr) > 0;
+        if (!validUin || !meta || typeof meta !== "object" || Array.isArray(meta)) {
+          continue;
+        }
+        const nickVal = meta.nickname ?? meta.nick;
+        const rawUid =
+          meta.uid !== undefined && meta.uid !== null
+            ? String(meta.uid).trim()
+            : this.uinToUid.get(uinStr) || "";
+        this._setUserMeta(uinStr, {
+          uin: Number(uinStr),
+          uid: rawUid !== "0" ? rawUid : "",
+          ...(nickVal ? { nickname: String(nickVal) } : {}),
+          ...(meta.remark !== undefined ? { remark: String(meta.remark) } : {}),
+          ...(meta.sex ? { sex: String(meta.sex) } : {}),
+          ...(meta.age !== undefined && Number.isFinite(Number(meta.age))
+            ? { age: Number(meta.age) }
+            : {}),
+        });
+      }
+    }
+    this._evictIfNeeded();
+    return true;
+  }
+
+  loadFromFileSync(filePath) {
+    if (!filePath || typeof filePath !== "string" || !filePath.trim()) {
+      return false;
+    }
+    try {
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      return Boolean(this.loadSnapshot(parsed));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async saveToFile(filePath) {
+    return enqueueCoalescedSave(this._persist, filePath, () => this.toSnapshot());
+  }
+
+  enableAutoPersist(filePath, { debounceMs = 2000 } = {}) {
+    const targetPath = typeof filePath === "string" ? filePath.trim() : "";
+    if (!targetPath) {
+      this.disableAutoPersist();
+      return false;
+    }
+    this._persist.filePath = targetPath;
+    const parsedDebounce = Number(debounceMs);
+    this._persist.debounceMs =
+      Number.isFinite(parsedDebounce) && parsedDebounce >= 0
+        ? Math.trunc(parsedDebounce)
+        : 2000;
+    this._persist.enabled = true;
+    return true;
+  }
+
+  disableAutoPersist() {
+    this._persist.enabled = false;
+    this._persist.dirty = false;
+    if (this._persist.timer) {
+      clearTimeout(this._persist.timer);
+      this._persist.timer = null;
+    }
+  }
+
+  schedulePersist() {
+    if (!this._persist.enabled || !this._persist.filePath) return false;
+    this._persist.dirty = true;
+    if (this._persist.timer) {
+      clearTimeout(this._persist.timer);
+    }
+    const targetPath = this._persist.filePath;
+    const timer = setTimeout(() => {
+      this._persist.timer = null;
+      if (!this._persist.enabled || !this._persist.dirty) return;
+      this._persist.dirty = false;
+      this.saveToFile(targetPath).catch(() => {});
+    }, this._persist.debounceMs);
+    if (timer && typeof timer.unref === "function") {
+      timer.unref();
+    }
+    this._persist.timer = timer;
+    return true;
+  }
+
+  async flushPersist() {
+    if (this._persist.timer) {
+      clearTimeout(this._persist.timer);
+      this._persist.timer = null;
+    }
+    if (!this._persist.enabled || !this._persist.filePath) {
+      return false;
+    }
+    this._persist.dirty = false;
+    await this.saveToFile(this._persist.filePath);
+    return true;
   }
 }
 

@@ -369,12 +369,75 @@ const ACTION_HANDLERS = {
       );
       sceneId = typeof sceneRes === "string" ? sceneRes : sceneRes?.sceneId || "";
       if (sceneId) {
-        const listRes = await this.invokeNt(
-          "nodeIKernelGroupService/getNextMemberList",
-          { sceneId, lastId: undefined, prevId: undefined, num: 3000 },
-          [sceneId, undefined, 3000]
-        );
-        infos = listRes?.result?.infos || listRes?.infos || listRes;
+        const MAX_PAGES = 10;
+        const mergedMap = new Map();
+        let lastId = undefined;
+        for (let page = 0; page < MAX_PAGES; page += 1) {
+          const listRes = await this.invokeNt(
+            "nodeIKernelGroupService/getNextMemberList",
+            { sceneId, lastId, prevId: undefined, num: 3000 },
+            [sceneId, lastId, 3000]
+          );
+          const pageResult =
+            listRes?.result && typeof listRes.result === "object" ? listRes.result : listRes;
+          const pageInfos = pageResult?.infos ?? listRes?.infos ?? listRes;
+          let rawEntries = [];
+          if (pageInfos instanceof Map) {
+            rawEntries = Array.from(pageInfos.entries());
+          } else if (Array.isArray(pageInfos)) {
+            rawEntries = pageInfos.map((m) => [undefined, m]);
+          } else if (pageInfos && typeof pageInfos === "object") {
+            rawEntries = Object.entries(pageInfos);
+          }
+
+          let pageEntryCount = 0;
+          let addedCount = 0;
+          let lastKeyInPage = undefined;
+          for (let i = 0; i < rawEntries.length; i += 1) {
+            const [rawKey, m] = rawEntries[i];
+            if (!m || typeof m !== "object" || Array.isArray(m)) continue;
+            pageEntryCount += 1;
+            const uidKey = m.uid ? String(m.uid) : "";
+            const uinVal = pickPositiveUin(m.uin, m.user_id);
+            const mapKey =
+              uidKey ||
+              (uinVal > 0 ? `uin:${uinVal}` : "") ||
+              (rawKey !== undefined && String(rawKey) !== "" && !/^\d+$/.test(String(rawKey))
+                ? String(rawKey)
+                : `idx:${page}:${i}`);
+            lastKeyInPage = uidKey || (rawKey !== undefined ? String(rawKey) : mapKey);
+            if (!mergedMap.has(mapKey)) {
+              addedCount += 1;
+            }
+            mergedMap.set(mapKey, m);
+          }
+
+          const finishedFlag =
+            typeof pageResult?.finished === "boolean"
+              ? pageResult.finished
+              : typeof listRes?.finished === "boolean"
+              ? listRes.finished
+              : undefined;
+          const explicitLastId = pageResult?.lastId || listRes?.lastId || undefined;
+
+          if (finishedFlag === true) break;
+          if (addedCount === 0) break;
+          if (finishedFlag === undefined && !explicitLastId && pageEntryCount < 3000) {
+            break;
+          }
+
+          const nextLastId =
+            explicitLastId ||
+            (Array.isArray(pageResult?.ids) && pageResult.ids.length > 0
+              ? String(pageResult.ids[pageResult.ids.length - 1])
+              : undefined) ||
+            lastKeyInPage;
+          if (!nextLastId) break;
+          lastId = nextLastId;
+        }
+        if (mergedMap.size > 0) {
+          infos = mergedMap;
+        }
       }
     } catch (_) {
     } finally {

@@ -9,6 +9,9 @@ const {
   parseBoolString,
   parsePrefixedEnvBool,
   resolveConfigDirsFromEnv,
+  resolveSilkDecoderPathFromEnv,
+  resolveSilkEncoderPathFromEnv,
+  resolveStateDirFromEnv,
 } = envHelpers;
 
 const {
@@ -156,6 +159,7 @@ function loadBridgeConfig(customConfigDir) {
     httpServers: [],
     wsServers: [],
     wsClients: [],
+    httpClients: [],
     heartbeatIntervalMs: envHeartbeatRaw !== "" ? Number(envHeartbeatRaw) : 5000,
   };
 
@@ -196,7 +200,11 @@ function loadBridgeConfig(customConfigDir) {
           const stat = fs.statSync(fullPath);
           const nets = raw?.networks || {};
           const enabledWsClients = filterEnabledEntries(nets.wsClients);
-          const hasWsClients = enabledWsClients.length > 0;
+          const enabledHttpClients = filterEnabledEntries(
+            nets.httpClients || nets.httpPost || raw?.httpClients
+          );
+          const hasWsClients =
+            enabledWsClients.length > 0 || enabledHttpClients.length > 0;
           parsedEntries.push({
             file,
             uin,
@@ -259,6 +267,9 @@ function loadBridgeConfig(customConfigDir) {
           "allowArbitraryLocalFiles",
           "allowedFileDirs",
           "ffmpegPath",
+          "silkDecoderPath",
+          "silkEncoderPath",
+          "stateDir",
         ]) {
           if (raw && raw[optKey] !== undefined) {
             defaultConfig[optKey] = raw[optKey];
@@ -269,6 +280,9 @@ function loadBridgeConfig(customConfigDir) {
         defaultConfig.httpServers.push(...filterEnabledEntries(nets.httpServers));
         defaultConfig.wsServers.push(...filterEnabledEntries(nets.wsServers));
         defaultConfig.wsClients.push(...filterEnabledEntries(nets.wsClients));
+        defaultConfig.httpClients.push(
+          ...filterEnabledEntries(nets.httpClients || nets.httpPost || raw?.httpClients)
+        );
         loadedFromFile = true;
       }
       if (loadedFromFile) break;
@@ -462,6 +476,65 @@ function loadBridgeConfig(customConfigDir) {
     defaultConfig.ffmpegPath = rawFfmpegPath;
   }
 
+  const resolvedSilkDecoder = resolveSilkDecoderPathFromEnv(
+    loadedRaw.silkDecoderPath || loadedRaw.silk_decoder_path || loadedRaw.silkCodecPath || ""
+  );
+  if (resolvedSilkDecoder) {
+    defaultConfig.silkDecoderPath = resolvedSilkDecoder;
+  }
+
+  const resolvedSilkEncoder = resolveSilkEncoderPathFromEnv(
+    loadedRaw.silkEncoderPath || loadedRaw.silk_encoder_path || ""
+  );
+  if (resolvedSilkEncoder) {
+    defaultConfig.silkEncoderPath = resolvedSilkEncoder;
+  }
+
+  const resolvedStateDir = resolveStateDirFromEnv(
+    loadedRaw.stateDir || loadedRaw.state_dir || ""
+  );
+  if (resolvedStateDir) {
+    defaultConfig.stateDir = resolvedStateDir;
+  }
+
+  _applyOptionalBoolOverride(defaultConfig, "persistStores", loadedRaw, "PERSIST_STORES");
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "statePersistDebounceMs",
+    loadedRaw,
+    "STATE_PERSIST_DEBOUNCE_MS"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "maxForwardCustomNodes",
+    loadedRaw,
+    "MAX_FORWARD_CUSTOM_NODES"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "forwardStageDelayMs",
+    loadedRaw,
+    "FORWARD_STAGE_DELAY_MS"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "inboundMediaConcurrency",
+    loadedRaw,
+    "INBOUND_MEDIA_CONCURRENCY"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "uploadFileUuidWaitMs",
+    loadedRaw,
+    "UPLOAD_FILE_UUID_WAIT_MS"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "httpPostTimeoutMs",
+    loadedRaw,
+    "HTTP_POST_TIMEOUT_MS"
+  );
+
   const envCompatProfile = pickPrefixedEnv("COMPAT_PROFILE").toLowerCase();
   const rawCompatProfile = String(
     envCompatProfile || loadedRaw.compatProfile || loadedRaw.compat_profile || "rosmontis"
@@ -489,6 +562,8 @@ function loadBridgeConfig(customConfigDir) {
   const envHttpPort = Number(pickPrefixedEnv("HTTP_PORT") || 0);
   const envWsPort = Number(pickPrefixedEnv("WS_PORT") || 0);
   const envRevWsUrl = pickPrefixedEnv("REVERSE_WS_URL");
+  const envHttpPostUrl = pickPrefixedEnv("HTTP_POST_URL");
+  const envHttpSecret = pickPrefixedEnv("HTTP_SECRET");
   const envToken = pickPrefixedEnv("ACCESS_TOKEN");
   const listenHost = pickPrefixedEnv("HOST") || "0.0.0.0";
 
@@ -534,10 +609,24 @@ function loadBridgeConfig(customConfigDir) {
     ];
   }
 
+  if (envHttpPostUrl) {
+    defaultConfig.httpClients = [
+      {
+        name: "httpclient-env",
+        url: envHttpPostUrl,
+        accessToken: envToken,
+        ...(envHttpSecret ? { secret: envHttpSecret } : {}),
+        reportSelfMessage: false,
+        timeoutMs: 5000,
+      },
+    ];
+  }
+
   for (const entry of [
     ...defaultConfig.httpServers,
     ...defaultConfig.wsServers,
     ...defaultConfig.wsClients,
+    ...defaultConfig.httpClients,
   ]) {
     entry.messageFormat =
       (entry.messageFormat ||
@@ -554,6 +643,11 @@ function loadBridgeConfig(customConfigDir) {
     for (const s of defaultConfig.httpServers) s.accessToken = envToken;
     for (const s of defaultConfig.wsServers) s.accessToken = envToken;
     for (const c of defaultConfig.wsClients) c.accessToken = envToken;
+    for (const c of defaultConfig.httpClients) c.accessToken = envToken;
+  }
+
+  if (envHttpSecret) {
+    for (const c of defaultConfig.httpClients) c.secret = envHttpSecret;
   }
 
   return defaultConfig;

@@ -1061,7 +1061,248 @@ async function runTests() {
     console.log("  [PASS] Suite 8: Renderer IPC service map & side-effect non-replay contracts");
   }
 
-  console.log("=== All 8 Core Architecture Module Suites Passed ===");
+  // =========================================================================
+  // Suite 9: Store Persistence, Late-Load Probe, External SILK CLI & Video Segments
+  // =========================================================================
+  {
+    const os = require("os");
+    const { ntCaptureMixin } = require("../src/core/nt_capture");
+    const { resolveMediaSource } = require("../src/core/media_security");
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rosmontis-core-s9-"));
+    try {
+      // 9a. MessageIdStore & UinUidStore persistence + LFI guard on dot-state JSON
+      const msgStatePath = path.join(tmpRoot, ".rosmontis_state_messages.json");
+      const uinStatePath = path.join(tmpRoot, ".rosmontis_state_uin_uid.json");
+
+      const store1 = new storesMod.MessageIdStore(100);
+      store1.enableAutoPersist(msgStatePath, { debounceMs: 5000 });
+      const shortId = store1.register(
+        {
+          msgId: "749900112233445566",
+          msgSeq: "88",
+          chatType: 2,
+          peerUid: "987654321",
+          senderUin: "10001",
+          senderUid: "u_sender_10001",
+          elements: [{ elementType: 1, textElement: { content: "persisted hello" } }],
+        },
+        { chatType: 2, peerUid: "987654321", guildId: "" },
+        "88"
+      );
+      await store1.flushPersist();
+      assert.ok(fs.existsSync(msgStatePath), "MessageIdStore state file must exist after flushPersist");
+
+      const store2 = new storesMod.MessageIdStore(100);
+      assert.strictEqual(store2.loadFromFileSync(msgStatePath), true);
+      const restored = store2.resolveByOneBotId(shortId);
+      assert.ok(restored, "Restored MessageIdStore must resolve shortId across restarts");
+      assert.strictEqual(restored.msgId, "749900112233445566");
+      assert.strictEqual(restored.peer.peerUid, "987654321");
+
+      const uinStore1 = new storesMod.UinUidStore(100);
+      uinStore1.enableAutoPersist(uinStatePath, { debounceMs: 5000 });
+      uinStore1.remember("10001", "u_sender_10001");
+      uinStore1.remember("10002", "u_sender_10002", "987654321");
+      await uinStore1.flushPersist();
+
+      const uinStore2 = new storesMod.UinUidStore(100);
+      assert.strictEqual(uinStore2.loadFromFileSync(uinStatePath), true);
+      assert.strictEqual(uinStore2.getUidSync("10001"), "u_sender_10001");
+      assert.strictEqual(uinStore2.getUinSync("u_sender_10002"), "10002");
+
+      await assert.rejects(
+        () =>
+          resolveMediaSource(msgStatePath, {
+            tempDir: tmpRoot,
+            allowedFileDirs: [tmpRoot],
+          }),
+        /sensitive|not allowed|blocked|Forbidden/i,
+        "Dot-prefixed .rosmontis_state_*.json must be blocked from LFI media reads"
+      );
+
+      // 9b. Late-load runtime probe (`probeExistingRuntime`)
+      const fakeNtApi = {
+        "nodeIKernelMsgService/sendMsg": async () => ({ result: 0 }),
+      };
+      const fakeBindingMap = new Map([["ntApi", [{ cache: fakeNtApi }]]]);
+      const fakeIpcMain = {
+        _events: {
+          RM_IPCFROM_RENDERER: () => {},
+        },
+        container: {
+          _bindingDictionary: { _map: fakeBindingMap },
+        },
+      };
+      let hookedSession = null;
+      const fakeWrapperExports = {
+        NodeIQQNTWrapperSession: {
+          create() {
+            return { getMsgService: () => ({}) };
+          },
+        },
+      };
+      const fakeModuleCache = {
+        "/opt/QQ/resources/app/versions/3.2.32/wrapper.node": {
+          id: "wrapper.node",
+          filename: "/opt/QQ/resources/app/versions/3.2.32/wrapper.node",
+          exports: fakeWrapperExports,
+        },
+      };
+      const probeHost = Object.assign(
+        {
+          config: { keepMapHook: true },
+          capturedServices: {
+            ntApi: null,
+            ntApiContainer: null,
+            ntStore: null,
+            wrapperSession: null,
+          },
+          _attachedEmitters: new WeakSet(),
+          _maybeScheduleMapHookRelease() {},
+        },
+        ntCaptureMixin
+      );
+      const probeSummary = probeHost.probeExistingRuntime({
+        moduleCache: fakeModuleCache,
+        ipcMain: fakeIpcMain,
+      });
+      assert.strictEqual(probeSummary.wrapperModulesFound, 1);
+      assert.ok(probeSummary.rmIpcChannels.includes("RM_IPCFROM_RENDERER"));
+      assert.strictEqual(probeHost.capturedServices.ntApi, fakeNtApi);
+      hookedSession = fakeWrapperExports.NodeIQQNTWrapperSession.create();
+      assert.strictEqual(probeHost.capturedServices.wrapperSession, hookedSession);
+
+      // 9c. Pure-JS PCM->WAV wrapper & external SILK v3 CLI decoder fallback/round-trip
+      const pcmSamples = Buffer.alloc(4800, 0x12); // 0.1s @ 24kHz mono s16le
+      const wavBuf = audioCodecMod.wrapPcmS16leToWavBuffer(pcmSamples, 24000, 1);
+      assert.strictEqual(wavBuf.subarray(0, 4).toString("ascii"), "RIFF");
+      assert.strictEqual(wavBuf.subarray(8, 12).toString("ascii"), "WAVE");
+      assert.strictEqual(wavBuf.readUInt32LE(24), 24000);
+      assert.strictEqual(wavBuf.length, 44 + pcmSamples.length);
+
+      // Create cross-platform mock SILK decoder & encoder CLI scripts
+      const silkFile = path.join(tmpRoot, "sample_voice.silk");
+      fs.writeFileSync(
+        silkFile,
+        Buffer.concat([Buffer.from("\x02#!SILK_V3", "binary"), Buffer.alloc(64, 0x05)])
+      );
+      const mockJsDecoder = path.join(tmpRoot, "mock_silk_decoder.js");
+      fs.writeFileSync(
+        mockJsDecoder,
+        `"use strict";
+const fs = require("fs");
+const args = process.argv.slice(2);
+const inFile = args[0];
+const outFile = args[1];
+const raw = fs.readFileSync(inFile);
+if (raw.subarray(0, 9).toString("binary") !== "#!SILK_V3") {
+  process.exit(2);
+}
+fs.writeFileSync(outFile, Buffer.alloc(9600, 1));
+`,
+        "utf8"
+      );
+
+      const decodedWav = await audioCodecMod.transcodeRecordOutFormat(silkFile, "wav", {
+        tempDir: tmpRoot,
+        silkDecoderPath: mockJsDecoder,
+        ffmpegPath: path.join(tmpRoot, "nonexistent_ffmpeg_bin"),
+      });
+      assert.ok(decodedWav && decodedWav.localPath, "External SILK CLI must decode Tencent SILK directly to WAV");
+      const decodedWavBytes = fs.readFileSync(decodedWav.localPath);
+      assert.strictEqual(decodedWavBytes.subarray(0, 4).toString("ascii"), "RIFF");
+      assert.strictEqual(decodedWavBytes.length, 44 + 9600);
+      await decodedWav.cleanup?.();
+
+      // Mock ffmpeg PCM extractor + mock SILK encoder CLI for outbound HD SILK v3 encoding
+      const mockJsFfmpeg = path.join(tmpRoot, "mock_ffmpeg_pcm.js");
+      fs.writeFileSync(
+        mockJsFfmpeg,
+        `"use strict";
+const fs = require("fs");
+const outPath = process.argv[process.argv.length - 1];
+fs.writeFileSync(outPath, Buffer.alloc(9600, 2));
+`,
+        "utf8"
+      );
+      const mockJsEncoder = path.join(tmpRoot, "mock_silk_encoder.js");
+      fs.writeFileSync(
+        mockJsEncoder,
+        `"use strict";
+const fs = require("fs");
+const outPath = process.argv[3];
+const frameLen = Buffer.alloc(2);
+frameLen.writeInt16LE(20, 0);
+fs.writeFileSync(outPath, Buffer.concat([Buffer.from("#!SILK_V3", "binary"), frameLen, Buffer.alloc(20, 0x33)]));
+`,
+        "utf8"
+      );
+      const wavInPath = path.join(tmpRoot, "input_voice.wav");
+      fs.writeFileSync(wavInPath, wavBuf);
+      const encodedSilk = await audioCodecMod.prepareVoiceMedia(
+        {
+          localPath: wavInPath,
+          fileName: "input_voice.wav",
+          fileSize: wavBuf.length,
+          md5HexStr: "00112233445566778899aabbccddeeff",
+        },
+        {
+          tempDir: tmpRoot,
+          ffmpegPath: mockJsFfmpeg,
+          silkEncoderPath: mockJsEncoder,
+        }
+      );
+      assert.strictEqual(encodedSilk.format, "silk_tencent");
+      const encodedSilkBytes = fs.readFileSync(encodedSilk.localPath);
+      assert.strictEqual(encodedSilkBytes.subarray(0, 10).toString("binary"), "\x02#!SILK_V3");
+
+      // Missing external SILK CLI degrades gracefully to null without throwing
+      const degradedWav = await audioCodecMod.transcodeRecordOutFormat(silkFile, "wav", {
+        tempDir: tmpRoot,
+        silkDecoderPath: path.join(tmpRoot, "missing_silk_decoder"),
+        ffmpegPath: path.join(tmpRoot, "missing_ffmpeg"),
+      });
+      assert.strictEqual(degradedWav, null);
+
+      // 9d. Non-blocking buildNtPicUrl & outbound videoElement thumbnail synthesis
+      const localPicPath = path.join(tmpRoot, "big_photo.jpg");
+      fs.writeFileSync(localPicPath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+      const picUrlFromPath = segmentConverterMod.buildNtPicUrl({
+        sourcePath: localPicPath,
+        fileUuid: "uuid_1",
+      });
+      assert.ok(
+        picUrlFromPath.startsWith("file:///"),
+        "buildNtPicUrl must return non-blocking file:// URL rather than synchronous base64 data URI"
+      );
+
+      const dummyMp4Path = path.join(tmpRoot, "clip.mp4");
+      fs.writeFileSync(dummyMp4Path, Buffer.alloc(256, 0x42));
+      const vidConv = await segmentConverterMod.oneBotSegmentsToNtElements(
+        [{ type: "video", data: { file: dummyMp4Path, duration: 12 } }],
+        {
+          tempDir: tmpRoot,
+          allowedFileDirs: [tmpRoot],
+          ffmpegPath: path.join(tmpRoot, "no_ffmpeg_installed"),
+        }
+      );
+      assert.strictEqual(vidConv.elements.length, 1);
+      const ve = vidConv.elements[0].videoElement;
+      assert.ok(ve, "Outbound video segment must produce videoElement");
+      assert.strictEqual(ve.fileTime, 12);
+      assert.ok(ve.thumbMd5 && ve.thumbMd5.length === 32, "Fallback PNG thumbnail MD5 must be populated");
+      assert.ok(ve.thumbSize > 0, "Fallback PNG thumbnail size must be non-zero");
+      assert.ok(ve.thumbPath instanceof Map && ve.thumbPath.get(0), "thumbPath Map(0 => path) must be populated");
+      for (const cb of vidConv.cleanupCallbacks) await cb();
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+
+    console.log("  [PASS] Suite 9: Store persistence, late-load runtime probe, SILK CLI & video segments");
+  }
+
+  console.log("=== All 9 Core Architecture Module Suites Passed ===");
 }
 
 runTests().catch((err) => {

@@ -1,13 +1,152 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
+const { execFile } = require("child_process");
 const { pathToFileURL } = require("url");
 
 const { segmentsToCqCode, normalizeOneBotMessage } = require("./cq_codec");
 const { pickPositiveUin, lookupCachedUin, buildNtMarketFaceUrl } = require("./stores");
 const { resolveMediaSource } = require("../core/media_security");
-const { prepareVoiceMedia, DEFAULT_WAVE_AMPLITUDES } = require("../core/audio_codec");
+const { resolveFfmpegPathFromEnv } = require("../core/env");
+const {
+  prepareVoiceMedia,
+  DEFAULT_WAVE_AMPLITUDES,
+} = require("../core/audio_codec");
+
+// Minimal valid 1x1 black RGB PNG (67 bytes) for fallback video thumbnail when ffmpeg is absent
+const FALLBACK_VIDEO_THUMB_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC",
+  "base64"
+);
+const FALLBACK_VIDEO_THUMB_MD5 = crypto
+  .createHash("md5")
+  .update(FALLBACK_VIDEO_THUMB_PNG)
+  .digest("hex");
+
+function parseFfmpegDurationSeconds(stderrText) {
+  const m = /Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/i.exec(String(stderrText || ""));
+  if (!m) return 0;
+  const sec = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  return Number.isFinite(sec) && sec > 0 ? Math.max(1, Math.round(sec)) : 0;
+}
+
+async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
+  const explicitCover = String(data.cover || data.thumb || "").trim();
+  if (explicitCover) {
+    try {
+      const coverMedia =
+        typeof ctx.resolveMediaSource === "function"
+          ? await ctx.resolveMediaSource(explicitCover, { kind: "image", preferredExt: ".jpg" })
+          : await resolveMediaSource(explicitCover, {
+              tempDir: ctx.tempDir,
+              preferredExt: ".jpg",
+              maxMediaBytes: ctx.maxMediaBytes,
+              allowPrivateUrls: ctx.allowPrivateUrls,
+              allowPrivateMediaUrls: ctx.allowPrivateMediaUrls,
+              allowArbitraryLocalFiles: ctx.allowArbitraryLocalFiles,
+              allowedFileDirs: ctx.allowedFileDirs,
+            });
+      if (coverMedia && coverMedia.localPath) {
+        return {
+          thumbMedia: coverMedia,
+          localPath: coverMedia.localPath,
+          md5HexStr: coverMedia.md5HexStr,
+          fileSize: Number(coverMedia.fileSize || 0),
+          width: Number(coverMedia.width || 480),
+          height: Number(coverMedia.height || 270),
+          probedDuration: 0,
+        };
+      }
+    } catch (_) {}
+  }
+
+  const baseTempDir = String(ctx.tempDir || path.join(os.tmpdir(), "rosmontis-media"));
+  await fs.promises.mkdir(baseTempDir, { recursive: true });
+  const randSuffix = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+
+  const ffmpegBin = resolveFfmpegPathFromEnv(ctx.ffmpegPath);
+  if (ffmpegBin && videoMedia?.localPath) {
+    const jpgThumbPath = path.join(baseTempDir, `vthumb_${randSuffix}.jpg`);
+    const timeoutMs = Math.max(1500, Number(ctx.transcodeTimeoutMs || 10000));
+    const ffResult = await new Promise((resolve) => {
+      execFile(
+        ffmpegBin,
+        [
+          "-hide_banner",
+          "-y",
+          "-i",
+          videoMedia.localPath,
+          "-frames:v",
+          "1",
+          "-vf",
+          "scale='min(480,iw)':-2",
+          "-q:v",
+          "5",
+          jpgThumbPath,
+        ],
+        { timeout: timeoutMs, windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
+        (err, _stdout, stderr) => {
+          resolve({ err, stderr: String(stderr || "") });
+        }
+      );
+    });
+    const probedDuration = parseFfmpegDurationSeconds(ffResult.stderr);
+    try {
+      const buf = await fs.promises.readFile(jpgThumbPath);
+      if (buf.length > 0) {
+        const md5HexStr = crypto.createHash("md5").update(buf).digest("hex");
+        const cleanup = async () => {
+          try {
+            await fs.promises.unlink(jpgThumbPath);
+          } catch (_) {}
+        };
+        return {
+          thumbMedia: { localPath: jpgThumbPath, isTemp: true, cleanup },
+          localPath: jpgThumbPath,
+          md5HexStr,
+          fileSize: buf.length,
+          width: 480,
+          height: 270,
+          probedDuration,
+        };
+      }
+    } catch (_) {}
+    try {
+      await fs.promises.unlink(jpgThumbPath);
+    } catch (_) {}
+  }
+
+  const pngThumbPath = path.join(baseTempDir, `vthumb_${randSuffix}.png`);
+  await fs.promises.writeFile(pngThumbPath, FALLBACK_VIDEO_THUMB_PNG);
+  const cleanup = async () => {
+    try {
+      await fs.promises.unlink(pngThumbPath);
+    } catch (_) {}
+  };
+  return {
+    thumbMedia: { localPath: pngThumbPath, isTemp: true, cleanup },
+    localPath: pngThumbPath,
+    md5HexStr: FALLBACK_VIDEO_THUMB_MD5,
+    fileSize: FALLBACK_VIDEO_THUMB_PNG.length,
+    width: 480,
+    height: 270,
+    probedDuration: 0,
+  };
+}
+
+function safePathToFileUrl(localPath) {
+  const trimmed = String(localPath || "").trim();
+  if (!trimmed) return "";
+  try {
+    if (path.isAbsolute(trimmed)) {
+      return pathToFileURL(trimmed).href;
+    }
+  } catch (_) {}
+  return `file://${trimmed.replace(/\\/g, "/")}`;
+}
 
 function buildNtPicUrl(picElement, chatType) {
   if (!picElement || typeof picElement !== "object") return "";
@@ -28,6 +167,13 @@ function buildNtPicUrl(picElement, chatType) {
       return `https://gchat.qpic.cn${origin}`;
     }
   }
+  if (typeof picElement.__localFileUrl === "string" && picElement.__localFileUrl) {
+    return picElement.__localFileUrl;
+  }
+  const md5 = String(picElement.md5HexStr || "").toUpperCase();
+  if (!origin.startsWith("/download") && md5 && /^[0-9A-F]{32}$/.test(md5)) {
+    return `https://gchat.qpic.cn/gchatpic_new/0/0-0-${md5}/0?term=2`;
+  }
   const candidatePaths = [];
   if (picElement.sourcePath) candidatePaths.push(String(picElement.sourcePath));
   if (picElement.thumbPath instanceof Map) {
@@ -39,23 +185,11 @@ function buildNtPicUrl(picElement, chatType) {
       if (p) candidatePaths.push(String(p));
     }
   }
-  for (const localPath of candidatePaths) {
-    try {
-      if (localPath && fs.existsSync(localPath)) {
-        const st = fs.statSync(localPath);
-        if (st.isFile() && st.size > 0) {
-          if (st.size <= 10 * 1024 * 1024) {
-            const b64 = fs.readFileSync(localPath).toString("base64");
-            return `base64://${b64}`;
-          }
-          return `file://${localPath}`;
-        }
-      }
-    } catch (_) {}
-  }
-  const md5 = String(picElement.md5HexStr || "").toUpperCase();
-  if (!origin.startsWith("/download") && md5 && /^[0-9A-F]{32}$/.test(md5)) {
-    return `https://gchat.qpic.cn/gchatpic_new/0/0-0-${md5}/0?term=2`;
+  if (!origin.startsWith("/download")) {
+    for (const localPath of candidatePaths) {
+      const fileUrl = safePathToFileUrl(localPath);
+      if (fileUrl) return fileUrl;
+    }
   }
   if (origin.startsWith("/download")) {
     return `https://multimedia.nt.qq.com.cn${origin}`;
@@ -190,6 +324,8 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
       let url = "";
       if (typeof ptt.__base64Uri === "string" && ptt.__base64Uri) {
         url = ptt.__base64Uri;
+      } else if (typeof ptt.__localFileUrl === "string" && ptt.__localFileUrl) {
+        url = ptt.__localFileUrl;
       } else if (pttLocal && fs.existsSync(pttLocal)) {
         url = pathToFileURL(pttLocal).href;
       } else {
@@ -217,7 +353,11 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
       const ve = el.videoElement;
       const veLocal = String(ve.filePath || ve.sourcePath || "");
       let url = "";
-      if (veLocal && fs.existsSync(veLocal)) {
+      if (typeof ve.__base64Uri === "string" && ve.__base64Uri) {
+        url = ve.__base64Uri;
+      } else if (typeof ve.__localFileUrl === "string" && ve.__localFileUrl) {
+        url = ve.__localFileUrl;
+      } else if (veLocal && fs.existsSync(veLocal)) {
         url = pathToFileURL(veLocal).href;
       }
       const file = String(
@@ -750,6 +890,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
         tempDir: ctx.tempDir,
         maxMediaBytes: ctx.maxMediaBytes,
         ffmpegPath: ctx.ffmpegPath,
+        silkEncoderPath: ctx.silkEncoderPath,
         transcodeTimeoutMs: ctx.transcodeTimeoutMs,
       });
       if (voiceMedia.extraTempMedia) {
@@ -827,23 +968,62 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
               allowedFileDirs: ctx.allowedFileDirs,
             });
       trackTempMedia(media);
+
+      const thumbInfo = await buildVideoThumbnail(media, data, ctx);
+      if (thumbInfo.thumbMedia) {
+        trackTempMedia(thumbInfo.thumbMedia);
+      }
+
+      let finalVideoPath = media.localPath;
+      let finalVideoName = media.fileName;
+      let finalVideoMd5 = media.md5HexStr;
+      let finalVideoSize = media.fileSize;
+      let finalThumbPath = thumbInfo.localPath;
+      let finalThumbMd5 = thumbInfo.md5HexStr;
+      let finalThumbSize = thumbInfo.fileSize;
+      const explicitDuration = Number(data.duration);
+      const fileTime =
+        Number.isFinite(explicitDuration) && explicitDuration > 0
+          ? Math.max(1, Math.round(explicitDuration))
+          : thumbInfo.probedDuration > 0
+          ? thumbInfo.probedDuration
+          : 5;
+
+      if (typeof ctx.prepareNtVideoPath === "function") {
+        const prepared = await ctx.prepareNtVideoPath(media, thumbInfo);
+        if (prepared && typeof prepared === "object") {
+          if (prepared.videoPath) finalVideoPath = String(prepared.videoPath);
+          if (prepared.fileName) finalVideoName = String(prepared.fileName);
+          if (prepared.videoMd5) finalVideoMd5 = String(prepared.videoMd5);
+          if (prepared.fileSize) finalVideoSize = Number(prepared.fileSize);
+          if (prepared.thumbPath) finalThumbPath = String(prepared.thumbPath);
+          if (prepared.thumbMd5) finalThumbMd5 = String(prepared.thumbMd5);
+          if (prepared.thumbSize) finalThumbSize = Number(prepared.thumbSize);
+        }
+      }
+
+      const thumbPathMap = new Map();
+      if (finalThumbPath) {
+        thumbPathMap.set(0, finalThumbPath);
+      }
+
       elements.push({
         elementType: 5,
         elementId: "",
         videoElement: {
-          filePath: media.localPath,
-          fileName: media.fileName,
-          videoMd5: media.md5HexStr,
-          thumbMd5: "",
-          fileTime: Number(data.duration || 5),
-          thumbSize: 0,
+          filePath: finalVideoPath,
+          fileName: finalVideoName,
+          videoMd5: finalVideoMd5,
+          thumbMd5: finalThumbMd5 || "",
+          fileTime,
+          thumbSize: Number(finalThumbSize || 0),
           fileFormat: 2,
-          fileSize: String(media.fileSize),
-          thumbWidth: 480,
-          thumbHeight: 270,
+          fileSize: String(finalVideoSize),
+          thumbWidth: thumbInfo.width || 480,
+          thumbHeight: thumbInfo.height || 270,
           busiType: 0,
           subBusiType: 0,
-          thumbPath: new Map(),
+          thumbPath: thumbPathMap,
           transferStatus: 0,
           progress: 0,
           invalidState: 0,

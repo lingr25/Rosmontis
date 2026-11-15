@@ -5,7 +5,12 @@ const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
 
-const { resolveTempDirFromEnv, resolveFfmpegPathFromEnv } = require("./env");
+const {
+  resolveTempDirFromEnv,
+  resolveFfmpegPathFromEnv,
+  resolveSilkDecoderPathFromEnv,
+  resolveSilkEncoderPathFromEnv,
+} = require("./env");
 const {
   resolveMaxMediaBytes,
   pruneTempDirAsync,
@@ -372,10 +377,14 @@ async function inspectAudioFile(filePath) {
 }
 
 function _execFfmpeg(ffmpegBin, args, timeoutMs = 30000) {
+  const binStr = String(ffmpegBin || "");
+  const isNodeScript = /\.(?:c|m)?js$/i.test(binStr);
+  const execBin = isNodeScript ? process.execPath : binStr;
+  const execArgs = isNodeScript ? [binStr, ...(args || [])] : args;
   return new Promise((resolve, reject) => {
     execFile(
-      ffmpegBin,
-      args,
+      execBin,
+      execArgs,
       {
         timeout: timeoutMs,
         windowsHide: true,
@@ -392,6 +401,172 @@ function _execFfmpeg(ffmpegBin, args, timeoutMs = 30000) {
       }
     );
   });
+}
+
+function wrapPcmS16leToWavBuffer(pcmBuf, sampleRate = 24000, channels = 1) {
+  const dataBytes = Buffer.isBuffer(pcmBuf) ? pcmBuf.length : 0;
+  const sr = Math.max(8000, Number(sampleRate) || 24000);
+  const ch = Math.max(1, Number(channels) || 1);
+  const bitsPerSample = 16;
+  const blockAlign = (ch * bitsPerSample) >> 3;
+  const byteRate = sr * blockAlign;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + dataBytes, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(ch, 22);
+  header.writeUInt32LE(sr, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(dataBytes, 40);
+  return dataBytes > 0 ? Buffer.concat([header, pcmBuf]) : header;
+}
+
+const _missingCliCache = new Set();
+
+async function _decodeSilkViaExternalCli(inputPath, silkFormat, options = {}) {
+  const configuredBin = resolveSilkDecoderPathFromEnv(options.silkDecoderPath);
+  const candidates = configuredBin ? [configuredBin] : ["silk_v3_decoder"];
+  const tempDir = resolveTempDirFromEnv(options.tempDir);
+  await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
+  const timeoutMs = Math.max(2000, Number(options.transcodeTimeoutMs || 30000));
+  const sampleRate = Math.max(8000, Number(options.silkSampleRate || 24000));
+
+  for (const bin of candidates) {
+    if (!configuredBin && _missingCliCache.has(bin)) continue;
+    const rand = crypto.randomBytes(6).toString("hex");
+    const tmpPcm = path.join(tempDir, `silk_dec_${process.pid}_${rand}.pcm`);
+    let tmpRawSilk = "";
+    try {
+      let silkSrc = path.resolve(inputPath);
+      if (silkFormat === "silk_tencent") {
+        const rawBuf = await fs.promises.readFile(silkSrc);
+        if (_startsWithBytes(rawBuf, TENCENT_SILK_MAGIC)) {
+          tmpRawSilk = path.join(tempDir, `silk_in_${process.pid}_${rand}.silk`);
+          await fs.promises.writeFile(tmpRawSilk, rawBuf.subarray(1), { mode: 0o600 });
+          silkSrc = tmpRawSilk;
+        }
+      }
+      try {
+        await _execFfmpeg(
+          bin,
+          [silkSrc, tmpPcm, "-Fs_API", String(sampleRate), "-quiet"],
+          timeoutMs
+        );
+      } catch (firstErr) {
+        if (firstErr && firstErr.code === "ENOENT") {
+          if (!configuredBin) _missingCliCache.add(bin);
+          throw firstErr;
+        }
+        await _execFfmpeg(bin, [silkSrc, tmpPcm], timeoutMs);
+      }
+      const pcmBuf = await fs.promises.readFile(tmpPcm);
+      if (pcmBuf.length > 0) {
+        return wrapPcmS16leToWavBuffer(pcmBuf, sampleRate, 1);
+      }
+    } catch (_) {
+    } finally {
+      await fs.promises.unlink(tmpPcm).catch(() => {});
+      if (tmpRawSilk) await fs.promises.unlink(tmpRawSilk).catch(() => {});
+    }
+  }
+  return null;
+}
+
+async function _encodeSilkViaExternalCli(inputPath, options = {}) {
+  const encoderBin = resolveSilkEncoderPathFromEnv(options.silkEncoderPath);
+  if (!encoderBin) return null;
+  const maxMediaBytes = resolveMaxMediaBytes(options);
+  const tempDir = resolveTempDirFromEnv(options.tempDir);
+  await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
+  const maxTempFiles = Math.max(8, Number(options.maxTempFiles || 128));
+  const ffmpegBin = resolveFfmpegPathFromEnv(options.ffmpegPath);
+  const timeoutMs = Math.max(2000, Number(options.transcodeTimeoutMs || 30000));
+  const sampleRate = Math.max(8000, Number(options.silkSampleRate || 24000));
+
+  const rand = crypto.randomBytes(6).toString("hex");
+  const tmpPcm = path.join(tempDir, `silk_enc_${process.pid}_${rand}.pcm`);
+  const tmpSilk = path.join(tempDir, `silk_enc_${process.pid}_${rand}.silk`);
+
+  try {
+    await _execFfmpeg(
+      ffmpegBin,
+      [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        path.resolve(inputPath),
+        "-vn",
+        "-ar",
+        String(sampleRate),
+        "-ac",
+        "1",
+        "-f",
+        "s16le",
+        tmpPcm,
+      ],
+      timeoutMs
+    );
+    await _execFfmpeg(
+      encoderBin,
+      [
+        tmpPcm,
+        tmpSilk,
+        "-Fs_API",
+        String(sampleRate),
+        "-rate",
+        String(sampleRate),
+        "-tencent",
+        "-quiet",
+      ],
+      timeoutMs
+    );
+    let silkBuf = await fs.promises.readFile(tmpSilk);
+    if (silkBuf.length === 0) return null;
+    if (_startsWithBytes(silkBuf, RAW_SILK_MAGIC)) {
+      silkBuf = Buffer.concat([Buffer.from([0x02]), silkBuf]);
+    }
+    if (!_startsWithBytes(silkBuf, TENCENT_SILK_MAGIC)) return null;
+    if (silkBuf.length > maxMediaBytes) {
+      const err = new Error(
+        `Encoded SILK voice (${silkBuf.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+      );
+      err.code = "ERR_MEDIA_TOO_LARGE";
+      throw err;
+    }
+    const md5HexStr = crypto.createHash("md5").update(silkBuf).digest("hex");
+    const fileName = `${md5HexStr}.amr`;
+    const localPath = path.join(tempDir, fileName);
+    await writeTempMediaAtomically(localPath, silkBuf, false);
+    await pruneTempDirAsync(tempDir, maxTempFiles);
+    const info = inspectAudioBuffer(silkBuf);
+    return {
+      localPath,
+      fileName,
+      fileSize: silkBuf.length,
+      md5HexStr,
+      format: "silk_tencent",
+      formatType: 1,
+      duration: info.duration || 3,
+      durationSec: info.durationSec,
+      waveAmplitudes: info.waveAmplitudes,
+      extraTempMedia: { localPath, isTempFile: true },
+    };
+  } catch (err) {
+    if (err && err.code === "ERR_MEDIA_TOO_LARGE") throw err;
+    return null;
+  } finally {
+    await fs.promises.unlink(tmpPcm).catch(() => {});
+    await fs.promises.unlink(tmpSilk).catch(() => {});
+  }
 }
 
 async function transcodeAudioToAmrNb(inputPath, options = {}) {
@@ -537,6 +712,11 @@ async function prepareVoiceMedia(media, options = {}) {
     };
   }
 
+  const silkEncoded = await _encodeSilkViaExternalCli(media.localPath, options);
+  if (silkEncoded) {
+    return silkEncoded;
+  }
+
   const transcoded = await transcodeAudioToAmrNb(media.localPath, {
     ...options,
     detectedFormat: info.format,
@@ -583,17 +763,44 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
     return null;
   }
 
-  // Standard ffmpeg lacks a Tencent SILK v3 decoder; return null so get_record falls back cleanly
-  if (info.format === "silk_tencent" || info.format === "silk_raw") {
-    return null;
-  }
-
   const maxMediaBytes = resolveMaxMediaBytes(options);
   const tempDir = resolveTempDirFromEnv(options.tempDir);
   await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
   const maxTempFiles = Math.max(8, Number(options.maxTempFiles || 128));
   const ffmpegBin = resolveFfmpegPathFromEnv(options.ffmpegPath);
   const timeoutMs = Math.max(2000, Number(options.transcodeTimeoutMs || 30000));
+
+  let effectiveInputPath = path.resolve(inputPath);
+  let decodedSilkWavTempPath = "";
+
+  // Decode SILK v3 via external SILK CLI if available; for wav output no ffmpeg is needed!
+  if (info.format === "silk_tencent" || info.format === "silk_raw") {
+    const wavBuf = await _decodeSilkViaExternalCli(inputPath, info.format, options);
+    if (!wavBuf) {
+      return null;
+    }
+    if (normFmt === "wav") {
+      if (wavBuf.length === 0 || wavBuf.length > maxMediaBytes) return null;
+      const md5HexStr = crypto.createHash("md5").update(wavBuf).digest("hex");
+      const fileName = `${md5HexStr}.wav`;
+      const finalPath = path.join(tempDir, fileName);
+      await writeTempMediaAtomically(finalPath, wavBuf, false);
+      await pruneTempDirAsync(tempDir, maxTempFiles);
+      return {
+        localPath: finalPath,
+        fileName,
+        fileSize: wavBuf.length,
+        md5HexStr,
+        isTempFile: true,
+      };
+    }
+    decodedSilkWavTempPath = path.join(
+      tempDir,
+      `silk_wav_${process.pid}_${crypto.randomBytes(6).toString("hex")}.wav`
+    );
+    await fs.promises.writeFile(decodedSilkWavTempPath, wavBuf, { mode: 0o600 });
+    effectiveInputPath = decodedSilkWavTempPath;
+  }
 
   const tmpOut = path.join(
     tempDir,
@@ -610,7 +817,7 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
         "error",
         "-y",
         "-i",
-        path.resolve(inputPath),
+        effectiveInputPath,
         ...spec.args,
         tmpOut,
       ],
@@ -636,6 +843,10 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
   } catch (_) {
     await fs.promises.unlink(tmpOut).catch(() => {});
     return null;
+  } finally {
+    if (decodedSilkWavTempPath) {
+      await fs.promises.unlink(decodedSilkWavTempPath).catch(() => {});
+    }
   }
 }
 
@@ -645,6 +856,7 @@ module.exports = {
   AMR_NB_MAGIC,
   AMR_WB_MAGIC,
   DEFAULT_WAVE_AMPLITUDES,
+  wrapPcmS16leToWavBuffer,
   inspectAudioBuffer,
   inspectAudioFile,
   transcodeAudioToAmrNb,

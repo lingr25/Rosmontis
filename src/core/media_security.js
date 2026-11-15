@@ -1050,7 +1050,7 @@ function _isSensitiveCredentialOrDbPath(targetPath) {
   const base = (parts[parts.length - 1] || "").toLowerCase();
   if (!base) return false;
   if (SENSITIVE_FILENAMES.has(base) || base.startsWith(".env.")) return true;
-  if (/^(?:rosmontis|onebot|xiao_bridge).*\.json$/i.test(base)) return true;
+  if (/^\.?(?:rosmontis|onebot|xiao_bridge).*\.json$/i.test(base)) return true;
   const ext = path.extname(base);
   if (ext && SENSITIVE_EXTENSIONS.has(ext)) return true;
   return false;

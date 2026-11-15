@@ -9,6 +9,7 @@
  */
 
 const crypto = require("crypto");
+const path = require("path");
 const { EventEmitter } = require("events");
 
 const {
@@ -95,6 +96,7 @@ class NtqqOneBotBridge extends EventEmitter {
     this.selfUin = String(options.selfUin || this.config.selfUin || "");
     this.selfUid = String(options.selfUid || "");
     this.selfNickname = String(options.selfNickname || this.config.selfNickname || "QQBot");
+    this._initStorePersistence(options);
     this.startedAtMs = Number.isFinite(Number(options.startedAtMs))
       ? Number(options.startedAtMs)
       : Date.now();
@@ -147,9 +149,38 @@ class NtqqOneBotBridge extends EventEmitter {
     this._wsServerClients = new Set();
     this._reverseWsClients = [];
     this._wsClientHandles = this._reverseWsClients;
+    this._activeWebhookReqs = new Set();
     this.listenErrors = [];
     this._heartbeatTimer = null;
     this._wsPingTimer = null;
+  }
+
+  _initStorePersistence(options = {}) {
+    const stateDir = typeof this.config?.stateDir === "string" ? this.config.stateDir.trim() : "";
+    if (!stateDir || this.config?.persistStores === false) return;
+    const rawTag = String(this.config?.selfUin || options.selfUin || "").trim();
+    const uinTag = rawTag ? `_${rawTag.replace(/[^0-9a-zA-Z_-]/g, "")}` : "";
+    const debounceMs = Number.isFinite(Number(this.config?.statePersistDebounceMs))
+      ? Math.max(0, Math.trunc(Number(this.config.statePersistDebounceMs)))
+      : 1500;
+    const msgStorePath = path.join(stateDir, `.rosmontis_state_messages${uinTag}.json`);
+    const uinUidStorePath = path.join(stateDir, `.rosmontis_state_uin_uid${uinTag}.json`);
+
+    if (!options.messageIdStore && this.messageIdStore) {
+      this.messageIdStore.loadFromFileSync?.(msgStorePath);
+      this.messageIdStore.enableAutoPersist?.(msgStorePath, { debounceMs });
+    }
+    if (!options.uinUidStore && this.uinUidStore) {
+      this.uinUidStore.loadFromFileSync?.(uinUidStorePath);
+      this.uinUidStore.enableAutoPersist?.(uinUidStorePath, { debounceMs });
+    }
+  }
+
+  async flushStateStores() {
+    await Promise.allSettled([
+      this.messageIdStore?.flushPersist?.(),
+      this.uinUidStore?.flushPersist?.(),
+    ]);
   }
 
   // --------------------------------------------------------------------------
@@ -252,6 +283,10 @@ class NtqqOneBotBridge extends EventEmitter {
       if (event.post_type === "message_sent" && !rev.cfg?.reportSelfMessage) continue;
       const targetFormat = rev.messageFormat || rev.cfg?.messageFormat || defaultFormat;
       rev.conn.sendJson(this._formatEventForEndpoint(event, targetFormat));
+    }
+
+    if (typeof this._dispatchHttpWebhookEvent === "function") {
+      this._dispatchHttpWebhookEvent(event);
     }
   }
 

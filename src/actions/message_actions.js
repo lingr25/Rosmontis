@@ -13,6 +13,102 @@ const { resolveCompatVersionInfo } = require("../core/config");
 const { createActionRouter } = require("../core/primitives");
 
 const MAX_FORWARD_DEPTH = 3;
+const MAX_OVERFLOW_SUMMARY_LINES = 20;
+const MAX_OVERFLOW_SUMMARY_CHARS = 1500;
+
+function extractNodeMeta(node, bridge, defaultSource, selfNick) {
+  const nd = node;
+  const d = nd.data && typeof nd.data === "object" && !Array.isArray(nd.data) ? nd.data : nd;
+  const customName = String(
+    d.name ||
+      d.nickname ||
+      nd.sender?.card ||
+      nd.sender?.nickname ||
+      d.sender?.card ||
+      d.sender?.nickname ||
+      ""
+  ).trim();
+  const customUin = String(
+    d.uin || d.user_id || nd.sender?.user_id || d.sender?.user_id || bridge.selfUin || "0"
+  );
+  const nodeShowName = String(
+    customName || defaultSource || selfNick || customUin || bridge.selfNickname || "QQBot"
+  );
+  return { d, customName, nodeShowName };
+}
+
+function summarizeNodeContent(content) {
+  let rawText = "";
+  if (typeof content === "string") {
+    rawText = content;
+  } else if (Array.isArray(content) || (content && typeof content === "object")) {
+    const items = Array.isArray(content) ? content : [content];
+    rawText = items
+      .map((seg) => {
+        if (typeof seg === "string") return seg;
+        if (!seg || typeof seg !== "object") return "";
+        const t = String(seg.type || "").trim().toLowerCase();
+        if (t === "text") return String(seg.data?.text ?? seg.text ?? "");
+        if (t === "node") return "[转发消息]";
+        if (t === "image" || t === "mface") return "[图片]";
+        if (t === "record") return "[语音]";
+        if (t === "video") return "[视频]";
+        if (t === "file") {
+          const fname = seg.data?.name || seg.name || "";
+          return fname ? `[文件: ${fname}]` : "[文件]";
+        }
+        if (t === "at") return `@${seg.data?.name || seg.data?.qq || ""}`;
+        if (t === "face") return "[表情]";
+        if (t === "json" || t === "xml") return "[卡片消息]";
+        return t ? `[${t}]` : "";
+      })
+      .join("");
+  } else if (content !== undefined && content !== null) {
+    rawText = String(content);
+  }
+  const singleLine = rawText.replace(/\s+/g, " ").trim();
+  if (!singleLine) return "[消息]";
+  return singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
+}
+
+function buildOverflowSummaryText(overflowEntries) {
+  const total = overflowEntries.length;
+  if (total === 0) return "";
+  const lines = [];
+  let charCount = 0;
+  let included = 0;
+  const maxLines = Math.min(total, MAX_OVERFLOW_SUMMARY_LINES);
+
+  for (let idx = 0; idx < maxLines; idx += 1) {
+    const { name, brief } = overflowEntries[idx];
+    const line = `${name}: ${brief}`;
+    const willHaveOmitted = idx + 1 < total;
+    const reserve = willHaveOmitted ? 36 : 0;
+    const sep = lines.length > 0 ? 1 : 0;
+    if (lines.length === 0 && line.length + reserve > MAX_OVERFLOW_SUMMARY_CHARS) {
+      const budget = Math.max(10, MAX_OVERFLOW_SUMMARY_CHARS - reserve - 3);
+      lines.push(`${line.slice(0, budget)}...`);
+      charCount = lines[0].length;
+      included = 1;
+      break;
+    }
+    if (charCount + sep + line.length + reserve > MAX_OVERFLOW_SUMMARY_CHARS) {
+      break;
+    }
+    lines.push(line);
+    charCount += sep + line.length;
+    included += 1;
+  }
+
+  const omitted = total - included;
+  if (omitted > 0) {
+    lines.push(`... (共省略 ${omitted} 条节点)`);
+  }
+  const joined = lines.join("\n");
+  return joined.length > MAX_OVERFLOW_SUMMARY_CHARS
+    ? joined.slice(0, MAX_OVERFLOW_SUMMARY_CHARS)
+    : joined;
+}
 
 function stripTransientNtMedia(ntMsg) {
   if (typeof bridgeOneBot.stripTransientNtMedia === "function") {
@@ -53,7 +149,8 @@ async function stageForwardNodes(
   fallbackPeer,
   getSelfPeer,
   defaultSource = "",
-  depth = 1
+  depth = 1,
+  state = { customCount: 0, overflowSent: false }
 ) {
   const nodes = Array.isArray(rawNodes) ? rawNodes : [];
   const msgInfos = [];
@@ -62,24 +159,70 @@ async function stageForwardNodes(
   const selfNick =
     bridge.selfNickname && bridge.selfNickname !== "QQBot" ? bridge.selfNickname : "";
 
-  for (const node of nodes) {
-    if (!node || typeof node !== "object") continue;
-    const nd = node;
-    const d = nd.data && typeof nd.data === "object" && !Array.isArray(nd.data) ? nd.data : nd;
-    const customName = String(
-      d.name ||
-        d.nickname ||
-        nd.sender?.card ||
-        nd.sender?.nickname ||
-        d.sender?.card ||
-        d.sender?.nickname ||
-        ""
-    ).trim();
-    const customUin = String(
-      d.uin || d.user_id || nd.sender?.user_id || d.sender?.user_id || bridge.selfUin || "0"
+  const rawCap = Number(bridge.config?.maxForwardCustomNodes);
+  const maxCustomNodes = Number.isFinite(rawCap) && rawCap > 0 ? Math.floor(rawCap) : 40;
+  const rawDelay = Number(bridge.config?.forwardStageDelayMs || 0);
+  const stageDelayMs = Number.isFinite(rawDelay) && rawDelay > 0 ? rawDelay : 0;
+
+  const sendStagedCustom = async (selfPeer, payload) => {
+    state.customCount += 1;
+    if (stageDelayMs > 0 && state.customCount > 1) {
+      await new Promise((resolve) => setTimeout(resolve, stageDelayMs));
+    }
+    return await bridge._sendMessageToPeer(
+      selfPeer,
+      payload,
+      false,
+      undefined,
+      { skipHumanSimulation: true }
     );
-    const nodeShowName = String(
-      customName || defaultSource || selfNick || customUin || bridge.selfNickname || "QQBot"
+  };
+
+  const stageOverflowFromEntries = async (selfPeer, overflowEntries) => {
+    if (state.overflowSent || overflowEntries.length === 0) return;
+    state.overflowSent = true;
+    const summaryText = buildOverflowSummaryText(overflowEntries);
+    if (!summaryText) return;
+    stagedCustomCount += 1;
+    const summarySenderName =
+      overflowEntries.length === 1
+        ? overflowEntries[0].name
+        : String(
+            defaultSource || selfNick || bridge.selfNickname || overflowEntries[0].name || "QQBot"
+          );
+    const subSent = await sendStagedCustom(selfPeer, summaryText);
+    if (subSent?.real_id) {
+      msgInfos.push({ msgId: String(subSent.real_id), senderShowName: summarySenderName });
+    }
+  };
+
+  const collectRemainingCustomEntries = (startIdx) => {
+    const entries = [];
+    for (let j = startIdx; j < nodes.length; j += 1) {
+      const remNode = nodes[j];
+      if (!remNode || typeof remNode !== "object") continue;
+      const { d: remD, nodeShowName: remName } = extractNodeMeta(
+        remNode,
+        bridge,
+        defaultSource,
+        selfNick
+      );
+      if (remD.id !== undefined && remD.id !== null && String(remD.id) !== "") continue;
+      const remContent = remD.content !== undefined ? remD.content : remD.message;
+      if (remContent === undefined) continue;
+      entries.push({ name: remName, brief: summarizeNodeContent(remContent) });
+    }
+    return entries;
+  };
+
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    if (!node || typeof node !== "object") continue;
+    const { d, customName, nodeShowName } = extractNodeMeta(
+      node,
+      bridge,
+      defaultSource,
+      selfNick
     );
 
     if (d.id !== undefined && d.id !== null && String(d.id) !== "") {
@@ -111,6 +254,15 @@ async function stageForwardNodes(
     const content = d.content !== undefined ? d.content : d.message;
     if (content === undefined) continue;
 
+    if (state.customCount >= maxCustomNodes) {
+      if (!state.overflowSent) {
+        const selfPeer = await getSelfPeer();
+        const overflowEntries = collectRemainingCustomEntries(i);
+        await stageOverflowFromEntries(selfPeer, overflowEntries);
+      }
+      continue;
+    }
+
     stagedCustomCount += 1;
     const selfPeer = await getSelfPeer();
     const rawItems = Array.isArray(content)
@@ -128,13 +280,7 @@ async function stageForwardNodes(
     );
 
     if (!hasNestedNodes) {
-      const subSent = await bridge._sendMessageToPeer(
-        selfPeer,
-        content,
-        false,
-        undefined,
-        { skipHumanSimulation: true }
-      );
+      const subSent = await sendStagedCustom(selfPeer, content);
       if (subSent?.real_id) {
         msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
       }
@@ -144,13 +290,7 @@ async function stageForwardNodes(
           ? { type: "text", data: { text: "[转发消息]" } }
           : it
       );
-      const subSent = await bridge._sendMessageToPeer(
-        selfPeer,
-        flattened,
-        false,
-        undefined,
-        { skipHumanSimulation: true }
-      );
+      const subSent = await sendStagedCustom(selfPeer, flattened);
       if (subSent?.real_id) {
         msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
       }
@@ -177,7 +317,8 @@ async function stageForwardNodes(
             selfPeer,
             getSelfPeer,
             "",
-            depth + 1
+            depth + 1,
+            state
           );
           if (inner.msgInfos.length > 0) {
             const innerFwd = await bridge._invokeForwardWithEcho(selfPeer, () =>
@@ -220,15 +361,25 @@ async function stageForwardNodes(
             idx += 1;
           }
           if (segRun.length > 0) {
-            const subSent = await bridge._sendMessageToPeer(
-              selfPeer,
-              segRun,
-              false,
-              undefined,
-              { skipHumanSimulation: true }
-            );
-            if (subSent?.real_id) {
-              msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
+            if (state.customCount >= maxCustomNodes) {
+              if (!state.overflowSent) {
+                const restInNode = rawItems.slice(idx);
+                const overflowEntries = [
+                  {
+                    name: nodeShowName,
+                    brief: summarizeNodeContent(
+                      restInNode.length > 0 ? [...segRun, ...restInNode] : segRun
+                    ),
+                  },
+                  ...collectRemainingCustomEntries(i + 1),
+                ];
+                await stageOverflowFromEntries(selfPeer, overflowEntries);
+              }
+            } else {
+              const subSent = await sendStagedCustom(selfPeer, segRun);
+              if (subSent?.real_id) {
+                msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
+              }
             }
           }
         }
