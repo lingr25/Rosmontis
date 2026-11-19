@@ -1,7 +1,11 @@
 "use strict";
 
-const fs = require("fs");
-const { pathToFileURL } = require("url");
+/**
+ * Inbound Kernel Event Routing, UID Resolution & Per-Peer Concurrency Pipeline (`src/core/inbound_pipeline.js`)
+ *
+ * Composes `mediaHydratorMixin` (`./media_hydrator`) and `loginRecoveryMixin` (`./login_recovery`)
+ * into `inboundPipelineMixin` for seamless attachment onto `NtqqOneBotBridge.prototype`.
+ */
 
 const bridgeOnebot = require("../bridge_onebot");
 const {
@@ -12,7 +16,9 @@ const {
 } = bridgeOnebot;
 const { isPrefixedEnvFlagOne } = require("./env");
 const { setBoundedMap } = require("./primitives");
-const { pickPositiveUin, normalizeLoginIdentity } = require("./nt_normalizer");
+const { pickPositiveUin } = require("./nt_normalizer");
+const { mediaHydratorMixin, stripTransientMedia } = require("./media_hydrator");
+const { loginRecoveryMixin } = require("./login_recovery");
 
 function _isPositiveUin(v) {
   return (
@@ -30,42 +36,6 @@ function _pickPositiveUin(...candidates) {
   return picked > 0 ? String(picked) : "";
 }
 
-function _defineLocalFileUrl(target, localPath) {
-  if (!target || typeof target !== "object" || !localPath) return;
-  try {
-    Object.defineProperty(target, "__localFileUrl", {
-      value: pathToFileURL(String(localPath)).href,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  } catch (_) {}
-}
-
-function _stripTransientMedia(ntMsg) {
-  if (typeof bridgeOnebot.stripTransientNtMedia === "function") {
-    try {
-      bridgeOnebot.stripTransientNtMedia(ntMsg);
-    } catch (_) {}
-  }
-  if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
-  for (const el of ntMsg.elements) {
-    if (!el || typeof el !== "object") continue;
-    if (el.picElement && typeof el.picElement === "object") {
-      if ("__base64Uri" in el.picElement) delete el.picElement.__base64Uri;
-      if ("__localFileUrl" in el.picElement) delete el.picElement.__localFileUrl;
-    }
-    if (el.pttElement && typeof el.pttElement === "object") {
-      if ("__base64Uri" in el.pttElement) delete el.pttElement.__base64Uri;
-      if ("__localFileUrl" in el.pttElement) delete el.pttElement.__localFileUrl;
-    }
-    if (el.videoElement && typeof el.videoElement === "object") {
-      if ("__base64Uri" in el.videoElement) delete el.videoElement.__base64Uri;
-      if ("__localFileUrl" in el.videoElement) delete el.videoElement.__localFileUrl;
-    }
-  }
-}
-
 function _isRecallMsg(ntMsg) {
   if (!ntMsg || typeof ntMsg !== "object") return false;
   if (ntMsg.recallTime && String(ntMsg.recallTime) !== "0" && Number(ntMsg.recallTime) > 0) {
@@ -79,17 +49,6 @@ function _isRecallMsg(ntMsg) {
     return true;
   }
   return false;
-}
-
-async function _statPositiveFile(filePath) {
-  if (!filePath) return null;
-  try {
-    const st = await fs.promises.stat(String(filePath));
-    if (st.isFile() && st.size > 0) {
-      return st;
-    }
-  } catch (_) {}
-  return null;
 }
 
 function _collectTemplParamUids(templParam, out) {
@@ -127,7 +86,7 @@ function _collectTemplParamUids(templParam, out) {
   }
 }
 
-const inboundPipelineMixin = {
+const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecoveryMixin, {
   _isPositiveUin(v) {
     return _isPositiveUin(v);
   },
@@ -277,7 +236,7 @@ const inboundPipelineMixin = {
             }
             if (rev.origMsgSenderUid && !_isPositiveUin(rev.origMsgSenderUin)) {
               queueUid(rev.origMsgSenderUid, (uin) => {
-                rev.origMsgSenderUid = String(uin);
+                rev.origMsgSenderUin = String(uin);
               });
             }
           }
@@ -465,6 +424,551 @@ const inboundPipelineMixin = {
     return taskPromise;
   },
 
+  _handleAddSendMsgEvent(firstArg) {
+    const ntMsg = firstArg?.msgRecord || firstArg;
+    if (!ntMsg || typeof ntMsg !== "object" || !ntMsg.msgId) return;
+    if (this._isDuplicateEvent(`send:${ntMsg.msgId}`)) {
+      return;
+    }
+    this._matchSendEcho(ntMsg);
+    this.uinUidStore.rememberFromNtMsg(ntMsg);
+    try {
+      const ev = formatNtMsgToOneBotEvent(ntMsg, {
+        selfId: this.selfUin,
+        uinUidStore: this.uinUidStore,
+        messageIdStore: this.messageIdStore,
+        reportSelfMessage: false,
+      });
+      if (ev && ev.message_id !== undefined) {
+        this.messageIdStore?.indexMsgMedia?.(ntMsg, ev.message_id);
+      }
+      if (ev && ev.post_type === "message_sent") {
+        this._dispatchInboundEvent(ev);
+      }
+    } finally {
+      stripTransientMedia(ntMsg);
+    }
+  },
+
+  async _handleMsgInfoUpdateEvent(eventName, firstArg) {
+    const msgList = Array.isArray(firstArg)
+      ? firstArg
+      : Array.isArray(firstArg?.msgList)
+      ? firstArg.msgList
+      : firstArg &&
+        typeof firstArg === "object" &&
+        (firstArg.msgId || Array.isArray(firstArg.emojiLikesList))
+      ? [firstArg]
+      : [];
+
+    for (const ntMsg of msgList) {
+      if (!ntMsg || typeof ntMsg !== "object") continue;
+
+      // Check PTT voice-to-text completion waiters
+      if (Array.isArray(ntMsg.elements)) {
+        const pttEl = ntMsg.elements.find((e) => e?.elementType === 4 && e.pttElement)?.pttElement;
+        if (pttEl && pttEl.text && this._pttTextWaiters.has(String(ntMsg.msgId))) {
+          const waiter = this._pttTextWaiters.get(String(ntMsg.msgId));
+          this._pttTextWaiters.delete(String(ntMsg.msgId));
+          waiter(String(pttEl.text));
+        }
+      }
+
+      if (eventName === "onMsgInfoListUpdate" && _isRecallMsg(ntMsg)) {
+        const recallTag =
+          ntMsg.recallTime && String(ntMsg.recallTime) !== "0"
+            ? String(ntMsg.recallTime)
+            : "revoke";
+        const dedupKey = `recall:${ntMsg.msgId}:${recallTag}`;
+        if (!this._isDuplicateEvent(dedupKey)) {
+          await this._resolveNtMsgUids(ntMsg);
+          try {
+            const ev = formatNtMsgToOneBotEvent(ntMsg, {
+              selfId: this.selfUin,
+              uinUidStore: this.uinUidStore,
+              messageIdStore: this.messageIdStore,
+            });
+            if (ev && ev.post_type === "notice") {
+              this._dispatchInboundEvent(ev);
+            }
+          } finally {
+            stripTransientMedia(ntMsg);
+          }
+        }
+        continue;
+      }
+
+      await this._resolveNtMsgUids(ntMsg);
+      let hit = null;
+      let oneBotId = 0;
+      try {
+        hit =
+          this.messageIdStore?.resolveByNtKey?.(ntMsg.chatType, ntMsg.peerUid, ntMsg.msgId) ||
+          (ntMsg.msgId ? this.messageIdStore?.getByMsgId?.(ntMsg.msgId) : null) ||
+          (ntMsg.peerUid && ntMsg.msgSeq
+            ? this.messageIdStore?.getByPeerAndSeq?.(
+                ntMsg.chatType,
+                ntMsg.peerUid,
+                ntMsg.msgSeq
+              )
+            : null);
+        if (hit) {
+          if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
+            if (hit.rawMsg !== null && hit.rawMsg !== undefined) {
+              hit.rawMsg = ntMsg;
+            } else {
+              this.messageIdStore?.register?.(
+                ntMsg.msgId,
+                {
+                  chatType: Number(ntMsg.chatType || 1),
+                  peerUid: String(ntMsg.peerUid || ""),
+                  guildId: String(ntMsg.guildId || ""),
+                },
+                ntMsg.msgSeq,
+                {
+                  ...(ntMsg.senderUin ? { senderUin: String(ntMsg.senderUin) } : {}),
+                  ...(ntMsg.senderUid ? { senderUid: String(ntMsg.senderUid) } : {}),
+                  rawMsg: ntMsg,
+                }
+              );
+            }
+          }
+          oneBotId = hit.oneBotId ?? hit.shortId;
+          if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
+            this.messageIdStore?.indexMsgMedia?.(ntMsg, oneBotId);
+          }
+        } else if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
+          this.messageIdStore?.indexMsgMedia?.(ntMsg);
+        }
+
+        if (Array.isArray(ntMsg.emojiLikesList)) {
+          if (!(this._emojiLikesSnapshot instanceof Map)) {
+            this._emojiLikesSnapshot = new Map();
+          }
+          const snapshotKey = String(
+            ntMsg.msgId || `${ntMsg.chatType || 0}:${ntMsg.peerUid || ""}:${ntMsg.msgSeq || ""}`
+          );
+          const likes = ntMsg.emojiLikesList
+            .filter((item) => item && typeof item === "object")
+            .map((item) => ({
+              emoji_id: String(item.emojiId ?? item.emoji_id ?? ""),
+              emoji_type: Number(item.emojiType ?? item.emoji_type ?? 1),
+              count: Number(item.likesCnt ?? item.count ?? 1),
+            }));
+          if (likes.length === 0) {
+            if (snapshotKey) {
+              this._emojiLikesSnapshot.delete(snapshotKey);
+            }
+          } else {
+            const serializedSnapshot = likes
+              .map((x) => `${x.emoji_type}:${x.emoji_id}:${x.count}`)
+              .sort()
+              .join(",");
+            const prevSnapshot = snapshotKey
+              ? this._emojiLikesSnapshot.get(snapshotKey)
+              : undefined;
+            if (
+              prevSnapshot !== serializedSnapshot ||
+              eventName === "onMsgEmojiLikesListChanged"
+            ) {
+              if (snapshotKey) {
+                setBoundedMap(this._emojiLikesSnapshot, snapshotKey, serializedSnapshot, 2000);
+              }
+              const effectiveChatType = Number(ntMsg.chatType || hit?.peer?.chatType || 0);
+              const groupId = pickPositiveUin(
+                ntMsg.peerUid,
+                ntMsg.peerUin,
+                hit?.peer?.peerUid,
+                hit?.groupId
+              );
+              if (effectiveChatType === 2 && groupId > 0) {
+                const userId = Number(
+                  pickPositiveUin(
+                    ntMsg.senderUin,
+                    ntMsg.senderUid ? this.uinUidStore?.getUinSync?.(ntMsg.senderUid) : 0,
+                    hit?.senderUin,
+                    hit?.senderUid ? this.uinUidStore?.getUinSync?.(hit.senderUid) : 0
+                  ) || 0
+                );
+                this._dispatchInboundEvent(
+                  formatNoticeEvent(
+                    "group_msg_emoji_like",
+                    {
+                      group_id: groupId,
+                      user_id: userId,
+                      message_id: Number(oneBotId || 0),
+                      likes,
+                    },
+                    { selfId: this.selfUin }
+                  )
+                );
+              }
+            }
+          }
+        }
+      } finally {
+        stripTransientMedia(ntMsg);
+      }
+    }
+  },
+
+  async _handleGroupNotifiesUpdatedEvent(args, firstArg) {
+    const doubt =
+      typeof args[0] === "boolean"
+        ? args[0]
+        : typeof firstArg?.doubt === "boolean"
+        ? firstArg.doubt
+        : false;
+    const notifies = Array.isArray(args[1])
+      ? args[1]
+      : Array.isArray(firstArg?.notifies)
+      ? firstArg.notifies
+      : Array.isArray(firstArg)
+      ? firstArg
+      : [];
+    for (const item of notifies) {
+      if (!item || typeof item !== "object") continue;
+      const seq = String(item.seq || "");
+      const notifyType = Number(item.type || 0);
+      const status = Number(item.status || 0);
+      const groupId = pickPositiveUin(item.group?.groupCode);
+      const flag = seq ? `${seq}:${notifyType}:${groupId}` : "";
+      const cachedItem =
+        typeof item.doubt === "boolean" ? item : { ...item, doubt: Boolean(doubt) };
+      if (flag) setBoundedMap(this._groupNotifiesCache, flag, cachedItem);
+
+      if (item.user1?.uid && _isPositiveUin(item.user1?.uin)) {
+        this.uinUidStore?.remember?.(item.user1.uin, item.user1.uid, {
+          nickname: item.user1.nickName || "",
+        });
+      }
+      if (item.user2?.uid && _isPositiveUin(item.user2?.uin)) {
+        this.uinUidStore?.remember?.(item.user2.uin, item.user2.uid, {
+          nickname: item.user2.nickName || "",
+        });
+      }
+
+      // status === 1 means pending approval
+      if (status === 1 && (notifyType === 1 || notifyType === 2 || notifyType === 7)) {
+        const dedupKey = `group_req:${flag}`;
+        if (this._isDuplicateEvent(dedupKey)) continue;
+        const userUid = item.user1?.uid || "";
+        const resolvedUser1Uin =
+          _pickPositiveUin(item.user1?.uin) || (await this._ensureUinForUid(userUid));
+        if (_isPositiveUin(resolvedUser1Uin) && item.user1) {
+          item.user1.uin = String(resolvedUser1Uin);
+        }
+        if (item.user2?.uid && !_isPositiveUin(item.user2?.uin)) {
+          const resolvedUser2Uin = await this._ensureUinForUid(item.user2.uid);
+          if (_isPositiveUin(resolvedUser2Uin)) {
+            item.user2.uin = String(resolvedUser2Uin);
+          }
+        }
+        const userUin = _isPositiveUin(resolvedUser1Uin) ? Number(resolvedUser1Uin) : 0;
+        const ev = formatRequestEvent(
+          "group",
+          {
+            sub_type: notifyType === 2 ? "invite" : "add",
+            group_id: groupId,
+            user_id: userUin,
+            comment: String(item.postscript || ""),
+            flag,
+          },
+          { selfId: this.selfUin }
+        );
+        this._dispatchInboundEvent(ev);
+      }
+    }
+  },
+
+  async _handleBuddyReqChangeEvent(firstArg) {
+    const reqs = Array.isArray(firstArg?.buddyReqs)
+      ? firstArg.buddyReqs
+      : Array.isArray(firstArg)
+      ? firstArg
+      : [];
+    for (const req of reqs) {
+      if (!req || typeof req !== "object") continue;
+      if (req.isDecide || Number(req.reqType) !== 1) continue;
+      const rawFriendUid = String(req.friendUid || "");
+      const positiveReqUin = _pickPositiveUin(req.friendUin);
+      const friendUid = rawFriendUid || positiveReqUin;
+      const reqExtra = String(req.reqTime || req.flag || req.postscript || req.extWords || "0");
+      const flag = `${friendUid}:${reqExtra}`;
+      setBoundedMap(this._buddyReqsCache, flag, req);
+      const dedupKey = `friend_req:${friendUid}:${req.reqTime || req.flag || req.postscript || req.extWords || ""}`;
+      if (this._isDuplicateEvent(dedupKey)) continue;
+      const resolvedUin =
+        positiveReqUin || (await this._ensureUinForUid(rawFriendUid || friendUid));
+      if (_isPositiveUin(resolvedUin)) {
+        req.friendUin = String(resolvedUin);
+        if (rawFriendUid) {
+          this.uinUidStore?.remember?.(resolvedUin, rawFriendUid, {
+            nickname: req.friendNick || "",
+          });
+        }
+      }
+      const userUin = _isPositiveUin(resolvedUin) ? Number(resolvedUin) : 0;
+      const ev = formatRequestEvent(
+        "friend",
+        {
+          user_id: userUin,
+          comment: String(req.extWords || ""),
+          flag,
+        },
+        { selfId: this.selfUin }
+      );
+      this._dispatchInboundEvent(ev);
+    }
+  },
+
+  _handleBuddyListChangeEvent(firstArg) {
+    this.uinUidStore.rememberFromBuddyList(firstArg);
+    const cats = Array.isArray(firstArg)
+      ? firstArg
+      : Array.isArray(firstArg?.buddyCategory)
+      ? firstArg.buddyCategory
+      : Array.isArray(firstArg?.data)
+      ? firstArg.data
+      : [];
+    if (cats.length > 0) {
+      this._buddyCategoriesCache = cats;
+      this.online = true;
+    }
+    for (const waiter of Array.from(this._buddyListWaiters)) {
+      try {
+        waiter(firstArg);
+      } catch (err) {
+        this.logger?.debug?.("inbound", err);
+      }
+    }
+  },
+
+  _handleProfileSimpleChangedEvent(firstArg) {
+    const profiles = firstArg?.profiles || firstArg;
+    const entries =
+      profiles instanceof Map
+        ? Array.from(profiles.entries())
+        : profiles && typeof profiles === "object"
+        ? Object.entries(profiles)
+        : [];
+    for (const [uidKey, info] of entries) {
+      if (!info || typeof info !== "object") continue;
+      const core = info.coreInfo || info.baseInfo || info;
+      const uin = _pickPositiveUin(core.uin, info.uin);
+      this.uinUidStore.remember(uin, core.uid || info.uid || uidKey, {
+        nickname: core.nick || info.nick || "",
+        remark: core.remark || info.remark || "",
+      });
+    }
+  },
+
+  _handleProfileDetailInfoChangedEvent(firstArg) {
+    const info = firstArg?.info || firstArg;
+    if (!info || typeof info !== "object") return;
+    const simple = info.simpleInfo || info;
+    const core = simple.coreInfo || simple.baseInfo || info.coreInfo || info.baseInfo || info;
+    const uid = String(info.uid || simple.uid || core.uid || "");
+    const uin = _pickPositiveUin(info.uin, simple.uin, core.uin);
+    if (uid || uin) {
+      this.uinUidStore.remember(uin, uid, {
+        nickname: core.nick || info.nick || "",
+        remark: core.remark || info.remark || "",
+      });
+    }
+    if (uid && this._profileDetailWaiters instanceof Map) {
+      const waiters = this._profileDetailWaiters.get(uid);
+      if (waiters) {
+        this._profileDetailWaiters.delete(uid);
+        for (const resolve of Array.from(waiters)) {
+          try {
+            resolve(info);
+          } catch (err) {
+            this.logger?.debug?.("inbound", err);
+          }
+        }
+      }
+    }
+  },
+
+  _handleDoubtBuddyReqChangeEvent(firstArg) {
+    if (!this._doubtBuddyWaiters) return;
+    for (const waiter of Array.from(this._doubtBuddyWaiters)) {
+      try {
+        waiter(firstArg);
+      } catch (err) {
+        this.logger?.debug?.("inbound", err);
+      }
+    }
+  },
+
+  _handleGroupListUpdateEvent(args, firstArg) {
+    const groupList = Array.isArray(args[1])
+      ? args[1]
+      : Array.isArray(firstArg?.groupList)
+      ? firstArg.groupList
+      : Array.isArray(firstArg)
+      ? firstArg
+      : [];
+    if (groupList.length > 0) {
+      this.online = true;
+    }
+    for (const g of groupList) {
+      if (g && (g.groupCode || g.groupUin || g.group_id)) {
+        const gid = String(g.groupCode || g.groupUin || g.group_id);
+        setBoundedMap(this._groupListCache, gid, g);
+      }
+    }
+    for (const waiter of Array.from(this._groupListWaiters)) {
+      try {
+        waiter(groupList);
+      } catch (err) {
+        this.logger?.debug?.("inbound", err);
+      }
+    }
+  },
+
+  async _handleMemberInfoChangeEvent(args, firstArg) {
+    const rawObj = firstArg && typeof firstArg === "object" ? firstArg : null;
+    const groupCode = String(
+      (rawObj
+        ? rawObj.groupCode ?? rawObj.groupUin ?? rawObj.group_id ?? ""
+        : firstArg) || ""
+    );
+    const members =
+      args[2] ||
+      args[1] ||
+      (rawObj
+        ? rawObj.members ??
+          rawObj.infos ??
+          rawObj.result?.infos ??
+          (rawObj.cardName !== undefined ||
+          rawObj.cardNew !== undefined ||
+          rawObj.card_new !== undefined
+            ? [rawObj]
+            : null)
+        : null);
+    if (!groupCode || !members) return;
+
+    this.uinUidStore.rememberFromGroupMemberList(groupCode, members);
+
+    const groupId = pickPositiveUin(groupCode);
+    if (groupId <= 0) return;
+
+    if (!(this._memberCardCache instanceof Map)) {
+      this._memberCardCache = new Map();
+    }
+    let infos = members;
+    if (members && typeof members === "object") {
+      if (members.result && members.result.infos) {
+        infos = members.result.infos;
+      } else if (members.infos) {
+        infos = members.infos;
+      }
+    }
+    const entries =
+      infos instanceof Map
+        ? Array.from(infos.entries())
+        : Array.isArray(infos)
+        ? infos.map((m, idx) => [m?.uid || String(idx), m])
+        : infos && typeof infos === "object"
+        ? Object.entries(infos)
+        : [];
+    const explicitBatchCardChange = Boolean(
+      args[1] === "card" ||
+        rawObj?.changeType === "card" ||
+        rawObj?.subType === "card" ||
+        rawObj?.sub_type === "card"
+    );
+
+    for (const [entryKey, m] of entries) {
+      if (!m || typeof m !== "object") continue;
+      const hasCardField =
+        m.cardName !== undefined ||
+        m.card !== undefined ||
+        m.memberCard !== undefined ||
+        m.cardNew !== undefined ||
+        m.card_new !== undefined;
+      if (!hasCardField) continue;
+
+      const cardNew = String(
+        m.cardName ?? m.cardNew ?? m.card_new ?? m.card ?? m.memberCard?.memberCard ?? ""
+      );
+      const uid = String(
+        m.uid || (typeof entryKey === "string" && entryKey.startsWith("u_") ? entryKey : "") || ""
+      );
+      let uin = pickPositiveUin(
+        m.uin,
+        m.user_id,
+        uid ? this.uinUidStore?.getUinSync?.(uid) : 0,
+        typeof entryKey === "string" && /^\d+$/.test(entryKey) ? entryKey : 0
+      );
+
+      const uinCacheKey = uin > 0 ? `${groupId}:${uin}` : "";
+      const uidCacheKey = uid ? `${groupId}:${uid}` : "";
+      const existingKey =
+        (uinCacheKey && this._memberCardCache.has(uinCacheKey) ? uinCacheKey : "") ||
+        (uidCacheKey && this._memberCardCache.has(uidCacheKey) ? uidCacheKey : "");
+      const hasExplicitOld =
+        m.cardOld !== undefined || m.card_old !== undefined || m.oldCardName !== undefined;
+
+      if (existingKey) {
+        const cardOld = String(this._memberCardCache.get(existingKey) ?? "");
+        if (!uin && uid) {
+          const resolved = await this._ensureUinForUid(uid);
+          uin = pickPositiveUin(resolved);
+        }
+        const targetCacheKey = uin > 0 ? `${groupId}:${uin}` : existingKey;
+        if (existingKey !== targetCacheKey) {
+          this._memberCardCache.delete(existingKey);
+        }
+        setBoundedMap(this._memberCardCache, targetCacheKey, cardNew, 5000);
+        if (cardNew !== cardOld && uin > 0) {
+          this._dispatchInboundEvent(
+            formatNoticeEvent(
+              "group_card",
+              {
+                group_id: Number(groupId),
+                user_id: uin,
+                card_new: cardNew,
+                card_old: cardOld,
+              },
+              { selfId: this.selfUin }
+            )
+          );
+        }
+      } else {
+        if ((hasExplicitOld || explicitBatchCardChange) && !uin && uid) {
+          const resolved = await this._ensureUinForUid(uid);
+          uin = pickPositiveUin(resolved);
+        }
+        const targetCacheKey = uin > 0 ? `${groupId}:${uin}` : uidCacheKey;
+        if (targetCacheKey) {
+          setBoundedMap(this._memberCardCache, targetCacheKey, cardNew, 5000);
+        }
+        if ((hasExplicitOld || explicitBatchCardChange) && uin > 0) {
+          const cardOld = hasExplicitOld
+            ? String(m.cardOld ?? m.card_old ?? m.oldCardName ?? "")
+            : "";
+          if (!hasExplicitOld || cardNew !== cardOld) {
+            this._dispatchInboundEvent(
+              formatNoticeEvent(
+                "group_card",
+                {
+                  group_id: Number(groupId),
+                  user_id: uin,
+                  card_new: cardNew,
+                  card_old: cardOld,
+                },
+                { selfId: this.selfUin }
+              )
+            );
+          }
+        }
+      }
+    }
+  },
+
   async _handleKernelEvent(_listenerName, eventName, args) {
     const firstArg = args && args.length > 0 ? args[0] : undefined;
 
@@ -484,1055 +988,64 @@ const inboundPipelineMixin = {
 
     // 2. Self-sent message confirmation: onAddSendMsg
     if (eventName === "onAddSendMsg") {
-      const ntMsg = firstArg?.msgRecord || firstArg;
-      if (ntMsg && typeof ntMsg === "object" && ntMsg.msgId) {
-        if (this._isDuplicateEvent(`send:${ntMsg.msgId}`)) {
-          return;
-        }
-        this._matchSendEcho(ntMsg);
-        this.uinUidStore.rememberFromNtMsg(ntMsg);
-        try {
-          const ev = formatNtMsgToOneBotEvent(ntMsg, {
-            selfId: this.selfUin,
-            uinUidStore: this.uinUidStore,
-            messageIdStore: this.messageIdStore,
-            reportSelfMessage: false,
-          });
-          if (ev && ev.message_id !== undefined) {
-            this.messageIdStore?.indexMsgMedia?.(ntMsg, ev.message_id);
-          }
-          if (ev && ev.post_type === "message_sent") {
-            this._dispatchInboundEvent(ev);
-          }
-        } finally {
-          _stripTransientMedia(ntMsg);
-        }
-      }
+      this._handleAddSendMsgEvent(firstArg);
       return;
     }
 
     // 3. Message updates (recalls, PTT transcription completion, emoji likes, async media updates)
     if (eventName === "onMsgInfoListUpdate" || eventName === "onMsgEmojiLikesListChanged") {
-      const msgList = Array.isArray(firstArg)
-        ? firstArg
-        : Array.isArray(firstArg?.msgList)
-        ? firstArg.msgList
-        : firstArg &&
-          typeof firstArg === "object" &&
-          (firstArg.msgId || Array.isArray(firstArg.emojiLikesList))
-        ? [firstArg]
-        : [];
-      for (const ntMsg of msgList) {
-        if (!ntMsg || typeof ntMsg !== "object") continue;
-
-        // Check PTT voice-to-text completion waiters
-        if (Array.isArray(ntMsg.elements)) {
-          const pttEl = ntMsg.elements.find((e) => e?.elementType === 4 && e.pttElement)?.pttElement;
-          if (pttEl && pttEl.text && this._pttTextWaiters.has(String(ntMsg.msgId))) {
-            const waiter = this._pttTextWaiters.get(String(ntMsg.msgId));
-            this._pttTextWaiters.delete(String(ntMsg.msgId));
-            waiter(String(pttEl.text));
-          }
-        }
-
-        if (eventName === "onMsgInfoListUpdate" && _isRecallMsg(ntMsg)) {
-          const recallTag =
-            ntMsg.recallTime && String(ntMsg.recallTime) !== "0"
-              ? String(ntMsg.recallTime)
-              : "revoke";
-          const dedupKey = `recall:${ntMsg.msgId}:${recallTag}`;
-          if (!this._isDuplicateEvent(dedupKey)) {
-            await this._resolveNtMsgUids(ntMsg);
-            try {
-              const ev = formatNtMsgToOneBotEvent(ntMsg, {
-                selfId: this.selfUin,
-                uinUidStore: this.uinUidStore,
-                messageIdStore: this.messageIdStore,
-              });
-              if (ev && ev.post_type === "notice") {
-                this._dispatchInboundEvent(ev);
-              }
-            } finally {
-              _stripTransientMedia(ntMsg);
-            }
-          }
-        } else {
-          await this._resolveNtMsgUids(ntMsg);
-          let hit = null;
-          let oneBotId = 0;
-          try {
-            hit =
-              this.messageIdStore?.resolveByNtKey?.(ntMsg.chatType, ntMsg.peerUid, ntMsg.msgId) ||
-              (ntMsg.msgId ? this.messageIdStore?.getByMsgId?.(ntMsg.msgId) : null) ||
-              (ntMsg.peerUid && ntMsg.msgSeq
-                ? this.messageIdStore?.getByPeerAndSeq?.(
-                    ntMsg.chatType,
-                    ntMsg.peerUid,
-                    ntMsg.msgSeq
-                  )
-                : null);
-            if (hit) {
-              if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
-                if (hit.rawMsg !== null && hit.rawMsg !== undefined) {
-                  hit.rawMsg = ntMsg;
-                } else {
-                  this.messageIdStore?.register?.(
-                    ntMsg.msgId,
-                    {
-                      chatType: Number(ntMsg.chatType || 1),
-                      peerUid: String(ntMsg.peerUid || ""),
-                      guildId: String(ntMsg.guildId || ""),
-                    },
-                    ntMsg.msgSeq,
-                    {
-                      ...(ntMsg.senderUin ? { senderUin: String(ntMsg.senderUin) } : {}),
-                      ...(ntMsg.senderUid ? { senderUid: String(ntMsg.senderUid) } : {}),
-                      rawMsg: ntMsg,
-                    }
-                  );
-                }
-              }
-              oneBotId = hit.oneBotId ?? hit.shortId;
-              if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
-                this.messageIdStore?.indexMsgMedia?.(ntMsg, oneBotId);
-              }
-            } else if (eventName === "onMsgInfoListUpdate" || Array.isArray(ntMsg.elements)) {
-              this.messageIdStore?.indexMsgMedia?.(ntMsg);
-            }
-
-            if (Array.isArray(ntMsg.emojiLikesList)) {
-              if (!(this._emojiLikesSnapshot instanceof Map)) {
-                this._emojiLikesSnapshot = new Map();
-              }
-              const snapshotKey = String(
-                ntMsg.msgId || `${ntMsg.chatType || 0}:${ntMsg.peerUid || ""}:${ntMsg.msgSeq || ""}`
-              );
-              const likes = ntMsg.emojiLikesList
-                .filter((item) => item && typeof item === "object")
-                .map((item) => ({
-                  emoji_id: String(item.emojiId ?? item.emoji_id ?? ""),
-                  emoji_type: Number(item.emojiType ?? item.emoji_type ?? 1),
-                  count: Number(item.likesCnt ?? item.count ?? 1),
-                }));
-              if (likes.length === 0) {
-                if (snapshotKey) {
-                  this._emojiLikesSnapshot.delete(snapshotKey);
-                }
-              } else {
-                const serializedSnapshot = likes
-                  .map((x) => `${x.emoji_type}:${x.emoji_id}:${x.count}`)
-                  .sort()
-                  .join(",");
-                const prevSnapshot = snapshotKey
-                  ? this._emojiLikesSnapshot.get(snapshotKey)
-                  : undefined;
-                if (
-                  prevSnapshot !== serializedSnapshot ||
-                  eventName === "onMsgEmojiLikesListChanged"
-                ) {
-                  if (snapshotKey) {
-                    setBoundedMap(this._emojiLikesSnapshot, snapshotKey, serializedSnapshot, 2000);
-                  }
-                  const effectiveChatType = Number(ntMsg.chatType || hit?.peer?.chatType || 0);
-                  const groupId = pickPositiveUin(
-                    ntMsg.peerUid,
-                    ntMsg.peerUin,
-                    hit?.peer?.peerUid,
-                    hit?.groupId
-                  );
-                  if (effectiveChatType === 2 && groupId > 0) {
-                    const userId = Number(
-                      pickPositiveUin(
-                        ntMsg.senderUin,
-                        ntMsg.senderUid ? this.uinUidStore?.getUinSync?.(ntMsg.senderUid) : 0,
-                        hit?.senderUin,
-                        hit?.senderUid ? this.uinUidStore?.getUinSync?.(hit.senderUid) : 0
-                      ) || 0
-                    );
-                    this._dispatchInboundEvent(
-                      formatNoticeEvent(
-                        "group_msg_emoji_like",
-                        {
-                          group_id: groupId,
-                          user_id: userId,
-                          message_id: Number(oneBotId || 0),
-                          likes,
-                        },
-                        { selfId: this.selfUin }
-                      )
-                    );
-                  }
-                }
-              }
-            }
-          } finally {
-            _stripTransientMedia(ntMsg);
-          }
-        }
-      }
+      await this._handleMsgInfoUpdateEvent(eventName, firstArg);
       return;
     }
 
     // 4. Group notifications (join/invite requests)
     if (eventName === "onGroupNotifiesUpdated") {
-      const doubt =
-        typeof args[0] === "boolean"
-          ? args[0]
-          : typeof firstArg?.doubt === "boolean"
-          ? firstArg.doubt
-          : false;
-      const notifies = Array.isArray(args[1])
-        ? args[1]
-        : Array.isArray(firstArg?.notifies)
-        ? firstArg.notifies
-        : Array.isArray(firstArg)
-        ? firstArg
-        : [];
-      for (const item of notifies) {
-        if (!item || typeof item !== "object") continue;
-        const seq = String(item.seq || "");
-        const notifyType = Number(item.type || 0);
-        const status = Number(item.status || 0);
-        const groupId = pickPositiveUin(item.group?.groupCode);
-        const flag = seq ? `${seq}:${notifyType}:${groupId}` : "";
-        const cachedItem =
-          typeof item.doubt === "boolean" ? item : { ...item, doubt: Boolean(doubt) };
-        if (flag) setBoundedMap(this._groupNotifiesCache, flag, cachedItem);
-
-        if (item.user1?.uid && _isPositiveUin(item.user1?.uin)) {
-          this.uinUidStore?.remember?.(item.user1.uin, item.user1.uid, {
-            nickname: item.user1.nickName || "",
-          });
-        }
-        if (item.user2?.uid && _isPositiveUin(item.user2?.uin)) {
-          this.uinUidStore?.remember?.(item.user2.uin, item.user2.uid, {
-            nickname: item.user2.nickName || "",
-          });
-        }
-
-        // status === 1 means pending approval
-        if (status === 1 && (notifyType === 1 || notifyType === 2 || notifyType === 7)) {
-          const dedupKey = `group_req:${flag}`;
-          if (this._isDuplicateEvent(dedupKey)) continue;
-          const userUid = item.user1?.uid || "";
-          const resolvedUser1Uin =
-            _pickPositiveUin(item.user1?.uin) || (await this._ensureUinForUid(userUid));
-          if (_isPositiveUin(resolvedUser1Uin) && item.user1) {
-            item.user1.uin = String(resolvedUser1Uin);
-          }
-          if (item.user2?.uid && !_isPositiveUin(item.user2?.uin)) {
-            const resolvedUser2Uin = await this._ensureUinForUid(item.user2.uid);
-            if (_isPositiveUin(resolvedUser2Uin)) {
-              item.user2.uin = String(resolvedUser2Uin);
-            }
-          }
-          const userUin = _isPositiveUin(resolvedUser1Uin) ? Number(resolvedUser1Uin) : 0;
-          const ev = formatRequestEvent(
-            "group",
-            {
-              sub_type: notifyType === 2 ? "invite" : "add",
-              group_id: groupId,
-              user_id: userUin,
-              comment: String(item.postscript || ""),
-              flag,
-            },
-            { selfId: this.selfUin }
-          );
-          this._dispatchInboundEvent(ev);
-        }
-      }
+      await this._handleGroupNotifiesUpdatedEvent(args, firstArg);
       return;
     }
 
     // 5. Friend requests: onBuddyReqChange
     if (eventName === "onBuddyReqChange") {
-      const reqs = Array.isArray(firstArg?.buddyReqs)
-        ? firstArg.buddyReqs
-        : Array.isArray(firstArg)
-        ? firstArg
-        : [];
-      for (const req of reqs) {
-        if (!req || typeof req !== "object") continue;
-        if (req.isDecide || Number(req.reqType) !== 1) continue;
-        const rawFriendUid = String(req.friendUid || "");
-        const positiveReqUin = _pickPositiveUin(req.friendUin);
-        const friendUid = rawFriendUid || positiveReqUin;
-        const reqExtra = String(req.reqTime || req.flag || req.postscript || req.extWords || "0");
-        const flag = `${friendUid}:${reqExtra}`;
-        setBoundedMap(this._buddyReqsCache, flag, req);
-        const dedupKey = `friend_req:${friendUid}:${req.reqTime || req.flag || req.postscript || req.extWords || ""}`;
-        if (this._isDuplicateEvent(dedupKey)) continue;
-        const resolvedUin =
-          positiveReqUin || (await this._ensureUinForUid(rawFriendUid || friendUid));
-        if (_isPositiveUin(resolvedUin)) {
-          req.friendUin = String(resolvedUin);
-          if (rawFriendUid) {
-            this.uinUidStore?.remember?.(resolvedUin, rawFriendUid, {
-              nickname: req.friendNick || "",
-            });
-          }
-        }
-        const userUin = _isPositiveUin(resolvedUin) ? Number(resolvedUin) : 0;
-        const ev = formatRequestEvent(
-          "friend",
-          {
-            user_id: userUin,
-            comment: String(req.extWords || ""),
-            flag,
-          },
-          { selfId: this.selfUin }
-        );
-        this._dispatchInboundEvent(ev);
-      }
+      await this._handleBuddyReqChangeEvent(firstArg);
       return;
     }
 
-    // 6. Buddy list change (V1 & V2) + Profile simple change + RichMedia download complete
+    // 6. Buddy list change (V1 & V2), Profile changes, Doubt buddy reqs & RichMedia download complete
     if (eventName === "onBuddyListChange" || eventName === "onBuddyListChangedV2") {
-      this.uinUidStore.rememberFromBuddyList(firstArg);
-      const cats = Array.isArray(firstArg)
-        ? firstArg
-        : Array.isArray(firstArg?.buddyCategory)
-        ? firstArg.buddyCategory
-        : Array.isArray(firstArg?.data)
-        ? firstArg.data
-        : [];
-      if (cats.length > 0) {
-        this._buddyCategoriesCache = cats;
-        this.online = true;
-      }
-      for (const waiter of Array.from(this._buddyListWaiters)) {
-        try {
-          waiter(firstArg);
-        } catch (err) {
-          this.logger?.debug?.("inbound", err);
-        }
-      }
+      this._handleBuddyListChangeEvent(firstArg);
       return;
     }
-
     if (eventName === "onProfileSimpleChanged") {
-      const profiles = firstArg?.profiles || firstArg;
-      const entries =
-        profiles instanceof Map
-          ? Array.from(profiles.entries())
-          : profiles && typeof profiles === "object"
-          ? Object.entries(profiles)
-          : [];
-      for (const [uidKey, info] of entries) {
-        if (!info || typeof info !== "object") continue;
-        const core = info.coreInfo || info.baseInfo || info;
-        const uin = _pickPositiveUin(core.uin, info.uin);
-        this.uinUidStore.remember(uin, core.uid || info.uid || uidKey, {
-          nickname: core.nick || info.nick || "",
-          remark: core.remark || info.remark || "",
-        });
-      }
+      this._handleProfileSimpleChangedEvent(firstArg);
       return;
     }
-
     if (eventName === "onProfileDetailInfoChanged") {
-      const info = firstArg?.info || firstArg;
-      if (info && typeof info === "object") {
-        const simple = info.simpleInfo || info;
-        const core = simple.coreInfo || simple.baseInfo || info.coreInfo || info.baseInfo || info;
-        const uid = String(info.uid || simple.uid || core.uid || "");
-        const uin = _pickPositiveUin(info.uin, simple.uin, core.uin);
-        if (uid || uin) {
-          this.uinUidStore.remember(uin, uid, {
-            nickname: core.nick || info.nick || "",
-            remark: core.remark || info.remark || "",
-          });
-        }
-        if (uid && this._profileDetailWaiters instanceof Map) {
-          const waiters = this._profileDetailWaiters.get(uid);
-          if (waiters) {
-            this._profileDetailWaiters.delete(uid);
-            for (const resolve of Array.from(waiters)) {
-              try {
-                resolve(info);
-              } catch (err) {
-                this.logger?.debug?.("inbound", err);
-              }
-            }
-          }
-        }
-      }
+      this._handleProfileDetailInfoChangedEvent(firstArg);
       return;
     }
-
     if (eventName === "onDoubtBuddyReqChange") {
-      if (this._doubtBuddyWaiters) {
-        for (const waiter of Array.from(this._doubtBuddyWaiters)) {
-          try {
-            waiter(firstArg);
-          } catch (err) {
-            this.logger?.debug?.("inbound", err);
-          }
-        }
-      }
+      this._handleDoubtBuddyReqChangeEvent(firstArg);
       return;
     }
-
     if (eventName === "onRichMediaDownloadComplete") {
-      const info = firstArg?.notifyInfo || firstArg || {};
-      const msgId = String(info.msgId || "");
-      const elId = String(info.msgElementId || info.elementId || "");
-      const filePath = String(info.filePath || "");
-      const keys = [`${msgId}:${elId}`, `${msgId}:0`, filePath].filter(Boolean);
-      const toInvoke = new Set();
-      for (const k of keys) {
-        const set = this._richMediaWaiters?.get(k);
-        if (!set) continue;
-        for (const waiter of Array.from(set)) {
-          if (typeof waiter === "function") {
-            set.delete(waiter);
-            toInvoke.add(waiter);
-          } else if (waiter && typeof waiter.resolve === "function") {
-            const specificElMismatch =
-              elId &&
-              elId !== "0" &&
-              waiter.elementId &&
-              waiter.elementId !== "0" &&
-              waiter.elementId !== elId &&
-              (!filePath || !waiter.targetPath || filePath !== waiter.targetPath);
-            if (!specificElMismatch) {
-              set.delete(waiter);
-              toInvoke.add(waiter);
-            }
-          }
-        }
-        if (set.size === 0) {
-          this._richMediaWaiters.delete(k);
-        }
-      }
-      for (const waiter of toInvoke) {
-        try {
-          if (typeof waiter === "function") {
-            waiter(filePath);
-          } else {
-            waiter.resolve(filePath);
-          }
-        } catch (err) {
-          this.logger?.debug?.("inbound", err);
-        }
-      }
+      this._handleRichMediaDownloadComplete(firstArg);
       return;
     }
 
     // 7. Group list update
     if (eventName === "onGroupListUpdate") {
-      const groupList = Array.isArray(args[1])
-        ? args[1]
-        : Array.isArray(firstArg?.groupList)
-        ? firstArg.groupList
-        : Array.isArray(firstArg)
-        ? firstArg
-        : [];
-      if (groupList.length > 0) {
-        this.online = true;
-      }
-      for (const g of groupList) {
-        if (g && (g.groupCode || g.groupUin || g.group_id)) {
-          const gid = String(g.groupCode || g.groupUin || g.group_id);
-          setBoundedMap(this._groupListCache, gid, g);
-        }
-      }
-      for (const waiter of Array.from(this._groupListWaiters)) {
-        try {
-          waiter(groupList);
-        } catch (err) {
-          this.logger?.debug?.("inbound", err);
-        }
-      }
+      this._handleGroupListUpdateEvent(args, firstArg);
       return;
     }
 
     // 8. Group member info change
     if (eventName === "onMemberInfoChange") {
-      const rawObj = firstArg && typeof firstArg === "object" ? firstArg : null;
-      const groupCode = String(
-        (rawObj
-          ? rawObj.groupCode ?? rawObj.groupUin ?? rawObj.group_id ?? ""
-          : firstArg) || ""
-      );
-      const members =
-        args[2] ||
-        args[1] ||
-        (rawObj
-          ? rawObj.members ??
-            rawObj.infos ??
-            rawObj.result?.infos ??
-            (rawObj.cardName !== undefined ||
-            rawObj.cardNew !== undefined ||
-            rawObj.card_new !== undefined
-              ? [rawObj]
-              : null)
-          : null);
-      if (groupCode && members) {
-        this.uinUidStore.rememberFromGroupMemberList(groupCode, members);
-
-        const groupId = pickPositiveUin(groupCode);
-        if (groupId > 0) {
-          if (!(this._memberCardCache instanceof Map)) {
-            this._memberCardCache = new Map();
-          }
-          let infos = members;
-          if (members && typeof members === "object") {
-            if (members.result && members.result.infos) {
-              infos = members.result.infos;
-            } else if (members.infos) {
-              infos = members.infos;
-            }
-          }
-          const entries =
-            infos instanceof Map
-              ? Array.from(infos.entries())
-              : Array.isArray(infos)
-              ? infos.map((m, idx) => [m?.uid || String(idx), m])
-              : infos && typeof infos === "object"
-              ? Object.entries(infos)
-              : [];
-          const explicitBatchCardChange = Boolean(
-            args[1] === "card" ||
-              rawObj?.changeType === "card" ||
-              rawObj?.subType === "card" ||
-              rawObj?.sub_type === "card"
-          );
-
-          for (const [entryKey, m] of entries) {
-            if (!m || typeof m !== "object") continue;
-            const hasCardField =
-              m.cardName !== undefined ||
-              m.card !== undefined ||
-              m.memberCard !== undefined ||
-              m.cardNew !== undefined ||
-              m.card_new !== undefined;
-            if (!hasCardField) continue;
-
-            const cardNew = String(
-              m.cardName ?? m.cardNew ?? m.card_new ?? m.card ?? m.memberCard?.memberCard ?? ""
-            );
-            const uid = String(
-              m.uid || (typeof entryKey === "string" && entryKey.startsWith("u_") ? entryKey : "") || ""
-            );
-            let uin = pickPositiveUin(
-              m.uin,
-              m.user_id,
-              uid ? this.uinUidStore?.getUinSync?.(uid) : 0,
-              typeof entryKey === "string" && /^\d+$/.test(entryKey) ? entryKey : 0
-            );
-
-            const uinCacheKey = uin > 0 ? `${groupId}:${uin}` : "";
-            const uidCacheKey = uid ? `${groupId}:${uid}` : "";
-            const existingKey =
-              (uinCacheKey && this._memberCardCache.has(uinCacheKey) ? uinCacheKey : "") ||
-              (uidCacheKey && this._memberCardCache.has(uidCacheKey) ? uidCacheKey : "");
-            const hasExplicitOld =
-              m.cardOld !== undefined || m.card_old !== undefined || m.oldCardName !== undefined;
-
-            if (existingKey) {
-              const cardOld = String(this._memberCardCache.get(existingKey) ?? "");
-              if (!uin && uid) {
-                const resolved = await this._ensureUinForUid(uid);
-                uin = pickPositiveUin(resolved);
-              }
-              const targetCacheKey = uin > 0 ? `${groupId}:${uin}` : existingKey;
-              if (existingKey !== targetCacheKey) {
-                this._memberCardCache.delete(existingKey);
-              }
-              setBoundedMap(this._memberCardCache, targetCacheKey, cardNew, 5000);
-              if (cardNew !== cardOld && uin > 0) {
-                this._dispatchInboundEvent(
-                  formatNoticeEvent(
-                    "group_card",
-                    {
-                      group_id: Number(groupId),
-                      user_id: uin,
-                      card_new: cardNew,
-                      card_old: cardOld,
-                    },
-                    { selfId: this.selfUin }
-                  )
-                );
-              }
-            } else {
-              if ((hasExplicitOld || explicitBatchCardChange) && !uin && uid) {
-                const resolved = await this._ensureUinForUid(uid);
-                uin = pickPositiveUin(resolved);
-              }
-              const targetCacheKey = uin > 0 ? `${groupId}:${uin}` : uidCacheKey;
-              if (targetCacheKey) {
-                setBoundedMap(this._memberCardCache, targetCacheKey, cardNew, 5000);
-              }
-              if ((hasExplicitOld || explicitBatchCardChange) && uin > 0) {
-                const cardOld = hasExplicitOld
-                  ? String(m.cardOld ?? m.card_old ?? m.oldCardName ?? "")
-                  : "";
-                if (!hasExplicitOld || cardNew !== cardOld) {
-                  this._dispatchInboundEvent(
-                    formatNoticeEvent(
-                      "group_card",
-                      {
-                        group_id: Number(groupId),
-                        user_id: uin,
-                        card_new: cardNew,
-                        card_old: cardOld,
-                      },
-                      { selfId: this.selfUin }
-                    )
-                  );
-                }
-              }
-            }
-          }
-        }
-      }
+      await this._handleMemberInfoChangeEvent(args, firstArg);
       return;
     }
 
-    // 9. Login / QR / Session / Offline
-    if (eventName === "onQRCodeGetPicture" || eventName === "onQRCodeSessionQuickLoginFailed") {
-      const pngBase64 =
-        firstArg?.pngBase64QrcodeData ||
-        firstArg?.qrcodeImage ||
-        firstArg?.result?.pngBase64QrcodeData ||
-        "";
-      if (pngBase64) {
-        this.lastQrCodeBase64 = String(pngBase64);
-      }
-      return;
-    }
-    if (eventName === "onUserLoggedIn" || eventName === "onQRCodeLoginSucceed") {
-      const identity = normalizeLoginIdentity(firstArg);
-      this._updateSelfIdentity({
-        ...identity,
-        markOnline: true,
-      });
-      return;
-    }
-    if (eventName === "onSessionInitComplete") {
-      const code =
-        firstArg && typeof firstArg === "object" ? Number(firstArg.result ?? 0) : Number(firstArg ?? 0);
-      if (!Number.isFinite(code) || code === 0) {
-        this.online = true;
-      }
-      return;
-    }
-    if (eventName === "onKickedOffLine") {
-      this.online = false;
-      this._resetHumanSessionState({ resetRenderer: true });
-      this._dispatchInboundEvent(
-        formatNoticeEvent(
-          "bot_offline",
-          {
-            user_id: pickPositiveUin(this.selfUin),
-            tag: String(firstArg?.tipsTitle || "kicked_offline"),
-            message: String(firstArg?.tipsDesc || "QQ offline"),
-          },
-          { selfId: this.selfUin }
-        )
-      );
-    }
-  },
-
-  async _downloadRichMediaElement({
-    msgId,
-    chatType,
-    peerUid,
-    elementId,
-    downloadType = 1,
-    downSourceType = 0,
-    downloadScene = 0,
-    fileModelId = "0",
-    thumbSize = 0,
-    filePath = "",
-    timeoutMs = 8000,
-  } = {}) {
-    const targetPath = filePath ? String(filePath).trim() : "";
-    if (targetPath) {
-      const existingStat = await _statPositiveFile(targetPath);
-      if (existingStat) {
-        return targetPath;
-      }
-    }
-    if (!this._isNtReady()) return "";
-    if (!msgId || !peerUid) return "";
-
-    const msgIdStr = String(msgId);
-    const elIdStr = String(elementId || "0");
-    const effectiveTimeout = Math.max(100, Number(timeoutMs) || 8000);
-    if (!this._richMediaWaiters) {
-      this._richMediaWaiters = new Map();
-    }
-    const waitKeys = [`${msgIdStr}:${elIdStr}`, `${msgIdStr}:0`, targetPath].filter(Boolean);
-
-    let timer = null;
-    let pollTimer = null;
-    let waiterEntry = null;
-    const cleanupWaiter = () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      if (waiterEntry && this._richMediaWaiters) {
-        for (const k of waitKeys) {
-          const set = this._richMediaWaiters.get(k);
-          if (set) {
-            set.delete(waiterEntry);
-            if (set.size === 0) {
-              this._richMediaWaiters.delete(k);
-            }
-          }
-        }
-      }
-    };
-
-    const waitDownload = new Promise((resolve) => {
-      let settled = false;
-      let polling = false;
-      const finish = (candidate) => {
-        if (settled) return;
-        settled = true;
-        cleanupWaiter();
-        resolve(candidate || targetPath);
-      };
-      waiterEntry = {
-        msgId: msgIdStr,
-        elementId: elIdStr,
-        targetPath,
-        resolve: (downloadedPath) => finish(downloadedPath || targetPath),
-      };
-      for (const k of waitKeys) {
-        if (!this._richMediaWaiters.has(k)) {
-          this._richMediaWaiters.set(k, new Set());
-        }
-        this._richMediaWaiters.get(k).add(waiterEntry);
-      }
-      if (targetPath) {
-        pollTimer = setInterval(async () => {
-          if (polling || settled) return;
-          polling = true;
-          try {
-            const st = await _statPositiveFile(targetPath);
-            if (st) {
-              finish(targetPath);
-            }
-          } finally {
-            polling = false;
-          }
-        }, 200);
-        pollTimer.unref?.();
-      }
-      timer = setTimeout(() => finish(targetPath), effectiveTimeout);
-      timer.unref?.();
-    });
-
-    try {
-      const resolvedDownSourceType = Number(downSourceType ?? 0);
-      const getReq = {
-        downSourceType: resolvedDownSourceType,
-        downloadSourceType: resolvedDownSourceType,
-        downloadScene: Number(downloadScene ?? 0),
-        fileModelId: String(fileModelId || "0"),
-        triggerType: 1,
-        msgId: msgIdStr,
-        chatType: Number(chatType || 1),
-        peerUid: String(peerUid),
-        elementId: elIdStr,
-        thumbSize: Number(thumbSize || 0),
-        downloadType: Number(downloadType ?? 1),
-        filePath: targetPath,
-      };
-      const dlRes =
-        typeof this.invokeNt === "function"
-          ? await this.invokeNt(
-              "nodeIKernelMsgService/downloadRichMedia",
-              { getReq },
-              [getReq]
-            )
-          : typeof this.ntCall === "function"
-          ? await this.ntCall("nodeIKernelMsgService", "downloadRichMedia", [{ getReq }])
-          : null;
-      const directPath =
-        typeof dlRes === "string" ? dlRes : dlRes?.filePath ? String(dlRes.filePath) : "";
-      if (directPath && (await _statPositiveFile(directPath))) {
-        return directPath;
-      }
-      if (targetPath && (await _statPositiveFile(targetPath))) {
-        return targetPath;
-      }
-      const waitedPath = await waitDownload;
-      if (waitedPath && (await _statPositiveFile(waitedPath))) {
-        return String(waitedPath);
-      }
-    } catch (err) {
-      this.logger?.debug?.("inbound", err);
-    } finally {
-      cleanupWaiter();
-    }
-    return "";
-  },
-
-  async _hydrateNtMsgMedia(ntMsg, options = {}) {
-    if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
-    const maxPicBytes = 10 * 1024 * 1024;
-    const maxPttBytes = 2 * 1024 * 1024;
-    const skipRemoteDownload = Boolean(options?.skipRemoteDownload);
-    const downSourceType = Number(options?.downSourceType ?? 0);
-    const fallbackChatType = Number(ntMsg.chatType || options?.chatType || 1);
-    const fallbackPeerUid = String(
-      ntMsg.peerUid && String(ntMsg.peerUid) !== "0" ? ntMsg.peerUid : options?.peerUid || ""
-    );
-    const hydrationTimeout = Math.max(
-      100,
-      Number(
-        options?.timeoutMs ??
-          this.config?.mediaHydrationTimeoutMs ??
-          this.config?.richMediaDownloadTimeoutMs ??
-          8000
-      ) || 8000
-    );
-    const deadlineMs = Number(options?.deadlineMs) > 0 ? Number(options.deadlineMs) : 0;
-    const remainingRemoteBudgetMs = (capMs) => {
-      if (skipRemoteDownload) return 0;
-      if (deadlineMs > 0) {
-        const rem = deadlineMs - Date.now();
-        if (rem <= 0) return 0;
-        return Math.min(hydrationTimeout, capMs, rem);
-      }
-      return Math.min(hydrationTimeout, capMs);
-    };
-
-    for (const el of ntMsg.elements) {
-      if (!el || typeof el !== "object") continue;
-      const elType = Number(el.elementType);
-
-      if (elType === 2 && el.picElement) {
-        const pe = el.picElement;
-        if (pe.__base64Uri) continue;
-        const origin = String(pe.originImageUrl || "").trim();
-        if (origin && origin.includes("rkey=")) continue;
-        if (
-          origin &&
-          /^https?:\/\//i.test(origin) &&
-          !origin.includes("multimedia.nt.qq.com.cn/download")
-        ) {
-          continue;
-        }
-        let localPath = String(pe.sourcePath || "").trim();
-        let st = await _statPositiveFile(localPath);
-        if (!st && Number(pe.fileSize || 0) > maxPicBytes) continue;
-
-        if (!st && !localPath && pe.md5HexStr && this._isNtReady()) {
-          try {
-            const pathInfo = {
-              md5HexStr: String(pe.md5HexStr),
-              fileName: String(pe.fileName || `${pe.md5HexStr}.jpg`),
-              elementType: 2,
-              elementSubType: Number(pe.picSubType || 0),
-              thumbSize: 0,
-              needCreate: true,
-              downloadType: 1,
-              file_uuid: String(pe.fileUuid || ""),
-            };
-            const pathRes = await this.invokeNt(
-              "nodeIKernelMsgService/getRichMediaFilePathForGuild",
-              { path_info: pathInfo },
-              [pathInfo]
-            );
-            const resolvedPath = typeof pathRes === "string" ? pathRes : pathRes?.path || "";
-            if (resolvedPath) {
-              localPath = String(resolvedPath);
-              st = await _statPositiveFile(localPath);
-            }
-          } catch (err) {
-            this.logger?.debug?.("inbound", err);
-          }
-        }
-
-        const origBudgetMs = remainingRemoteBudgetMs(8000);
-        if (!st && origBudgetMs > 0 && ntMsg.msgId && fallbackPeerUid) {
-          const downloadedOrig = await this._downloadRichMediaElement({
-            msgId: ntMsg.msgId,
-            chatType: fallbackChatType,
-            peerUid: fallbackPeerUid,
-            elementId: el.elementId || "0",
-            downloadType: 1,
-            downSourceType,
-            thumbSize: 0,
-            filePath: localPath,
-            timeoutMs: origBudgetMs,
-          });
-          if (downloadedOrig) {
-            const dlStat = await _statPositiveFile(downloadedOrig);
-            if (dlStat && dlStat.size <= maxPicBytes) {
-              localPath = downloadedOrig;
-              st = dlStat;
-            }
-          }
-        }
-
-        if (!st) {
-          const thumbs =
-            pe.thumbPath instanceof Map
-              ? Array.from(pe.thumbPath.values())
-              : pe.thumbPath && typeof pe.thumbPath === "object"
-              ? Object.values(pe.thumbPath)
-              : [];
-          for (const tp of thumbs) {
-            const candidate = String(tp || "").trim();
-            const tpStat = await _statPositiveFile(candidate);
-            if (tpStat && tpStat.size <= maxPicBytes) {
-              localPath = candidate;
-              st = tpStat;
-              break;
-            }
-          }
-          const thumbBudgetMs = remainingRemoteBudgetMs(5000);
-          if (!st && thumbBudgetMs > 0 && ntMsg.msgId && fallbackPeerUid) {
-            const fallbackThumbPath = thumbs.length > 0 ? String(thumbs[0] || "") : "";
-            const downloadedThumb = await this._downloadRichMediaElement({
-              msgId: ntMsg.msgId,
-              chatType: fallbackChatType,
-              peerUid: fallbackPeerUid,
-              elementId: el.elementId || "0",
-              downloadType: 2,
-              downSourceType,
-              thumbSize: 720,
-              filePath: fallbackThumbPath,
-              timeoutMs: thumbBudgetMs,
-            });
-            if (downloadedThumb) {
-              const dlThumbStat = await _statPositiveFile(downloadedThumb);
-              if (dlThumbStat && dlThumbStat.size <= maxPicBytes) {
-                localPath = downloadedThumb;
-                st = dlThumbStat;
-              }
-            }
-          }
-        }
-
-        if (st && st.size > 0 && localPath) {
-          pe.sourcePath = localPath;
-          _defineLocalFileUrl(pe, localPath);
-          if (st.size <= maxPicBytes) {
-            try {
-              const buf = await fs.promises.readFile(localPath);
-              Object.defineProperty(pe, "__base64Uri", {
-                value: `base64://${buf.toString("base64")}`,
-                enumerable: false,
-                configurable: true,
-                writable: true,
-              });
-            } catch (err) {
-              this.logger?.debug?.("inbound", err);
-            }
-          }
-        }
-        continue;
-      }
-
-      if (elType === 4 && el.pttElement) {
-        const ptt = el.pttElement;
-        if (ptt.__base64Uri) continue;
-        let localPath = String(ptt.filePath || ptt.sourcePath || "").trim();
-        let st = await _statPositiveFile(localPath);
-
-        const pttBudgetMs = remainingRemoteBudgetMs(8000);
-        if (
-          !st &&
-          pttBudgetMs > 0 &&
-          this._isNtReady() &&
-          ntMsg.msgId &&
-          fallbackPeerUid &&
-          el.elementId
-        ) {
-          const downloadedPtt = await this._downloadRichMediaElement({
-            msgId: ntMsg.msgId,
-            chatType: fallbackChatType,
-            peerUid: fallbackPeerUid,
-            elementId: el.elementId,
-            downloadType: 1,
-            downSourceType,
-            thumbSize: 0,
-            filePath: localPath,
-            timeoutMs: pttBudgetMs,
-          });
-          if (downloadedPtt) {
-            localPath = downloadedPtt;
-            st = await _statPositiveFile(localPath);
-          }
-        }
-
-        if (!st && this._isNtReady() && ptt.md5HexStr) {
-          try {
-            const pathInfo = {
-              md5HexStr: String(ptt.md5HexStr),
-              fileName: String(ptt.fileName || `${ptt.md5HexStr}.amr`),
-              elementType: 4,
-              elementSubType: 0,
-              thumbSize: 0,
-              needCreate: false,
-              downloadType: 1,
-              file_uuid: String(ptt.fileUuid || ""),
-            };
-            const pathRes = await this.invokeNt(
-              "nodeIKernelMsgService/getRichMediaFilePathForGuild",
-              { path_info: pathInfo },
-              [pathInfo]
-            );
-            const resolvedPath = typeof pathRes === "string" ? pathRes : pathRes?.path || "";
-            if (resolvedPath) {
-              const cachedStat = await _statPositiveFile(String(resolvedPath));
-              if (cachedStat) {
-                localPath = String(resolvedPath);
-                st = cachedStat;
-              }
-            }
-          } catch (err) {
-            this.logger?.debug?.("inbound", err);
-          }
-        }
-
-        if (st && st.size > 0 && localPath) {
-          ptt.filePath = localPath;
-          _defineLocalFileUrl(ptt, localPath);
-          if (st.size <= maxPttBytes) {
-            try {
-              const buf = await fs.promises.readFile(localPath);
-              Object.defineProperty(ptt, "__base64Uri", {
-                value: `base64://${buf.toString("base64")}`,
-                enumerable: false,
-                configurable: true,
-                writable: true,
-              });
-            } catch (err) {
-              this.logger?.debug?.("inbound", err);
-            }
-          }
-        }
-        continue;
-      }
-
-      if (elType === 5 && el.videoElement) {
-        const ve = el.videoElement;
-        if (ve.__localFileUrl) continue;
-        const localPath = String(ve.filePath || ve.sourcePath || "").trim();
-        const st = await _statPositiveFile(localPath);
-        if (st && st.size > 0 && localPath) {
-          ve.filePath = localPath;
-          _defineLocalFileUrl(ve, localPath);
-        }
-        continue;
-      }
-    }
-
-    this.messageIdStore?.indexMsgMedia?.(ntMsg);
+    // 9. Login / QR / Session / Offline (delegated to loginRecoveryMixin)
+    this._handleLoginKernelEvent(eventName, args);
   },
 
   async _processIncomingNtMessage(ntMsg) {
@@ -1566,7 +1079,7 @@ const inboundPipelineMixin = {
         this._dispatchInboundEvent(uploadNotice);
       }
     } finally {
-      _stripTransientMedia(ntMsg);
+      stripTransientMedia(ntMsg);
     }
 
     const autoReadAndType =
@@ -1603,9 +1116,11 @@ const inboundPipelineMixin = {
       );
     }
   },
-};
+});
 
 module.exports = {
   inboundPipelineMixin,
+  mediaHydratorMixin,
+  loginRecoveryMixin,
   _isPositiveUin,
 };
