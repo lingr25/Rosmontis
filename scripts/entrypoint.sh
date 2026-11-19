@@ -123,6 +123,9 @@ mkdir -p \
   "${XDG_RUNTIME_DIR}" \
   "${ROSMONTIS_TEMP_DIR}" \
   "${ROSMONTIS_CONFIG_DIR}"
+if [[ -n "${ROSMONTIS_STATE_DIR:-}" ]]; then
+  mkdir -p "${ROSMONTIS_STATE_DIR}"
+fi
 chmod 700 "${XDG_RUNTIME_DIR}"
 find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name 'mojo.*.*.sock' -delete 2>/dev/null || true
 
@@ -135,6 +138,9 @@ if [[ "$(id -u)" == "0" ]]; then
     "${XDG_RUNTIME_DIR}" \
     "${ROSMONTIS_TEMP_DIR}" \
     "${ROSMONTIS_CONFIG_DIR}" 2>/dev/null || true
+  if [[ -n "${ROSMONTIS_STATE_DIR:-}" ]]; then
+    chown -R "${TARGET_UID}:${TARGET_GID}" "${ROSMONTIS_STATE_DIR}" 2>/dev/null || true
+  fi
   if [[ -d /app ]]; then
     chown "${TARGET_UID}:${TARGET_GID}" /app 2>/dev/null || true
   fi
@@ -241,6 +247,8 @@ if [[ -n "${VNC_PASSWD:-}" ]] && command -v x11vnc >/dev/null 2>&1; then
   else
     echo "[rosmontis] WARNING: Failed to initialize VNC password file; skipping x11vnc." >&2
   fi
+elif [[ -n "${VNC_PASSWD:-}" ]]; then
+  echo "[rosmontis] WARNING: VNC_PASSWD is set but x11vnc is not installed (image built with INSTALL_VNC=0); skipping VNC." >&2
 fi
 unset VNC_PASSWD || true
 

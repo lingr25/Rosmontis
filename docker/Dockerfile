@@ -7,18 +7,23 @@ ARG QQ_DEB_URL=""
 ARG QQ_DEB_SHA256=""
 # Set to "1" in reproducible/production builds to require a pinned QQ_DEB_SHA256
 ARG REQUIRE_QQ_DEB_SHA256="0"
+# Set to "0" to skip Fluxbox/x11vnc/noVNC packages for a slimmer headless image
+ARG INSTALL_VNC="1"
 
 RUN if [ "${REQUIRE_QQ_DEB_SHA256}" = "1" ] && [ -z "${QQ_DEB_SHA256}" ]; then \
       echo "ERROR: QQ_DEB_SHA256 is required when REQUIRE_QQ_DEB_SHA256=1" >&2; \
       exit 1; \
     fi \
+  && VNC_PKGS="" \
+  && if [ "${INSTALL_VNC}" = "1" ]; then \
+       VNC_PKGS="fluxbox novnc websockify x11vnc"; \
+     fi \
   && apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     dbus \
     dbus-x11 \
     ffmpeg \
-    fluxbox \
     fonts-noto-cjk \
     gosu \
     libasound2t64 \
@@ -44,13 +49,11 @@ RUN if [ "${REQUIRE_QQ_DEB_SHA256}" = "1" ] && [ -z "${QQ_DEB_SHA256}" ]; then \
     libxss1 \
     libxtst6 \
     nodejs \
-    novnc \
     procps \
     tini \
-    websockify \
-    x11vnc \
     xdg-utils \
     xvfb \
+    ${VNC_PKGS} \
   && DEB_ARCH="$(dpkg --print-architecture)" \
   && RAW_QQ_URL="${QQ_DEB_URL}" \
   && if [ -z "${RAW_QQ_URL}" ]; then \
@@ -89,7 +92,7 @@ RUN if [ "${REQUIRE_QQ_DEB_SHA256}" = "1" ] && [ -z "${QQ_DEB_SHA256}" ]; then \
 
 RUN (getent group 1000 >/dev/null || groupadd -g 1000 rosmontis) \
   && (id -u 1000 >/dev/null 2>&1 || useradd -u 1000 -g 1000 -d /app -s /bin/bash -M rosmontis) \
-  && mkdir -p /app/.config /app/.fluxbox /app/.local/share /app/data/config /opt/rosmontis /tmp/.X11-unix \
+  && mkdir -p /app/.config /app/.fluxbox /app/.local/share /app/data/config /app/data/state /opt/rosmontis /tmp/.X11-unix \
   && chmod 1777 /tmp/.X11-unix \
   && chown -R 1000:1000 /app
 

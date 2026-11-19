@@ -7,6 +7,7 @@ services:
         QQ_DEB_URL: ${QQ_DEB_URL:-}
         QQ_DEB_SHA256: ${QQ_DEB_SHA256:-}
         REQUIRE_QQ_DEB_SHA256: ${REQUIRE_QQ_DEB_SHA256:-0}
+        INSTALL_VNC: ${INSTALL_VNC:-1}
     container_name: rosmontis
     restart: unless-stopped
     shm_size: 1gb
@@ -20,7 +21,19 @@ services:
       - ROSMONTIS_HTTP_PORT=${ROSMONTIS_HTTP_PORT:-3000}
       - ROSMONTIS_WS_PORT=${ROSMONTIS_WS_PORT:-3001}
       - ROSMONTIS_REVERSE_WS_URL
+      - ROSMONTIS_HTTP_POST_URL
+      - ROSMONTIS_HTTP_SECRET
       - ROSMONTIS_ACCESS_TOKEN
+      # Defaults to /app/data/state when unset; set ROSMONTIS_STATE_DIR= (empty) to disable persistence
+      - ROSMONTIS_STATE_DIR=${ROSMONTIS_STATE_DIR-/app/data/state}
+      - ROSMONTIS_COMPAT_PROFILE
+      - ROSMONTIS_FFMPEG_PATH
+      - ROSMONTIS_SILK_ENCODER_PATH
+      - ROSMONTIS_SILK_DECODER_PATH
+      - ROSMONTIS_ALLOWED_FILE_DIRS
+      - ROSMONTIS_ALLOW_PRIVATE_MEDIA_URLS
+      - ROSMONTIS_LOG_FORMAT
+      - ROSMONTIS_HUMAN_SIMULATION
       - ROSMONTIS_ENABLE_WEB_CREDENTIAL_API
     ports:
       # Bind to localhost by default; expose via SSH tunnel or authenticated reverse proxy
