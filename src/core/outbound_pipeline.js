@@ -13,6 +13,7 @@ const {
   _elementsSignatureMatch,
   hasRichMediaElements,
 } = require("./echo_correlator");
+const { OutboundRateLimiter } = require("./rate_limiter");
 
 const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
 
@@ -53,6 +54,40 @@ function isBridgeUnavailableError(err) {
 }
 
 const outboundPipelineMixin = {
+  _ensureRateLimiter() {
+    const cfgRef = this.config?.rateLimit;
+    if (!this.rateLimiter) {
+      this.rateLimiter = new OutboundRateLimiter(cfgRef);
+      this._rateLimiterConfigRef = cfgRef;
+    } else if (this._rateLimiterConfigRef !== cfgRef) {
+      this._rateLimiterConfigRef = cfgRef;
+      if (typeof this.rateLimiter.updateConfig === "function") {
+        this.rateLimiter.updateConfig(cfgRef);
+      }
+    }
+    return this.rateLimiter;
+  },
+
+  _enforceOutboundRateLimit(peerKey) {
+    const limiter = this._ensureRateLimiter();
+    if (!limiter || typeof limiter.consume !== "function") return null;
+    const res = limiter.consume(peerKey);
+    if (res && res.allowed === false) {
+      const retryAfterMs = Number.isFinite(Number(res.retryAfterMs))
+        ? Math.max(0, Math.ceil(Number(res.retryAfterMs)))
+        : 0;
+      const reason = res.reason || "rate_limited";
+      const err = new Error(`Rate limit exceeded (${reason}); retry after ${retryAfterMs}ms`);
+      err.retcode = 1429;
+      err.code = "ERR_RATE_LIMITED";
+      err.retryAfterMs = retryAfterMs;
+      err.rateLimitReason = reason;
+      err.circuitState = res.state;
+      throw err;
+    }
+    return res;
+  },
+
   _ensureEchoCorrelator() {
     if (!this.echoCorrelator) {
       this.echoCorrelator = new EchoCorrelator({
@@ -330,6 +365,7 @@ const outboundPipelineMixin = {
 
   async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
+    this._enforceOutboundRateLimit(peerKey);
     this._sessionScheduler.cancelPeerReaction(peerKey);
 
     // Phase 1 (unlocked): concurrent heavy I/O (HTTP media download, EXIF normalize, @UIN->UID)
@@ -461,6 +497,8 @@ const outboundPipelineMixin = {
   },
 
   async _invokeForwardWithEcho(peer, invokeFn, fallbackSeed = "") {
+    const peerKey = `${peer?.chatType || 0}:${peer?.peerUid || ""}:${peer?.guildId || ""}`;
+    this._enforceOutboundRateLimit(peerKey);
     const timeoutMs =
       Number(this.config?.forwardEchoTimeoutMs) > 0
         ? Number(this.config.forwardEchoTimeoutMs)

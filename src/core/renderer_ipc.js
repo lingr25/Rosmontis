@@ -80,6 +80,7 @@ const SERVICE_GETTER_MAP = {
 // fall through to the next tier; any other failure means the call may already have reached
 // the kernel/server and must NOT be replayed.
 const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
+const RENDERER_HEALTH_ATTACHED = Symbol("rosmontisRendererHealthAttached");
 
 // Kernel commands whose duplicate execution is user-visible or harmful (double messages,
 // double recalls, repeated admin actions, burst retries under risk control).
@@ -274,7 +275,49 @@ const rendererIpcMixin = {
     }
   },
 
+  _ensureRendererHealthStats() {
+    if (!this.rendererHealthStats || typeof this.rendererHealthStats !== "object") {
+      this.rendererHealthStats = {
+        crashes: 0,
+        unresponsive: 0,
+        unresponsiveActive: false,
+        recoveries: 0,
+        recoveryFailures: 0,
+        reloadSuppressed: 0,
+        lastCrashAt: 0,
+        lastCrashReason: "",
+        lastUnresponsiveAt: 0,
+      };
+    }
+    if (!Array.isArray(this._rendererReloadTimestamps)) {
+      this._rendererReloadTimestamps = [];
+    }
+    if (!(this._rendererReloadTimers instanceof Map)) {
+      this._rendererReloadTimers = new Map();
+    }
+    return this.rendererHealthStats;
+  },
+
+  _clearRendererReloadTimers(webContents = null) {
+    if (!(this._rendererReloadTimers instanceof Map)) return;
+    if (webContents) {
+      const timer = this._rendererReloadTimers.get(webContents);
+      if (timer) {
+        clearTimeout(timer);
+        this._rendererReloadTimers.delete(webContents);
+      }
+      return;
+    }
+    for (const timer of this._rendererReloadTimers.values()) {
+      if (timer) clearTimeout(timer);
+    }
+    this._rendererReloadTimers.clear();
+  },
+
   _rejectPendingRendererCmds(webContents = null, reason = "Renderer command channel closed") {
+    if (!webContents) {
+      this._clearRendererReloadTimers(null);
+    }
     for (const [reqId, pending] of Array.from(this._pendingRendererCmds.entries())) {
       if (!webContents || pending.webContents === webContents) {
         this._pendingRendererCmds.delete(reqId);
@@ -431,6 +474,7 @@ const rendererIpcMixin = {
     if (!webContents || typeof webContents.on !== "function") return;
     if (this._knownWebContents.has(webContents)) return;
     this._knownWebContents.add(webContents);
+    this._ensureRendererHealthStats();
 
     if (this._shouldPromoteWebContents(webContents)) {
       this.activeWebContents = webContents;
@@ -438,7 +482,9 @@ const rendererIpcMixin = {
     let isWcDestroyed = false;
     const onDestroyed = () => {
       isWcDestroyed = true;
+      webContents.__rosmontisBridgeInjected = false;
       webContents.__rosmontisCmdChannelReady = false;
+      this._clearRendererReloadTimers(webContents);
       this._rejectPendingRendererCmds(webContents, "renderer webContents destroyed");
       this._knownWebContents.delete(webContents);
       if (this.activeWebContents === webContents) {
@@ -464,6 +510,7 @@ const rendererIpcMixin = {
       injectGen += 1;
       pageInjected = false;
       injectPending = false;
+      webContents.__rosmontisBridgeInjected = false;
       webContents.__rosmontisCmdChannelReady = false;
       webContents.__rosmontisIpcTokenInjected = false;
       this._rejectPendingRendererCmds(webContents, "renderer navigated");
@@ -534,6 +581,7 @@ const rendererIpcMixin = {
             }
             injectPending = false;
             pageInjected = true;
+            webContents.__rosmontisBridgeInjected = true;
             webContents.__rosmontisIpcTokenInjected = true;
             if (typeof webContents.send === "function" && this._ipcCmdAckInstalled) {
               webContents.__rosmontisCmdChannelReady = true;
@@ -555,6 +603,138 @@ const rendererIpcMixin = {
     webContents.on("dom-ready", injectScript);
     webContents.on("did-finish-load", injectScript);
     webContents.on("did-navigate-in-page", injectScript);
+
+    if (!webContents[RENDERER_HEALTH_ATTACHED]) {
+      Object.defineProperty(webContents, RENDERER_HEALTH_ATTACHED, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+      });
+
+      const onRenderProcessGone = (_event, details) => {
+        const stats = this._ensureRendererHealthStats();
+        const now = Date.now();
+        const reason = String(details?.reason || "unknown");
+
+        stats.crashes += 1;
+        stats.lastCrashAt = now;
+        stats.lastCrashReason = reason;
+        stats.unresponsiveActive = false;
+
+        injectGen += 1;
+        pageInjected = false;
+        injectPending = false;
+        webContents.__rosmontisBridgeInjected = false;
+        webContents.__rosmontisCmdChannelReady = false;
+        webContents.__rosmontisIpcTokenInjected = false;
+
+        this._rejectPendingRendererCmds(webContents, `renderer process gone (${reason})`);
+        try {
+          const resetRes = this._resetHumanSessionState?.({ resetRenderer: false });
+          if (resetRes && typeof resetRes.catch === "function") {
+            resetRes.catch(() => {});
+          }
+        } catch (_) {}
+
+        if (this.activeWebContents === webContents) {
+          this.activeWebContents = null;
+        }
+
+        this._logWarn(
+          `renderer-gone:${webContents.id || 0}:${reason}`,
+          `WARN: Renderer process gone (wc=${webContents.id || 0}, reason=${reason}, exitCode=${details?.exitCode ?? "n/a"})`,
+          10000
+        );
+
+        if (
+          this.config?.rendererAutoReload !== false &&
+          typeof webContents.reload === "function" &&
+          !isWcDestroyed &&
+          !webContents.isDestroyed?.()
+        ) {
+          const rawMaxReloads = this.config?.rendererMaxReloadsPerMinute;
+          const maxReloads =
+            rawMaxReloads !== undefined &&
+            rawMaxReloads !== null &&
+            Number.isFinite(Number(rawMaxReloads))
+              ? Math.max(0, Math.trunc(Number(rawMaxReloads)))
+              : 3;
+
+          this._rendererReloadTimestamps = this._rendererReloadTimestamps.filter(
+            (ts) => now - ts < 60000
+          );
+          if (this._rendererReloadTimestamps.length >= maxReloads) {
+            stats.reloadSuppressed += 1;
+            this._logWarn(
+              `renderer-reload-suppressed:${webContents.id || 0}`,
+              `WARN: Renderer auto-reload suppressed (exceeded ${maxReloads} reloads/min)`,
+              30000
+            );
+            return;
+          }
+
+          this._rendererReloadTimestamps.push(now);
+          const attempt = this._rendererReloadTimestamps.length;
+          const rawBackoff = this.config?.rendererReloadBackoffMs;
+          const baseBackoffMs =
+            rawBackoff !== undefined &&
+            rawBackoff !== null &&
+            Number.isFinite(Number(rawBackoff))
+              ? Math.max(0, Number(rawBackoff))
+              : 1500;
+          const delayMs = baseBackoffMs * attempt;
+
+          this._clearRendererReloadTimers(webContents);
+          const timer = setTimeout(() => {
+            this._rendererReloadTimers?.delete(webContents);
+            if (
+              isWcDestroyed ||
+              !this._knownWebContents.has(webContents) ||
+              !this._isWebContentsAlive(webContents) ||
+              typeof webContents.reload !== "function"
+            ) {
+              return;
+            }
+            try {
+              webContents.reload();
+              stats.recoveries += 1;
+            } catch (err) {
+              stats.recoveryFailures += 1;
+              this._logWarn(
+                `renderer-reload-fail:${webContents.id || 0}`,
+                `WARN: Renderer auto-reload failed (wc=${webContents.id || 0}): ${err?.message || err}`,
+                10000
+              );
+            }
+          }, delayMs);
+          if (timer && typeof timer.unref === "function") {
+            timer.unref();
+          }
+          this._rendererReloadTimers.set(webContents, timer);
+        }
+      };
+
+      const onUnresponsive = () => {
+        const stats = this._ensureRendererHealthStats();
+        stats.unresponsive += 1;
+        stats.unresponsiveActive = true;
+        stats.lastUnresponsiveAt = Date.now();
+        this._logWarn(
+          `renderer-unresponsive:${webContents.id || 0}`,
+          `WARN: Renderer process unresponsive (wc=${webContents.id || 0})`,
+          10000
+        );
+      };
+
+      const onResponsive = () => {
+        const stats = this._ensureRendererHealthStats();
+        stats.unresponsiveActive = false;
+      };
+
+      webContents.on("render-process-gone", onRenderProcessGone);
+      webContents.on("unresponsive", onUnresponsive);
+      webContents.on("responsive", onResponsive);
+    }
 
     try {
       const isLoading =
