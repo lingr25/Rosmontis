@@ -8,6 +8,7 @@ const {
 } = require("../core/web_http");
 const { isWebCredentialApiEnabled } = require("../core/qzone_actions");
 const { createActionRouter, waitForEventOnce } = require("../core/primitives");
+const { hasKernelMethod } = require("../core/capability_probe");
 const {
   pickPositiveUin,
   normalizeGroupSummary,
@@ -624,12 +625,42 @@ const ACTION_HANDLERS = {
     return {};
   },
 
-  async set_group_special_title() {
-    const err = new Error(
-      "set_group_special_title is unsupported by Linux QQNT 3.2.32 kernel (no modifyMemberSpecialTitle RPC)"
+  async set_group_special_title(p) {
+    const methodName = hasKernelMethod(
+      this,
+      "nodeIKernelGroupService",
+      "modifyMemberSpecialTitle"
+    )
+      ? "modifyMemberSpecialTitle"
+      : hasKernelMethod(this, "nodeIKernelGroupService", "setMemberSpecialTitle")
+      ? "setMemberSpecialTitle"
+      : "";
+    if (!methodName) {
+      const err = new Error(
+        "set_group_special_title is unsupported by Linux QQNT 3.2.32 kernel (no modifyMemberSpecialTitle RPC)"
+      );
+      err.retcode = 1404;
+      throw err;
+    }
+    const groupCode = String(p?.group_id || "").trim();
+    if (!groupCode) throw new Error("group_id is required");
+    const uid = await this.uinUidStore.resolveUid(p?.user_id, this.invokeNt.bind(this));
+    const specialTitle = String(p?.special_title ?? "");
+    const duration =
+      p?.duration !== undefined && p?.duration !== null && Number.isFinite(Number(p.duration))
+        ? Number(p.duration)
+        : -1;
+    await this.invokeNt(
+      `nodeIKernelGroupService/${methodName}`,
+      {
+        groupCode,
+        uid,
+        specialTitle,
+        duration,
+      },
+      [groupCode, uid, specialTitle, duration]
     );
-    err.retcode = 1404;
-    throw err;
+    return {};
   },
 
   async set_group_name(p) {

@@ -11,6 +11,7 @@ const {
 
 const { resolveCompatVersionInfo } = require("../core/config");
 const { createActionRouter } = require("../core/primitives");
+const { probeRuntimeCapabilities } = require("../core/capability_probe");
 
 const MAX_FORWARD_DEPTH = 3;
 const MAX_OVERFLOW_SUMMARY_LINES = 20;
@@ -564,6 +565,12 @@ const ACTION_HANDLERS = {
         map_hook_active: Boolean(this._mapSetHook) && Map.prototype.set === this._mapSetHook,
         map_hook_release: this.mapHookRelease || null,
         listenErrors: Array.isArray(this.listenErrors) ? this.listenErrors : [],
+        capabilities: probeRuntimeCapabilities(this),
+        renderer_health: this.rendererHealthStats ? { ...this.rendererHealthStats } : null,
+        rate_limit:
+          typeof this.rateLimiter?.getStats === "function"
+            ? this.rateLimiter.getStats()
+            : null,
       },
     };
   },
@@ -605,11 +612,34 @@ const ACTION_HANDLERS = {
   },
 
   can_send_image() {
-    return { yes: true };
+    const probe = probeRuntimeCapabilities(this);
+    if (!probe.runtimeDetected || probe.notes?.opaqueNtApiProxy) {
+      return { yes: true };
+    }
+    return { yes: Boolean(probe.capabilities.send_image) };
   },
 
   can_send_record() {
-    return { yes: true };
+    const probe = probeRuntimeCapabilities(this);
+    if (!probe.runtimeDetected || probe.notes?.opaqueNtApiProxy) {
+      return { yes: true };
+    }
+    return { yes: Boolean(probe.capabilities.send_record) };
+  },
+
+  get_capabilities(p) {
+    return probeRuntimeCapabilities(this, {
+      forceRefresh: Boolean(p?.refresh || p?.force_refresh),
+    });
+  },
+
+  async reload_config(p) {
+    if (typeof this.reloadConfig === "function") {
+      return await this.reloadConfig(p);
+    }
+    const err = new Error("reload_config is not supported on this bridge instance");
+    err.retcode = 1404;
+    throw err;
   },
 
   clean_cache() {
