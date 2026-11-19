@@ -5,6 +5,7 @@ const path = require("path");
 
 const envHelpers = require("./env");
 const {
+  buildPrefixedEnvKeys,
   pickPrefixedEnv,
   parseBoolString,
   parsePrefixedEnvBool,
@@ -64,6 +65,32 @@ function _resolveNonNegativeNumberWithDefault(rawVal, defaultVal, suffix, extraK
   if (rawVal !== undefined && rawVal !== null && rawVal !== "") {
     const rawNum = Number(rawVal);
     if (Number.isFinite(rawNum) && rawNum >= 0) return rawNum;
+  }
+  return defaultVal;
+}
+
+function _resolveNonNegativeIntWithDefault(rawVal, defaultVal, suffix, extraKeys = []) {
+  const envRaw = pickPrefixedEnv(suffix, extraKeys);
+  if (envRaw !== "") {
+    const envNum = Number(envRaw);
+    if (Number.isFinite(envNum) && envNum >= 0) return Math.floor(envNum);
+  }
+  if (rawVal !== undefined && rawVal !== null && rawVal !== "") {
+    const rawNum = Number(rawVal);
+    if (Number.isFinite(rawNum) && rawNum >= 0) return Math.floor(rawNum);
+  }
+  return defaultVal;
+}
+
+function _resolvePositiveNumberWithDefault(rawVal, defaultVal, suffix, extraKeys = []) {
+  const envRaw = pickPrefixedEnv(suffix, extraKeys);
+  if (envRaw !== "") {
+    const envNum = Number(envRaw);
+    if (Number.isFinite(envNum) && envNum > 0) return envNum;
+  }
+  if (rawVal !== undefined && rawVal !== null && rawVal !== "") {
+    const rawNum = Number(rawVal);
+    if (Number.isFinite(rawNum) && rawNum > 0) return rawNum;
   }
   return defaultVal;
 }
@@ -292,6 +319,106 @@ function loadBridgeConfig(customConfigDir) {
   // Logging, diagnostics & runtime flags (JSON + env overrides)
   defaultConfig.debugLogs = _resolveBoolWithDefault(loadedRaw.debugLogs, false, "DEBUG");
   defaultConfig.quietLogs = _resolveBoolWithDefault(loadedRaw.quietLogs, false, "QUIET");
+  const envLogFormat = pickPrefixedEnv("LOG_FORMAT").toLowerCase();
+  const rawLogFormat = String(
+    envLogFormat || loadedRaw.logFormat || loadedRaw.log_format || "text"
+  )
+    .trim()
+    .toLowerCase();
+  defaultConfig.logFormat = rawLogFormat === "json" ? "json" : "text";
+  defaultConfig.enableMetrics = _resolveBoolWithDefault(
+    loadedRaw.enableMetrics ?? loadedRaw.enable_metrics,
+    true,
+    "ENABLE_METRICS"
+  );
+  defaultConfig.reloadOnSighup = _resolveBoolWithDefault(
+    loadedRaw.reloadOnSighup ?? loadedRaw.reload_on_sighup,
+    true,
+    "RELOAD_ON_SIGHUP"
+  );
+  defaultConfig.webhookMaxConcurrency = _resolvePositiveIntWithDefault(
+    loadedRaw.webhookMaxConcurrency ?? loadedRaw.webhook_max_concurrency,
+    8,
+    "WEBHOOK_MAX_CONCURRENCY"
+  );
+  defaultConfig.webhookMaxQueueSize = _resolvePositiveIntWithDefault(
+    loadedRaw.webhookMaxQueueSize ?? loadedRaw.webhook_max_queue_size,
+    256,
+    "WEBHOOK_MAX_QUEUE_SIZE"
+  );
+  defaultConfig.webhookMaxRetries = _resolveNonNegativeIntWithDefault(
+    loadedRaw.webhookMaxRetries ?? loadedRaw.webhook_max_retries,
+    2,
+    "WEBHOOK_MAX_RETRIES"
+  );
+  defaultConfig.webhookRetryBaseMs = _resolveNonNegativeIntWithDefault(
+    loadedRaw.webhookRetryBaseMs ?? loadedRaw.webhook_retry_base_ms,
+    250,
+    "WEBHOOK_RETRY_BASE_MS"
+  );
+  defaultConfig.rendererAutoReload = _resolveBoolWithDefault(
+    loadedRaw.rendererAutoReload ?? loadedRaw.renderer_auto_reload,
+    true,
+    "RENDERER_AUTO_RELOAD"
+  );
+  defaultConfig.rendererMaxReloadsPerMinute = _resolvePositiveIntWithDefault(
+    loadedRaw.rendererMaxReloadsPerMinute ?? loadedRaw.renderer_max_reloads_per_minute,
+    3,
+    "RENDERER_MAX_RELOADS_PER_MINUTE"
+  );
+  defaultConfig.rendererReloadBackoffMs = _resolveNonNegativeIntWithDefault(
+    loadedRaw.rendererReloadBackoffMs ?? loadedRaw.renderer_reload_backoff_ms,
+    1500,
+    "RENDERER_RELOAD_BACKOFF_MS"
+  );
+  const rawRateLimit =
+    loadedRaw.rateLimit &&
+    typeof loadedRaw.rateLimit === "object" &&
+    !Array.isArray(loadedRaw.rateLimit)
+      ? loadedRaw.rateLimit
+      : loadedRaw.rate_limit &&
+        typeof loadedRaw.rate_limit === "object" &&
+        !Array.isArray(loadedRaw.rate_limit)
+      ? loadedRaw.rate_limit
+      : {};
+  defaultConfig.rateLimit = {
+    enabled: _resolveBoolWithDefault(
+      rawRateLimit.enabled ?? rawRateLimit.enable,
+      false,
+      "RATE_LIMIT_ENABLE",
+      buildPrefixedEnvKeys("RATE_LIMIT_ENABLED")
+    ),
+    globalPerSec: _resolvePositiveNumberWithDefault(
+      rawRateLimit.globalPerSec ?? rawRateLimit.global_per_sec,
+      10,
+      "RATE_LIMIT_GLOBAL_PER_SEC"
+    ),
+    globalBurst: _resolvePositiveNumberWithDefault(
+      rawRateLimit.globalBurst ?? rawRateLimit.global_burst,
+      20,
+      "RATE_LIMIT_GLOBAL_BURST"
+    ),
+    perPeerPerSec: _resolvePositiveNumberWithDefault(
+      rawRateLimit.perPeerPerSec ?? rawRateLimit.per_peer_per_sec,
+      2,
+      "RATE_LIMIT_PER_PEER_PER_SEC"
+    ),
+    perPeerBurst: _resolvePositiveNumberWithDefault(
+      rawRateLimit.perPeerBurst ?? rawRateLimit.per_peer_burst,
+      5,
+      "RATE_LIMIT_PER_PEER_BURST"
+    ),
+    circuitBreakerThreshold: _resolvePositiveIntWithDefault(
+      rawRateLimit.circuitBreakerThreshold ?? rawRateLimit.circuit_breaker_threshold,
+      5,
+      "RATE_LIMIT_CB_THRESHOLD"
+    ),
+    circuitBreakerCooldownMs: _resolveNonNegativeIntWithDefault(
+      rawRateLimit.circuitBreakerCooldownMs ?? rawRateLimit.circuit_breaker_cooldown_ms,
+      30000,
+      "RATE_LIMIT_CB_COOLDOWN_MS"
+    ),
+  };
   defaultConfig.keepMapHook = _resolveBoolWithDefault(
     loadedRaw.keepMapHook,
     false,

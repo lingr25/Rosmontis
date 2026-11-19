@@ -1,7 +1,7 @@
 "use strict";
 
 const fs = require("fs");
-const { isQuietLogsEnabled, isDebugLogsEnabled } = require("./env");
+const { isQuietLogsEnabled, isDebugLogsEnabled, getLogFormat } = require("./env");
 
 /**
  * Shared Zero-Dependency Runtime Primitives (`src/core/primitives.js`)
@@ -435,6 +435,10 @@ class BridgeLogger {
     return Boolean(isDebugLogsEnabled(cfg));
   }
 
+  _isJsonFormat(cfg) {
+    return getLogFormat(cfg) === "json";
+  }
+
   _emit(line) {
     try {
       this._writeFn(`${line}\n`);
@@ -442,6 +446,21 @@ class BridgeLogger {
     } catch (_) {
       return false;
     }
+  }
+
+  _emitFormatted(cfg, level, textLine, { msg, scope = undefined, key = undefined } = {}) {
+    if (this._isJsonFormat(cfg)) {
+      const entry = {
+        ts: new Date().toISOString(),
+        level,
+        component: "rosmontis",
+        msg: String(msg ?? ""),
+        ...(scope ? { scope: String(scope) } : {}),
+        ...(key ? { key: String(key) } : {}),
+      };
+      return this._emit(JSON.stringify(entry));
+    }
+    return this._emit(textLine);
   }
 
   /**
@@ -455,9 +474,14 @@ class BridgeLogger {
     const cfg = this._getConfig() || {};
     if (this._isQuiet(cfg) || !this._isDebug(cfg)) return false;
     if (errOrMsg === undefined) {
-      return this._emit(`${this.prefix} DEBUG: ${_formatLogValue(scope)}`);
+      const msg = _formatLogValue(scope);
+      return this._emitFormatted(cfg, "debug", `${this.prefix} DEBUG: ${msg}`, { msg });
     }
-    return this._emit(`${this.prefix} DEBUG [${scope}]: ${_formatLogValue(errOrMsg)}`);
+    const msg = _formatLogValue(errOrMsg);
+    return this._emitFormatted(cfg, "debug", `${this.prefix} DEBUG [${scope}]: ${msg}`, {
+      msg,
+      scope: String(scope),
+    });
   }
 
   /**
@@ -469,7 +493,8 @@ class BridgeLogger {
   warn(msg) {
     const cfg = this._getConfig() || {};
     if (this._isQuiet(cfg)) return false;
-    return this._emit(`${this.prefix} ${_formatLogValue(msg)}`);
+    const text = _formatLogValue(msg);
+    return this._emitFormatted(cfg, "warn", `${this.prefix} ${text}`, { msg: text });
   }
 
   /**
@@ -491,7 +516,11 @@ class BridgeLogger {
       return false;
     }
     this._throttleMap.set(throttleKey, now);
-    return this._emit(`${this.prefix} ${_formatLogValue(msg)}`);
+    const text = _formatLogValue(msg);
+    return this._emitFormatted(cfg, "warn", `${this.prefix} ${text}`, {
+      msg: text,
+      ...(key ? { key: String(key) } : {}),
+    });
   }
 
   /**
@@ -504,8 +533,12 @@ class BridgeLogger {
   error(msg, err) {
     const cfg = this._getConfig() || {};
     if (this._isQuiet(cfg)) return false;
+    const base = _formatLogValue(msg);
     const detail = err !== undefined && err !== null ? `: ${_formatLogValue(err)}` : "";
-    return this._emit(`${this.prefix} ERROR: ${_formatLogValue(msg)}${detail}`);
+    const fullMsg = `${base}${detail}`;
+    return this._emitFormatted(cfg, "error", `${this.prefix} ERROR: ${fullMsg}`, {
+      msg: fullMsg,
+    });
   }
 }
 

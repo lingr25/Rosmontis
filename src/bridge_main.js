@@ -68,6 +68,7 @@ for (const mod of ACTION_MODULES) {
 class NtqqOneBotBridge extends EventEmitter {
   constructor(options = {}) {
     super();
+    this._configDir = options.configDir;
     this.config = options.config || loadBridgeConfig(options.configDir);
     this.messageIdStore = options.messageIdStore || new MessageIdStore(10000);
     this.uinUidStore = options.uinUidStore || new UinUidStore(20000);
@@ -150,6 +151,11 @@ class NtqqOneBotBridge extends EventEmitter {
     this._reverseWsClients = [];
     this._wsClientHandles = this._reverseWsClients;
     this._activeWebhookReqs = new Set();
+    this._webhookRetryTimers = new Set();
+    this._webhookQueue = [];
+    this._webhookGeneration = 0;
+    this.webhookStats = { ok: 0, failed: 0, retries: 0, dropped: 0, inFlight: 0, queued: 0 };
+    this._sighupHandler = null;
     this.listenErrors = [];
     this._heartbeatTimer = null;
     this._wsPingTimer = null;
@@ -273,6 +279,7 @@ class NtqqOneBotBridge extends EventEmitter {
         this._wsServerClients.delete(client);
         continue;
       }
+      if (client._wsRole === "api") continue;
       if (event.post_type === "message_sent" && !client.reportSelfMessage) continue;
       const targetFormat = client._messageFormat || defaultFormat;
       client.sendJson(this._formatEventForEndpoint(event, targetFormat));
@@ -337,6 +344,9 @@ class NtqqOneBotBridge extends EventEmitter {
   async _dispatchAction(action, p, context = {}) {
     const handler = ACTION_DISPATCH_MAP.get(action);
     if (!handler) {
+      if (action === "reload_config" && typeof this.reloadConfig === "function") {
+        return await this.reloadConfig(p);
+      }
       throw new Error(`Unsupported OneBot action: ${action}`);
     }
     return await handler.call(this, action, p, context);

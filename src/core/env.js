@@ -158,6 +158,18 @@ function isDebugLogsEnabled(config) {
   return Boolean(config?.debugLogs) || isPrefixedEnvTruthy("DEBUG");
 }
 
+function getLogFormat(config) {
+  const cfgFmt =
+    config && typeof config.logFormat === "string"
+      ? config.logFormat.trim().toLowerCase()
+      : "";
+  if (cfgFmt === "json" || cfgFmt === "text") {
+    return cfgFmt;
+  }
+  const envFmt = pickPrefixedEnv("LOG_FORMAT").toLowerCase();
+  return envFmt === "json" ? "json" : "text";
+}
+
 function getHomeDir() {
   const env = _getEnv();
   return env.HOME || env.USERPROFILE || os.homedir();
@@ -238,6 +250,7 @@ module.exports = {
   isTestModeFromEnv,
   isQuietLogsEnabled,
   isDebugLogsEnabled,
+  getLogFormat,
   getHomeDir,
   getTempBaseDir,
   getXdgConfigHome,
