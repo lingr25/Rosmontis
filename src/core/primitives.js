@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const fs = require("fs");
@@ -15,10 +16,15 @@ const { isQuietLogsEnabled, isDebugLogsEnabled, getLogFormat } = require("./env"
 // 1. BoundedMap & setBoundedMap
 // ============================================================================
 
+/**
+ * @template [K=any]
+ * @template [V=any]
+ * @extends {Map<K, V>}
+ */
 class BoundedMap extends Map {
   /**
    * @param {number} [maxEntries=2000]
-   * @param {Iterable<readonly [any, any]>} [iterable]
+   * @param {Iterable<readonly [K, V]>} [iterable]
    */
   constructor(maxEntries = 2000, iterable = undefined) {
     super();
@@ -448,7 +454,14 @@ class BridgeLogger {
     }
   }
 
-  _emitFormatted(cfg, level, textLine, { msg, scope = undefined, key = undefined } = {}) {
+  /**
+   * @param {Record<string, any>} cfg
+   * @param {string} level
+   * @param {string} textLine
+   * @param {{ msg?: any, scope?: string, key?: string }} [meta]
+   * @returns {boolean}
+   */
+  _emitFormatted(cfg, level, textLine, { msg = undefined, scope = undefined, key = undefined } = {}) {
     if (this._isJsonFormat(cfg)) {
       const entry = {
         ts: new Date().toISOString(),

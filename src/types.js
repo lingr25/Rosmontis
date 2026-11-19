@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -127,6 +128,112 @@
  * @property {CompatProfile} [compatProfile]
  * @property {string} [compatAppName]
  * @property {string} [compatAppVersion]
+ * @property {"text" | "json"} [logFormat]
+ * @property {boolean} [enableMetrics]
+ * @property {boolean} [reloadOnSighup]
+ * @property {number} [webhookMaxConcurrency]
+ * @property {number} [webhookMaxQueueSize]
+ * @property {number} [webhookMaxRetries]
+ * @property {number} [webhookRetryBaseMs]
+ * @property {boolean} [rendererAutoReload]
+ * @property {number} [rendererMaxReloadsPerMinute]
+ * @property {number} [rendererReloadBackoffMs]
+ * @property {RateLimitConfig} [rateLimit]
+ */
+
+/**
+ * Runtime capability probe snapshot returned by `probeRuntimeCapabilities` / `get_capabilities`.
+ * @typedef {object} CapabilityProbeResult
+ * @property {number} probedAt
+ * @property {boolean} runtimeDetected
+ * @property {number} ntApiMethodCount
+ * @property {string[]} wrapperServices
+ * @property {{ ffmpegPath: string, silkEncoderConfigured: boolean, silkDecoderConfigured: boolean }} mediaTools
+ * @property {{
+ *   send_msg: boolean,
+ *   send_image: boolean,
+ *   send_record: boolean,
+ *   send_video: boolean,
+ *   send_file: boolean,
+ *   recall_msg: boolean,
+ *   forward_msg: boolean,
+ *   group_special_title: boolean,
+ *   group_essence: boolean,
+ *   group_notice: boolean,
+ *   emoji_like: boolean,
+ *   poke: boolean,
+ *   ocr_image: boolean,
+ *   voice_to_text: boolean,
+ *   web_credentials: boolean
+ * }} capabilities
+ * @property {{
+ *   copyFileWithDelExifInfo: boolean,
+ *   getRichMediaFilePathForGuild: boolean,
+ *   opaqueNtApiProxy: boolean
+ * }} notes
+ */
+
+/**
+ * Outbound token-bucket rate limiter & circuit breaker configuration.
+ * @typedef {object} RateLimitConfig
+ * @property {boolean} [enabled]
+ * @property {number} [globalPerSec]
+ * @property {number} [globalBurst]
+ * @property {number} [perPeerPerSec]
+ * @property {number} [perPeerBurst]
+ * @property {number} [circuitBreakerThreshold]
+ * @property {number} [circuitBreakerCooldownMs]
+ * @property {number} [maxPeers]
+ */
+
+/**
+ * Cumulative telemetry snapshot returned by `OutboundRateLimiter.getStats()`.
+ * @typedef {object} RateLimitStats
+ * @property {boolean} enabled
+ * @property {number} allowed
+ * @property {number} rejected
+ * @property {number} globalRejected
+ * @property {number} peerRejected
+ * @property {number} circuitRejected
+ * @property {number} circuitOpens
+ * @property {"closed" | "open" | "half_open"} circuitState
+ * @property {number} activePeers
+ */
+
+/**
+ * Electron renderer process crash / responsiveness self-healing telemetry.
+ * @typedef {object} RendererHealthStats
+ * @property {number} crashes
+ * @property {number} unresponsive
+ * @property {boolean} unresponsiveActive
+ * @property {number} recoveries
+ * @property {number} recoveryFailures
+ * @property {number} reloadSuppressed
+ * @property {number} lastCrashAt
+ * @property {string} lastCrashReason
+ * @property {number} lastUnresponsiveAt
+ */
+
+/**
+ * Outbound HTTP POST webhook delivery queue & retry counters.
+ * @typedef {object} WebhookStats
+ * @property {number} ok
+ * @property {number} failed
+ * @property {number} retries
+ * @property {number} dropped
+ * @property {number} inFlight
+ * @property {number} queued
+ */
+
+/**
+ * Result payload returned by `reloadConfig` / OneBot `reload_config` action.
+ * @typedef {object} ReloadConfigResult
+ * @property {boolean} reloaded
+ * @property {boolean} network_restarted
+ * @property {boolean} network_restart_scheduled
+ * @property {string[]} changed_keys
+ * @property {string[]} network_changed_keys
+ * @property {Array<Record<string, any>>} [listen_errors]
  */
 
 /**

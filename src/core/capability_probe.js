@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -203,7 +204,7 @@ function hasKernelMethodOnResolved(
  * Read-only check for whether a specific NTQQ kernel RPC (`serviceName/methodName`)
  * is actually exposed by the captured `wrapperSession` or explicit `ntApi` runtime.
  *
- * @param {object} bridge
+ * @param {Record<string, any>} bridge
  * @param {string} serviceName
  * @param {string} methodName
  * @returns {boolean}
@@ -227,11 +228,11 @@ function hasKernelMethod(bridge, serviceName, methodName) {
  * Results are lightly cached on `bridge._capabilityProbeCache` and auto-invalidated
  * when captured service references or web-credential gating change (or via `forceRefresh`).
  *
- * @param {object} bridge
+ * @param {Record<string, any>} bridge
  * @param {object} [options]
  * @param {boolean} [options.forceRefresh=false]
  * @param {number} [options.ttlMs=10000]
- * @returns {object}
+ * @returns {import("../types").CapabilityProbeResult}
  */
 function probeRuntimeCapabilities(bridge, options = {}) {
   const opts = options && typeof options === "object" ? options : {};

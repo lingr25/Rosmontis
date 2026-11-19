@@ -332,64 +332,71 @@ test("get_status, get_capabilities, and reload_config delegation work end-to-end
     config: makeBaseConfig(),
   });
 
-  // Default telemetry: renderer_health and rate_limit are null until sibling subsystems exist
-  const status1 = await bridge.handleOneBotAction("get_status", {});
-  assert.strictEqual(status1.status, "ok");
-  assert.ok(status1.data.bridge.capabilities);
-  assert.strictEqual(status1.data.bridge.capabilities.runtimeDetected, true);
-  assert.strictEqual(status1.data.bridge.capabilities.capabilities.send_msg, true);
-  assert.strictEqual(status1.data.bridge.capabilities.capabilities.ocr_image, true);
-  assert.strictEqual(status1.data.bridge.renderer_health, null);
-  assert.strictEqual(status1.data.bridge.rate_limit, null);
+  try {
+    // Default telemetry: renderer_health and rate_limit are null until sibling subsystems exist
+    const status1 = await bridge.handleOneBotAction("get_status", {});
+    assert.strictEqual(status1.status, "ok");
+    assert.ok(status1.data.bridge.capabilities);
+    assert.strictEqual(status1.data.bridge.capabilities.runtimeDetected, true);
+    assert.strictEqual(status1.data.bridge.capabilities.capabilities.send_msg, true);
+    assert.strictEqual(status1.data.bridge.capabilities.capabilities.ocr_image, true);
+    assert.strictEqual(status1.data.bridge.renderer_health, null);
+    assert.strictEqual(status1.data.bridge.rate_limit, null);
 
-  // When sibling modules populate rendererHealthStats & rateLimiter, get_status surfaces them defensively
-  bridge.rendererHealthStats = { status: "healthy", reInjects: 1 };
-  bridge.rateLimiter = {
-    getStats() {
-      return { totalRequests: 42, rejected: 0 };
-    },
-  };
-  const status2 = await bridge.handleOneBotAction("get_status", {});
-  assert.strictEqual(status2.status, "ok");
-  assert.deepStrictEqual(status2.data.bridge.renderer_health, {
-    status: "healthy",
-    reInjects: 1,
-  });
-  assert.notStrictEqual(status2.data.bridge.renderer_health, bridge.rendererHealthStats);
-  assert.deepStrictEqual(status2.data.bridge.rate_limit, {
-    totalRequests: 42,
-    rejected: 0,
-  });
+    // When sibling modules populate rendererHealthStats & rateLimiter, get_status surfaces them defensively
+    bridge.rendererHealthStats = { status: "healthy", reInjects: 1 };
+    bridge.rateLimiter = {
+      getStats() {
+        return { totalRequests: 42, rejected: 0 };
+      },
+    };
+    const status2 = await bridge.handleOneBotAction("get_status", {});
+    assert.strictEqual(status2.status, "ok");
+    assert.deepStrictEqual(status2.data.bridge.renderer_health, {
+      status: "healthy",
+      reInjects: 1,
+    });
+    assert.notStrictEqual(status2.data.bridge.renderer_health, bridge.rendererHealthStats);
+    assert.deepStrictEqual(status2.data.bridge.rate_limit, {
+      totalRequests: 42,
+      rejected: 0,
+    });
 
-  // get_capabilities action supports refresh flag
-  const cap1 = await bridge.handleOneBotAction("get_capabilities", {});
-  assert.strictEqual(cap1.status, "ok");
-  assert.strictEqual(cap1.data.capabilities.recall_msg, false);
-  ntApi["nodeIKernelMsgService/recallMsg"] = async () => ({ result: 0 });
-  // Without refresh, cached result still shows recall_msg: false
-  const capCached = await bridge.handleOneBotAction("get_capabilities", {});
-  assert.strictEqual(capCached.data.capabilities.recall_msg, false);
-  // With refresh: true, re-probes and detects recall_msg: true
-  const capRefreshed = await bridge.handleOneBotAction("get_capabilities", { refresh: true });
-  assert.strictEqual(capRefreshed.status, "ok");
-  assert.strictEqual(capRefreshed.data.capabilities.recall_msg, true);
+    // get_capabilities action supports refresh flag
+    const cap1 = await bridge.handleOneBotAction("get_capabilities", {});
+    assert.strictEqual(cap1.status, "ok");
+    assert.strictEqual(cap1.data.capabilities.recall_msg, false);
+    ntApi["nodeIKernelMsgService/recallMsg"] = async () => ({ result: 0 });
+    // Without refresh, cached result still shows recall_msg: false
+    const capCached = await bridge.handleOneBotAction("get_capabilities", {});
+    assert.strictEqual(capCached.data.capabilities.recall_msg, false);
+    // With refresh: true, re-probes and detects recall_msg: true
+    const capRefreshed = await bridge.handleOneBotAction("get_capabilities", { refresh: true });
+    assert.strictEqual(capRefreshed.status, "ok");
+    assert.strictEqual(capRefreshed.data.capabilities.recall_msg, true);
 
-  // reload_config returns retcode 1404 when bridge.reloadConfig is not implemented
-  const reloadMissing = await bridge.handleOneBotAction("reload_config", {});
-  assert.strictEqual(reloadMissing.status, "failed");
-  assert.strictEqual(reloadMissing.retcode, 1404);
+    // reload_config returns retcode 1404 when bridge.reloadConfig is not implemented
+    bridge.reloadConfig = null;
+    const reloadMissing = await bridge.handleOneBotAction("reload_config", {});
+    assert.strictEqual(reloadMissing.status, "failed");
+    assert.strictEqual(reloadMissing.retcode, 1404);
 
-  // When bridge.reloadConfig is attached (by Wave 2 sibling), reload_config delegates to it
-  const receivedParams = [];
-  bridge.reloadConfig = async (params) => {
-    receivedParams.push(params);
-    return { reloaded: true, applied: ["rateLimit"] };
-  };
-  const reloadOk = await bridge.handleOneBotAction("reload_config", { dry_run: true });
-  assert.strictEqual(reloadOk.status, "ok");
-  assert.strictEqual(reloadOk.retcode, 0);
-  assert.deepStrictEqual(reloadOk.data, { reloaded: true, applied: ["rateLimit"] });
-  assert.deepStrictEqual(receivedParams, [{ dry_run: true }]);
+    // When bridge.reloadConfig is attached, reload_config delegates to it
+    const receivedParams = [];
+    bridge.reloadConfig = async (params) => {
+      receivedParams.push(params);
+      return { reloaded: true, applied: ["rateLimit"] };
+    };
+    const reloadOk = await bridge.handleOneBotAction("reload_config", { dry_run: true });
+    assert.strictEqual(reloadOk.status, "ok");
+    assert.strictEqual(reloadOk.retcode, 0);
+    assert.deepStrictEqual(reloadOk.data, { reloaded: true, applied: ["rateLimit"] });
+    assert.deepStrictEqual(receivedParams, [{ dry_run: true }]);
+  } finally {
+    if (typeof bridge.stopServers === "function") {
+      await bridge.stopServers();
+    }
+  }
 });
 
 test("wildcard ntApi Proxy avoids false-positive group_special_title and defers to ntStore.wrapperSession when present", async () => {

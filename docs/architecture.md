@@ -51,17 +51,17 @@
 
 ## 2. Rosmontis 核心架构
 
-Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个顶层入口模块、JSDoc 类型契约（`src/types.js` & `jsconfig.json`）、`src/onebot/` 下的 4 个协议子模块、`src/core/` 下的 18 个零依赖核心子模块与 `src/actions/` 下的 4 个动作域子模块组成（零外部 npm 依赖）：
+Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任何二进制文件、不拦截或伪造任何官方遥测接口**。全项目由 4 个顶层入口模块、JSDoc 类型契约与静态检查（`src/types.js`、`jsconfig.json` 与核心模块 `// @ts-check`）、`src/onebot/` 下的 4 个协议子模块、`src/core/` 下的 22 个零依赖核心子模块与 `src/actions/` 下的 6 个动作域子模块组成（零外部 npm 依赖）：
 
 | 模块 | 职责 |
 | :--- | :--- |
 | `src/app_launcher_index.js` | 纯 JS 引导包装器：在 `major.node` 启动前初始化 `bridge_main.js`，支持 `ROSMONTIS_DISABLE=1` 一键旁路 |
 | `src/bridge_renderer.js` | 渲染层受信任桥接器：闭包隔离 `__ipcToken` 鉴权，监听结构化 `__ROSMONTIS_BRIDGE_CMD__` 指令通道，构造原生 `RM_IPCFROM_RENDERER{windowId}` 帧并驱动会话因果状态机 |
-| `src/bridge_main.js` | 主进程精简协调器：组合 `BridgeLogger`、`TtlDedupeSet`、`TempCleanupQueue`、`EchoCorrelator`、`HumanSessionController` 等核心子系统与动作路由表，统筹生命周期、自动快登与 OneBot v11 动作分发 |
-| `src/bridge_onebot.js` & `src/onebot/*` | OneBot v11 协议统一门面与 4 个高内聚子模块：`stores`（LRU 消息短 ID 映射与 UIN/UID 双向索引）、`cq_codec`（CQ 码与消息段归一化编解码）、`segment_converter`（NTQQ `elements` 与消息段双向转换）、`event_formatter`（消息、灰条通知、请求与元事件格式化） |
-| `src/types.js` & `jsconfig.json` | 零编译开销的 JSDoc 协议与内部运行时类型契约，提供 IDE 智能补全与静态契约约束 |
-| `src/core/*` | 18 个零依赖核心子模块：`env`（多前缀环境变量统一解析）、`primitives`（有界 LRU、TTL 去重、临时文件清理队列、事件等待器、限流日志、跨进程 `Map`/`void` 无损编解码与声明式动作路由）、`nt_normalizer`（多版本 NTQQ 内核结构防腐层）、`echo_correlator`（出站 `sendMsg` <-> `onAddSendMsg` 真实 `msgId` 关联）、`session_controller`（人类会话因果控制器 `HumanSessionController`）、`session_scheduler`（会话亲和互斥锁与切换冷却 `CausalSessionScheduler`）、`nt_capture`（无痕捕获与原生原型链自动归还）、`renderer_ipc`（渲染窗口注入、受信任 IPC 与三级 `invokeNt` 调度）、`inbound_pipeline`（内核事件监听与富媒体水合）、`outbound_pipeline`（两阶段出站发送管线）、`server_runtime`（HTTP / 正向 WS / 反向 WS 服务运行时）、`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`audio_codec`（纯 JS SILK v3 / AMR / WAV 帧解析与按需 `ffmpeg` 语音转码）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
-| `src/actions/*` | 4 个 OneBot v11 动作域子模块：`message_actions`（登录状态、消息收发、合并转发、历史记录、已读/回应/戳一戳）、`contact_actions`（好友列表、资料、备注与好友申请）、`group_actions`（群信息/成员、群管操作、精华消息与入群申请）、`file_media_actions`（群/私聊文件传输、媒体解析、OCR/语音转文字、个人资料与 Ark 分享） |
+| `src/bridge_main.js` | 主进程精简协调器：组合 `BridgeLogger`、`TtlDedupeSet`、`TempCleanupQueue`、`EchoCorrelator`、`HumanSessionController`、`OutboundRateLimiter` 等核心子系统与动作路由表，统筹生命周期、自动快登与 OneBot v11 动作分发 |
+| `src/bridge_onebot.js` & `src/onebot/*` | OneBot v11 协议统一门面与 4 个高内聚子模块：`stores`（LRU 消息短 ID 映射与 UIN/UID 双向索引，支持防抖原子持久化）、`cq_codec`（CQ 码与消息段归一化编解码）、`segment_converter`（NTQQ `elements` 与消息段双向转换）、`event_formatter`（消息、灰条通知、请求与元事件格式化） |
+| `src/types.js` & `jsconfig.json` | 零编译开销的 JSDoc 协议与运行时类型契约，配合核心纯 JS 模块 `// @ts-check` 在 IDE 与 CI 中执行 `tsc --noEmit -p jsconfig.json` 静态检查 |
+| `src/core/*` | 22 个零依赖核心子模块：`env`（多前缀环境变量统一解析）、`primitives`（有界 LRU、TTL 去重、临时文件清理队列、事件等待器、限流/结构化 JSON 日志 `BridgeLogger`、跨进程 `Map`/`void` 无损编解码与声明式动作路由）、`nt_normalizer`（多版本 NTQQ 内核结构防腐层）、`echo_correlator`（出站 `sendMsg` <-> `onAddSendMsg` 真实 `msgId` 关联）、`session_controller`（人类会话因果控制器 `HumanSessionController`）、`session_scheduler`（会话亲和互斥锁与切换冷却 `CausalSessionScheduler`）、`nt_capture`（无痕捕获与原生原型链自动归还）、`renderer_ipc`（渲染窗口注入、受信任 IPC、`render-process-gone` / `unresponsive` 崩溃自愈与三级 `invokeNt` 调度）、`inbound_pipeline`（内核事件监听与入站分发编排）、`media_hydrator`（按会话因果串行+跨会话有界并发富媒体下载水合）、`login_recovery`（本地快登凭据读取、`setAutoLogin` 与无扫码自动登录恢复）、`outbound_pipeline`（两阶段出站发送管线与频控集成）、`rate_limiter`（全局+单会话令牌桶限流与连续拒绝熔断器 `OutboundRateLimiter`，拒绝返回 `retcode: 1429`）、`capability_probe`（只读运行时内核 RPC 能力探测与动态动作门控）、`server_runtime`（HTTP API、`/health` `/ready` `/metrics`、正向 WS 分离路径 `/` `/api` `/event`、反向 WS、Webhook 有界并发队列与指数退避重试、`reload_config` / `SIGHUP` 热重载运行时）、`ws_rfc6455`（RFC 6455 帧/掩码/大小上限）、`transport_security`（恒定时间鉴权、`Origin` 防护、非回环 Protected Mode 自动鉴权）、`media_security`（流式配额下载、IPv4/IPv6 SSRF 防护、严格 LFI 目录白名单）、`audio_codec`（纯 JS SILK v3 / AMR / WAV 帧解析与按需 `ffmpeg` / SILK CLI 语音编解码）、`qzone_actions`（默认关闭的 Web 凭据/空间门控）、`web_http`、`config` |
+| `src/actions/*` | 6 个 OneBot v11 动作域子模块：`message_actions`（登录状态、`get_capabilities`、`reload_config`、消息收发、合并转发、历史记录、已读/回应/戳一戳）、`contact_actions`（好友列表、资料、备注与好友申请）、`group_actions`（群信息/成员、群管操作、精华消息与入群申请）、`file_actions`（群/私聊文件上传、下载链接与文件夹管理）、`media_profile_actions`（图片/语音/文件解析、OCR/语音转文字、个人资料状态与 Ark 分享），及保持向后兼容导出的聚合门面 `file_media_actions` |
 
 ### 2.1 渲染层官方 IPC 帧协议与 Map 跨进程还原
 
@@ -114,7 +114,27 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
 
 ---
 
-## 3. 诊断与运行状态观测
+## 3. 诊断、可观测性与运维弹性
+
+### 3.1 健康探针、Prometheus 指标与结构化日志
+
+- **HTTP 运维端点**（复用 OneBot HTTP 端口与鉴权策略）：
+  - `GET /health`：轻量进程存活探针；
+  - `GET /ready`：就绪探针（校验在线状态、网络监听错误为空及已捕获内核服务，未就绪返回 `503`）；
+  - `GET /metrics`（可通过 `enableMetrics: false` / `ROSMONTIS_ENABLE_METRICS=0` 关闭）：输出标准 Prometheus text exposition 格式指标（含在线状态、三级 `invokeNt` 计数、回显关联统计、WS 连接数、Webhook 成功/失败/重试/丢弃计数、限流与熔断状态、渲染进程崩溃/恢复统计）。
+- **正向 WebSocket 分离路径**：支持标准 OneBot v11 路由 `/`（全双工）、`/api`（仅动作请求，不推送事件）与 `/event`（仅接收事件，拒绝动作调用）。
+- **结构化日志**：设置 `logFormat: "json"` 或 `ROSMONTIS_LOG_FORMAT=json` 后，`BridgeLogger` 输出单行 NDJSON（`{ ts, level, component, msg, scope?, key? }`）。
+- **Webhook 有界并发与退避重试**：`server_runtime.js` 为 HTTP POST 事件推送维护有界并发池（`webhookMaxConcurrency`）与等待队列（`webhookMaxQueueSize`），对 `5xx` / `429` / 网络错误按 `webhookRetryBaseMs` 指数退避重试（`4xx` 非 `429` 不重试），避免慢下游拖垮内存。
+
+### 3.2 热重载、运行时能力探测、限流熔断与渲染崩溃自愈
+
+- **配置热重载**：支持 OneBot 动作 `reload_config`（通过 HTTP/WS 触发时延迟至当前响应写完后再安全重启变更的网络监听，无自锁死锁）以及 Unix `SIGHUP` 信号热重载（`reloadOnSighup: true`），平滑更新策略、限流阈值或监听端口并保留 `MessageIdStore` / `UinUidStore` 与会话状态。
+- **运行时 RPC 能力探测**：`src/core/capability_probe.js` 只读探测当前捕获的 `ntApi` 与 `wrapperSession` 实际暴露的方法及媒体工具配置，供 `get_capabilities`、`get_status.bridge.capabilities` 与动态能力门控（如 `can_send_image` / `can_send_record` / `set_group_special_title`）使用。
+- **出站限流与熔断**：`src/core/rate_limiter.js`（默认关闭，可通过 `rateLimit.enabled: true` 开启）提供全局 + 单会话（有界 LRU）双层令牌桶与连续拒绝熔断器（`closed` -> `open` -> `half_open` -> `closed`）；单会话被限流时自动退回全局令牌避免嘈杂会话饿死其他会话，拒绝时返回 `retcode: 1429`。
+- **渲染进程崩溃自愈**：`src/core/renderer_ipc.js` 监听 `render-process-gone`、`unresponsive` 与 `responsive` 事件，自动中止挂起指令、复位会话状态并在每分钟次数上限（`rendererMaxReloadsPerMinute`）内按线性退避（`rendererReloadBackoffMs`）自动重载恢复。
+- **容器默认持久化、精简构建与周度金丝雀**：Docker 镜像默认配置 `ROSMONTIS_STATE_DIR=/app/data/state`，支持 `--build-arg INSTALL_VNC=0` 裁剪 Fluxbox/x11vnc/noVNC，并由 `.github/workflows/canary.yml` 每周拉取腾讯官方最新 Linux QQ `.deb` 执行端到端无头冒烟验证；CI 另使用并行 `node --test`（`test/bridge/*.test.js`）与 `tsc --noEmit -p jsconfig.json`（隔离临时环境安装，不向仓库引入任何依赖）守卫核心纯 JS 模块类型契约。
+
+### 3.3 `POST /get_status` 遥测示例
 
 调用 OneBot `POST /get_status` 可实时查看桥接器内部健康度遥测：
 
@@ -140,6 +160,12 @@ Rosmontis **不编译任何 C/C++ 代码、不注入任何 `.so`、不修改任�
         "fromResult": 0,
         "timedOut": 0
       },
+      "capabilities": {
+        "runtimeDetected": true,
+        "capabilities": { "send_msg": true, "recall_msg": true }
+      },
+      "renderer_health": { "crashes": 0, "recoveries": 0, "unresponsiveActive": false },
+      "rate_limit": { "enabled": false, "circuitState": "closed", "rejected": 0 },
       "map_hook_active": false,
       "map_hook_release": {
         "reason": "captured",

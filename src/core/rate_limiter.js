@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -84,7 +85,7 @@ class OutboundRateLimiter {
 
     /** @type {{ tokens: number, lastRefillAt: number } | null} */
     this._globalBucket = null;
-    /** @type {BoundedMap<string, { tokens: number, lastRefillAt: number }>} */
+    /** @type {Map<string, { tokens: number, lastRefillAt: number }> & { maxEntries: number }} */
     this._peerBuckets = new BoundedMap(this._config.maxPeers);
 
     /** @type {"closed" | "open" | "half_open"} */
@@ -283,8 +284,8 @@ class OutboundRateLimiter {
   /**
    * Live hot-reload of rate limiter settings while preserving cumulative stats.
    *
-   * @param {object} [nextCfg={}]
-   * @returns {object}
+   * @param {import("../types").RateLimitConfig & { now?: () => number }} [nextCfg={}]
+   * @returns {import("../types").RateLimitConfig}
    */
   updateConfig(nextCfg = {}) {
     const src = nextCfg && typeof nextCfg === "object" ? nextCfg : {};
@@ -314,6 +315,7 @@ class OutboundRateLimiter {
    * Returns snapshot of cumulative counters, circuit breaker state, and active peer count.
    *
    * @param {number} [now]
+   * @returns {import("../types").RateLimitStats}
    */
   getStats(now = undefined) {
     let circuitState = this._circuitState;

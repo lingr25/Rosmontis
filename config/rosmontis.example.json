@@ -11,6 +11,25 @@
   "compatProfile": "rosmontis",
   "enableWebCredentialApi": false,
   "allowedOrigins": [],
+  "logFormat": "text",
+  "enableMetrics": true,
+  "reloadOnSighup": true,
+  "webhookMaxConcurrency": 8,
+  "webhookMaxQueueSize": 256,
+  "webhookMaxRetries": 2,
+  "webhookRetryBaseMs": 250,
+  "rendererAutoReload": true,
+  "rendererMaxReloadsPerMinute": 3,
+  "rendererReloadBackoffMs": 1500,
+  "rateLimit": {
+    "enabled": false,
+    "globalPerSec": 10,
+    "globalBurst": 20,
+    "perPeerPerSec": 2,
+    "perPeerBurst": 5,
+    "circuitBreakerThreshold": 5,
+    "circuitBreakerCooldownMs": 30000
+  },
   "networks": {
     "httpServers": [
       {

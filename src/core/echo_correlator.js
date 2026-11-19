@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -283,6 +284,11 @@ class EchoCorrelator {
     return true;
   }
 
+  /**
+   * @param {any[]} elements
+   * @param {Record<string, any>} [config={}]
+   * @returns {number}
+   */
   computeTimeoutMs(elements, config = {}) {
     const cfg = config && typeof config === "object" ? config : {};
     const textTimeout = Math.max(0, Number(cfg.sendEchoTimeoutMs ?? 3000));

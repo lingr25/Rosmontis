@@ -27,10 +27,36 @@ jobs:
             if (pkg.dependencies && Object.keys(pkg.dependencies).length > 0) {
               throw new Error("Rosmontis must remain zero-dependency pure JS");
             }
+            if (pkg.devDependencies && Object.keys(pkg.devDependencies).length > 0) {
+              throw new Error("Rosmontis package.json must not declare devDependencies");
+            }
           '
       - name: Check shell scripts syntax
         run: |
           bash -n scripts/install_bridge.sh
           bash -n scripts/entrypoint.sh
+      - name: Validate workflow YAML & config JSON
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            JSON.parse(fs.readFileSync("config/rosmontis.example.json", "utf8"));
+            JSON.parse(fs.readFileSync("jsconfig.json", "utf8"));
+          '
+          if python3 -c "import yaml" 2>/dev/null; then
+            python3 -c 'import yaml, sys; [yaml.safe_load(open(f, encoding="utf-8")) for f in sys.argv[1:]]' \
+              .github/workflows/ci.yml .github/workflows/canary.yml
+          elif command -v ruby >/dev/null 2>&1; then
+            ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' \
+              .github/workflows/ci.yml .github/workflows/canary.yml
+          fi
+      - name: Typecheck JSDoc (@ts-check modules)
+        if: matrix.node-version == 22
+        run: |
+          set -euo pipefail
+          TSC_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TSC_DIR}"' EXIT
+          npm --prefix "${TSC_DIR}" install --no-save --no-audit --no-fund typescript @types/node
+          "${TSC_DIR}/node_modules/.bin/tsc" --noEmit -p jsconfig.json --typeRoots "${TSC_DIR}/node_modules/@types"
       - name: Run unit & protocol contract tests
         run: npm test

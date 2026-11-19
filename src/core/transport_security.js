@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const crypto = require("crypto");
@@ -116,6 +117,11 @@ function isLoopbackHost(host) {
   return LOOPBACK_HOSTS.has(normalized);
 }
 
+/**
+ * @param {Array<Record<string, any>>} serverEntries
+ * @param {Record<string, any>} [globalConfig={}]
+ * @param {((msg: string) => void) | null} [onWarn=null]
+ */
 function enforceProtectedModeOnServers(serverEntries, globalConfig = {}, onWarn = null) {
   const cfg = globalConfig && typeof globalConfig === "object" ? globalConfig : {};
   const allowUnauthenticatedPublic =
@@ -167,6 +173,7 @@ function enforceProtectedModeOnServers(serverEntries, globalConfig = {}, onWarn 
 }
 
 function _createBodyTooLargeError(limit) {
+  /** @type {Error & { statusCode?: number, code?: string }} */
   const err = new Error(`HTTP request body exceeds maximum limit (${limit} bytes)`);
   err.statusCode = 413;
   err.code = "ERR_HTTP_BODY_TOO_LARGE";

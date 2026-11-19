@@ -38,7 +38,8 @@
 | **副作用安全** | 超时重试易导致重复发消息 | **副作用命令防重放保护**（已派发请求绝不跨级重放） |
 | **收发图与撤回闭环** | 易遇 NTv2 图片 `400` 或野生路径 Crash | **无 `rkey` 入站图内核自动水合 + 出站 EXIF 规范化 + 真实回显 `msgId` 撤回** |
 | **重启免扫码恢复** | 常需人工重新扫码 | **自动持久化 `autoLogin` 并执行 A1 快速登录恢复** |
-| **运行时依赖** | 复杂 C++ 工具链与 Node 依赖树 | **零 npm 运行时依赖**（内置纯 JS RFC 6455 WebSocket 与 HTTP 服务） |
+| **运行时依赖** | 复杂 C++ 工具链与 Node 依赖树 | **零 npm 运行时依赖**（内置纯 JS RFC 6455 WebSocket `/api` `/event` `/`、HTTP `/ready` `/metrics`、Webhook 并发重试与热重载） |
+| **弹性与可观测性** | 崩溃假死无自愈、缺少频控与指标 | **渲染进程崩溃自愈、出站限流与熔断（`retcode: 1429`）、运行时 RPC 能力探测、Prometheus `/metrics` 与结构化 JSON 日志** |
 
 ---
 
@@ -48,11 +49,14 @@
   OneBot v11 Clients (NoneBot2 / Koishi / AstrBot / SnowLuma / Custom Agent)
       ▲                 ▲                 │                  │
       │ HTTP (:3000)    │ Forward WS      │ Reverse WS       │ HTTP POST Webhook
-      ▼                 ▼ (:3001)         ▼                  ▼ (HMAC-SHA1 + Quick-Op)
+      │ /health /ready  │ (:3001)         │                  │ (HMAC-SHA1 + Quick-Op
+      │ /metrics        │ /  /api  /event │                  │  + Bounded Queue/Retry)
+      ▼                 ▼                 ▼                  ▼
 +-------------------------------------------------------------------------+
 | Rosmontis Main Coordinator (src/bridge_main.js + src/core/* + actions/*)|
-|  - 75+ OneBot v11 Actions / Send Echo msgId Correlator / Media Hydrator |
-|  - Ephemeral DI Capture + Late-Load Runtime Probe + Store Persistence   |
+|  - 75+ OneBot v11 Actions / Capability Probe / Hot Config Reload        |
+|  - Rate Limiter & Circuit Breaker / Echo Correlator / Media Hydrator    |
+|  - Ephemeral DI Capture + Renderer Self-Healing + Store Persistence     |
 +-------------------------------------------------------------------------+
           │ Structured CMD/ACK IPC                     ▲
           ▼                                            │ Kernel Events
@@ -76,7 +80,7 @@
 
 ### 方式一：Docker Compose 全新独立部署（推荐）
 
-`docker/Dockerfile` 基于干净的 `ubuntu:24.04`，构建时直接从腾讯官方 CDN 拉取原版 Linux QQ `.deb` 包并装载 Rosmontis 纯 JS 桥接脚本，不依赖任何第三方修改版镜像：
+`docker/Dockerfile` 基于干净的 `ubuntu:24.04`，构建时直接从腾讯官方 CDN 拉取原版 Linux QQ `.deb` 包并装载 Rosmontis 纯 JS 桥接脚本，不依赖任何第三方修改版镜像（默认 `ROSMONTIS_STATE_DIR=/app/data/state` 跨重启持久化消息与 UIN/UID 索引，支持 `--build-arg INSTALL_VNC=0` 构建精简无 VNC 镜像；仓库同时配置了每周定时运行的官方 `.deb` 金丝雀冒烟工作流 `.github/workflows/canary.yml`）：
 
 ```bash
 git clone https://github.com/lingr25/Rosmontis.git
@@ -140,14 +144,18 @@ Rosmontis 支持**零配置开箱即用**、**环境变量配置**与 **JSON 配
 
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `ROSMONTIS_HTTP_PORT` / `ONEBOT_HTTP_PORT` | `3000` | OneBot v11 HTTP API 监听端口 |
-| `ROSMONTIS_WS_PORT` / `ONEBOT_WS_PORT` | `3001` | OneBot v11 正向 WebSocket 监听端口 |
+| `ROSMONTIS_HTTP_PORT` / `ONEBOT_HTTP_PORT` | `3000` | OneBot v11 HTTP API 监听端口（内置 `/health`、`/ready` 就绪探针与 Prometheus `/metrics` 指标端点） |
+| `ROSMONTIS_WS_PORT` / `ONEBOT_WS_PORT` | `3001` | OneBot v11 正向 WebSocket 监听端口（支持标准分离路径 `/`、`/api` 与 `/event`） |
 | `ROSMONTIS_REVERSE_WS_URL` / `ONEBOT_REVERSE_WS_URL` | *(空)* | 反向 WebSocket 目标地址（如 `ws://127.0.0.1:8080/onebot/v11/ws`） |
-| `ROSMONTIS_HTTP_POST_URL` / `ONEBOT_HTTP_POST_URL` | *(空)* | 标准 OneBot v11 HTTP POST 事件推送（Webhook）目标地址（支持 200 JSON 快速操作响应） |
+| `ROSMONTIS_HTTP_POST_URL` / `ONEBOT_HTTP_POST_URL` | *(空)* | 标准 OneBot v11 HTTP POST 事件推送（Webhook）目标地址（支持 200 JSON 快速操作、有界并发队列与指数退避重试） |
 | `ROSMONTIS_HTTP_SECRET` / `ONEBOT_HTTP_SECRET` | *(空)* | HTTP POST 事件推送的 HMAC-SHA1 签名密钥（自动计算请求头 `X-Signature: sha1=...`） |
 | `ROSMONTIS_ACCESS_TOKEN` / `ONEBOT_ACCESS_TOKEN` | *(非回环自动生成)* | Bearer 鉴权 Token（绑定非回环地址且留空时，Protected Mode 自动生成 256-bit 随机 Token 并输出至日志） |
 | `ROSMONTIS_HOST` / `ONEBOT_HOST` | `0.0.0.0` | HTTP / 正向 WS 绑定地址（宿主机单机部署推荐 `127.0.0.1`） |
-| `ROSMONTIS_STATE_DIR` / `ONEBOT_STATE_DIR` | *(空)* | 可选状态持久化目录（跨重启自动保存与恢复 `MessageIdStore` 消息映射及 `UinUidStore` 双向索引） |
+| `ROSMONTIS_STATE_DIR` / `ONEBOT_STATE_DIR` | *(Docker 默认 `/app/data/state`)* | 可选状态持久化目录（跨重启自动保存与恢复 `MessageIdStore` 消息映射及 `UinUidStore` 双向索引） |
+| `ROSMONTIS_LOG_FORMAT` / `ONEBOT_LOG_FORMAT` | `text` | 日志输出格式（设为 `json` 输出结构化 NDJSON 日志，便于 Loki/ELK 采集） |
+| `ROSMONTIS_ENABLE_METRICS` / `ROSMONTIS_RELOAD_ON_SIGHUP` | `1` / `1` | 启用 Prometheus `/metrics` 端点与 `SIGHUP` 信号免重启配置热重载 |
+| `ROSMONTIS_RATE_LIMIT_ENABLE` | `0` | 设为 `1` 开启全局 + 单会话令牌桶限流与连续触发熔断（超限时返回 `retcode: 1429`） |
+| `ROSMONTIS_RENDERER_AUTO_RELOAD` | `1` | Electron 渲染进程触发 `render-process-gone` / `unresponsive` 时的退避限频自动重载自愈开关 |
 | `ROSMONTIS_COMPAT_PROFILE` / `ONEBOT_COMPAT_PROFILE` | `rosmontis` | 下游兼容画像（可选 `snowluma` / `napcat`，亦可在各网络端点单独配置 `compatProfile`） |
 | `ROSMONTIS_ENABLE_WEB_CREDENTIAL_API` | `0` | 设为 `1` 时显式开启 `get_cookies` / `get_clientkey` / QZone 等高敏凭据接口（默认关闭） |
 | `ROSMONTIS_CONFIG_DIR` | `/app/data/config` | 配置文件搜索目录（详见 [`config/rosmontis.example.json`](./config/rosmontis.example.json)） |
@@ -170,7 +178,7 @@ Rosmontis 默认原生兼容 **NoneBot2**、**Koishi**、**AstrBot** 等标准 O
 
 ## 已实现的 OneBot v11 接口（75+ Actions）
 
-- **账号、登录与诊断**：`get_login_info`, `get_status`, `get_version_info`, `get_login_qrcode`, `quick_login`, `can_send_image`, `can_send_record`, `clean_cache`, `set_online_status`, `set_diy_online_status`, `set_qq_profile`, `set_self_longnick`
+- **账号、登录与运维诊断**：`get_login_info`, `get_status`, `get_capabilities`, `reload_config`, `get_version_info`, `get_login_qrcode`, `quick_login`, `can_send_image`, `can_send_record`, `clean_cache`, `set_online_status`, `set_diy_online_status`, `set_qq_profile`, `set_self_longnick`（HTTP 另提供 `/health` 存活、`/ready` 就绪与 Prometheus `/metrics` 指标端点；支持 `SIGHUP` 热重载配置）
 - **消息收发与富媒体**：`send_private_msg`, `send_group_msg`, `send_msg`, `delete_msg`, `get_msg`, `.handle_quick_operation`, `get_group_msg_history`, `get_friend_msg_history`, `get_forward_msg`, `send_group_forward_msg`, `send_private_forward_msg`, `forward_friend_single_msg`, `forward_group_single_msg`（完整支持文本、表情与动画 `resultId`、`@`、回复、图片 `base64://`/`file://`/`http(s)://`、语音、视频、文件、链接分享 `share`、JSON 卡片简写与合并转发）
 - **拟人交互与表态**：`mark_msg_as_read`, `mark_private_msg_as_read`, `mark_group_msg_as_read`, `set_input_status`, `send_poke`, `group_poke`, `friend_poke`, `set_msg_emoji_like`, `get_msg_emoji_likes`, `fetch_custom_face`
 - **好友与群组信息**：`get_friend_list`, `get_stranger_info`, `send_like`, `delete_friend`, `get_group_list`, `get_group_info`, `get_group_info_ex`, `get_group_share_link`, `get_group_member_info`, `get_group_member_list`, `get_group_honor_info`, `get_group_at_all_remain`, `get_group_shut_list`
@@ -182,7 +190,7 @@ Rosmontis 默认原生兼容 **NoneBot2**、**Koishi**、**AstrBot** 等标准 O
 
 ## 开发与测试
 
-本项目包含完整的协议契约、安全边界与模拟 Electron 渲染窗口/主进程的端到端测试套件（51 组测试，零外部依赖）：
+本项目包含基于 Node.js 原生 `node --test` 的并行领域测试套件（`test/bridge/*.test.js` 17 个分域文件 + `test/test_core_modules.js` + `test/test_media_security.js`，共 55 组契约、安全与端到端测试，零外部依赖），同时通过 `jsconfig.json` 与核心纯 JS 模块顶部的 `// @ts-check` 在 CI 中执行零运行时依赖的 JSDoc 静态类型检查：
 
 ```bash
 npm test

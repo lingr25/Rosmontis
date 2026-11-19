@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const crypto = require("crypto");
@@ -536,6 +537,7 @@ async function _encodeSilkViaExternalCli(inputPath, options = {}) {
     }
     if (!_startsWithBytes(silkBuf, TENCENT_SILK_MAGIC)) return null;
     if (silkBuf.length > maxMediaBytes) {
+      /** @type {Error & { code?: string }} */
       const err = new Error(
         `Encoded SILK voice (${silkBuf.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
       );
@@ -615,6 +617,7 @@ async function transcodeAudioToAmrNb(inputPath, options = {}) {
       throw new Error("ffmpeg produced an empty AMR output file");
     }
     if (outBuf.length > maxMediaBytes) {
+      /** @type {Error & { code?: string }} */
       const err = new Error(
         `Transcoded AMR voice (${outBuf.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
       );
@@ -653,6 +656,7 @@ async function transcodeAudioToAmrNb(inputPath, options = {}) {
       err && err.code === "ENOENT"
         ? `ffmpeg binary not found (${ffmpegBin})`
         : String(err?.stderr || err?.message || "unknown ffmpeg error");
+    /** @type {Error & { code?: string }} */
     const wrapped = new Error(
       `Failed to transcode ${detected} audio to NTQQ voice (AMR-NB): ${detail}. ` +
         `Install ffmpeg (with libavcodec-extra on Debian/Ubuntu) or supply SILK v3 / AMR-NB audio.`
@@ -684,6 +688,7 @@ async function prepareVoiceMedia(media, options = {}) {
   if (info.needsTencentPrefix) {
     const prefixed = Buffer.concat([Buffer.from([0x02]), buf]);
     if (prefixed.length > maxMediaBytes) {
+      /** @type {Error & { code?: string }} */
       const err = new Error(
         `Normalized SILK voice (${prefixed.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
       );

@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const crypto = require("crypto");
@@ -250,6 +251,9 @@ class CausalSessionScheduler {
   /**
    * Sleeps for `ms` milliseconds using an `.unref()`ed timer tracked in `_activeTimers`
    * so `dispose()` cancels and resolves pending sleeps immediately on shutdown.
+   *
+   * @param {number} ms
+   * @returns {Promise<void>}
    */
   sleepUnref(ms) {
     const delay = Number(ms);
@@ -257,7 +261,7 @@ class CausalSessionScheduler {
       return Promise.resolve();
     }
 
-    return new Promise((resolve) => {
+    return new Promise((/** @type {() => void} */ resolve) => {
       const sleepRecord = { timer: null, resolve };
       const timer = setTimeout(() => {
         this._activeTimers.delete(timer);
