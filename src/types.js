@@ -70,6 +70,8 @@
  * Resolved Rosmontis bridge runtime configuration.
  * @typedef {object} BridgeConfig
  * @property {string} [selfUin]
+ * @property {string} [selfNickname]
+ * @property {string} [tempDir]
  * @property {EndpointServerConfig[]} httpServers
  * @property {EndpointServerConfig[]} wsServers
  * @property {ReverseWsClientConfig[]} wsClients
@@ -105,6 +107,8 @@
  * @property {number} [maxForwardCustomNodes]
  * @property {number} [forwardStageDelayMs]
  * @property {number} [inboundMediaConcurrency]
+ * @property {number} [mediaHydrationTimeoutMs]
+ * @property {number} [richMediaDownloadTimeoutMs]
  * @property {number} [uploadFileUuidWaitMs]
  * @property {number} [httpPostTimeoutMs]
  * @property {boolean} [enableWebCredentialApi]
@@ -114,6 +118,7 @@
  * @property {number} [maxHttpBodyBytes]
  * @property {number} [maxWsPayloadBytes]
  * @property {number} [maxWsSendBufferBytes]
+ * @property {boolean} [allowUnmaskedClientFrames]
  * @property {number} [wsPingIntervalMs]
  * @property {number} [wsPongTimeoutMs]
  * @property {boolean} [allowPtloginJump]
@@ -384,6 +389,78 @@
  * @param {ActionContext} context
  * @param {string} action
  * @returns {Promise<any> | any}
+ */
+
+/**
+ * 3-tier NTQQ kernel invocation telemetry counters.
+ * @typedef {object} InvokeStats
+ * @property {number} tier1
+ * @property {number} tier2
+ * @property {number} tier3
+ * @property {number} directMain
+ * @property {number} degraded
+ * @property {number} blockedReplays
+ * @property {number} failed
+ * @property {{ cmd: string, tier: number, at: number } | null} lastDegraded
+ */
+
+/**
+ * Captured NTQQ kernel service registry populated by `NtCaptureController`.
+ * @typedef {object} CapturedServices
+ * @property {any} ntApi
+ * @property {any} ntApiContainer
+ * @property {any} ntStore
+ * @property {any} WindowApi
+ * @property {any} PerformanceApi
+ * @property {any} LoggerApi
+ * @property {any} UserBehaviorReportService
+ * @property {any} SubWindowApi
+ * @property {any} ScreenRecordApi
+ * @property {any} ntCall
+ * @property {any} ntSessionManager
+ * @property {any} wrapperSession
+ */
+
+/**
+ * Metadata recorded when `NtCaptureController` releases its `Map.prototype.set` capture hook.
+ * @typedef {object} MapHookReleaseRecord
+ * @property {string} reason
+ * @property {boolean} restored
+ * @property {number} at
+ */
+
+/**
+ * Recorded HTTP/WS server listener startup error entry.
+ * @typedef {object} ListenErrorEntry
+ * @property {string} kind
+ * @property {string} host
+ * @property {number} port
+ * @property {string} code
+ * @property {string} message
+ * @property {number} ts
+ */
+
+/**
+ * Constructor options accepted by `NtqqOneBotBridge` and `installMainBridge`.
+ * @typedef {object} BridgeOptions
+ * @property {string} [configDir]
+ * @property {BridgeConfig} [config]
+ * @property {any} [messageIdStore]
+ * @property {any} [uinUidStore]
+ * @property {string | number} [selfUin]
+ * @property {string} [selfUid]
+ * @property {string} [selfNickname]
+ * @property {number} [startedAtMs]
+ * @property {boolean} [online]
+ * @property {any} [ntApi]
+ * @property {any} [ntSessionManager]
+ * @property {any} [wrapperSession]
+ * @property {((cmd: string, args: any[]) => Promise<any>) | null} [rendererExecute]
+ * @property {((opts?: Record<string, any>) => Promise<any>) | null} [rendererSimulateSession]
+ * @property {((opts?: Record<string, any>) => Promise<any>) | null} [rendererLeaveSession]
+ * @property {any} [electron]
+ * @property {boolean} [forceNew]
+ * @property {boolean} [autoStartServers]
  */
 
 module.exports = {};

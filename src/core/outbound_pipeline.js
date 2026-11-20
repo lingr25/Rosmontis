@@ -1,4 +1,13 @@
+// @ts-check
 "use strict";
+
+/**
+ * Two-Phase Outbound Send, Media Staging, Rate-Limiting & Echo Correlation Pipeline (`src/core/outbound_pipeline.js`)
+ *
+ * Composed controller (`OutboundPipeline`) handling outbound rate limiting, unlocked
+ * rich-media staging (`image`/`record`/`video`), AIO-serialized session activation +
+ * `sendMsg` dispatch, forward-message echo correlation, and poke/nudge fallbacks.
+ */
 
 const fs = require("fs");
 const path = require("path");
@@ -17,7 +26,10 @@ const { OutboundRateLimiter } = require("./rate_limiter");
 
 const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
 
+/** @type {any} */
 let cachedRendererIpc = null;
+
+/** @returns {any} */
 function getRendererIpcHelpers() {
   if (cachedRendererIpc) return cachedRendererIpc;
   try {
@@ -30,13 +42,20 @@ function getRendererIpcHelpers() {
       cachedRendererIpc = mod;
       return cachedRendererIpc;
     }
-  } catch (_) {}
+  } catch (_loadErr) {
+    // Benign: fallback error helpers below are used if renderer_ipc is unavailable during early bootstrap.
+  }
   return null;
 }
 
+/**
+ * @param {string} [message]
+ * @returns {Error & { code?: string, rosmontisUnavailable?: boolean }}
+ */
 function makeBridgeUnavailableError(message) {
   const mod = getRendererIpcHelpers();
   if (mod) return mod.makeBridgeUnavailableError(message);
+  /** @type {Error & { code?: string, rosmontisUnavailable?: boolean }} */
   const err = new Error(message || "NTQQ bridge unavailable");
   err.code = BRIDGE_UNAVAILABLE_TAG;
   Object.defineProperty(err, BRIDGE_UNAVAILABLE_TAG, {
@@ -47,13 +66,76 @@ function makeBridgeUnavailableError(message) {
   return err;
 }
 
+/**
+ * @param {any} err
+ * @returns {boolean}
+ */
 function isBridgeUnavailableError(err) {
   const mod = getRendererIpcHelpers();
   if (mod) return mod.isBridgeUnavailableError(err);
   return Boolean(err && (err.code === BRIDGE_UNAVAILABLE_TAG || err[BRIDGE_UNAVAILABLE_TAG]));
 }
 
-const outboundPipelineMixin = {
+const LEGACY_OUTBOUND_CTRL_SYM = Symbol("rosmontisLegacyOutboundPipeline");
+const LEGACY_OUTBOUND_STATE_KEYS = Object.freeze([
+  "rateLimiter",
+  "_rateLimiterConfigRef",
+]);
+
+/**
+ * Composed outbound message staging, rate-limiting & send/echo pipeline.
+ */
+class OutboundPipeline {
+  /**
+   * @param {any} [bridge]
+   */
+  constructor(bridge = {}) {
+    /** @type {any} */
+    this.bridge = bridge || {};
+    /** @type {any} */
+    this.rateLimiter = Object.prototype.hasOwnProperty.call(this.bridge, "rateLimiter")
+      ? this.bridge.rateLimiter
+      : null;
+    /** @type {any} */
+    this._rateLimiterConfigRef = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_rateLimiterConfigRef"
+    )
+      ? this.bridge._rateLimiterConfigRef
+      : undefined;
+  }
+
+  /** @returns {any} */
+  get config() {
+    return this.bridge.config;
+  }
+
+  /** @returns {any} */
+  get logger() {
+    return this.bridge.logger;
+  }
+
+  /** @returns {any} */
+  get messageIdStore() {
+    return this.bridge.messageIdStore;
+  }
+
+  /** @returns {any} */
+  get uinUidStore() {
+    return this.bridge.uinUidStore;
+  }
+
+  /** @returns {string} */
+  get selfUin() {
+    return this.bridge.selfUin;
+  }
+
+  /** @returns {string} */
+  get selfUid() {
+    return this.bridge.selfUid;
+  }
+
+  /** @returns {any} */
   _ensureRateLimiter() {
     const cfgRef = this.config?.rateLimit;
     if (!this.rateLimiter) {
@@ -66,8 +148,12 @@ const outboundPipelineMixin = {
       }
     }
     return this.rateLimiter;
-  },
+  }
 
+  /**
+   * @param {string} peerKey
+   * @returns {any}
+   */
   _enforceOutboundRateLimit(peerKey) {
     const limiter = this._ensureRateLimiter();
     if (!limiter || typeof limiter.consume !== "function") return null;
@@ -77,6 +163,7 @@ const outboundPipelineMixin = {
         ? Math.max(0, Math.ceil(Number(res.retryAfterMs)))
         : 0;
       const reason = res.reason || "rate_limited";
+      /** @type {Error & { retcode?: number, code?: string, retryAfterMs?: number, rateLimitReason?: string, circuitState?: string }} */
       const err = new Error(`Rate limit exceeded (${reason}); retry after ${retryAfterMs}ms`);
       err.retcode = 1429;
       err.code = "ERR_RATE_LIMITED";
@@ -86,33 +173,40 @@ const outboundPipelineMixin = {
       throw err;
     }
     return res;
-  },
+  }
 
+  /** @returns {InstanceType<typeof EchoCorrelator>} */
   _ensureEchoCorrelator() {
-    if (!this.echoCorrelator) {
-      this.echoCorrelator = new EchoCorrelator({
+    const b = this.bridge;
+    if (!b.echoCorrelator) {
+      b.echoCorrelator = new EchoCorrelator({
         getSignatureFns: () => ({
-          _ntElementsSignature: this?.constructor?._ntElementsSignature,
-          _elementsSignatureMatch: this?.constructor?._elementsSignatureMatch,
+          _ntElementsSignature: b?.constructor?._ntElementsSignature,
+          _elementsSignatureMatch: b?.constructor?._elementsSignatureMatch,
         }),
       });
-      if (this._sendEchoWaiters instanceof Map) {
-        this.echoCorrelator.waiters = this._sendEchoWaiters;
+      if (b._sendEchoWaiters instanceof Map) {
+        b.echoCorrelator.waiters = b._sendEchoWaiters;
       } else {
-        this._sendEchoWaiters = this.echoCorrelator.waiters;
+        b._sendEchoWaiters = b.echoCorrelator.waiters;
       }
-      if (this.sendEchoStats && typeof this.sendEchoStats === "object") {
-        this.echoCorrelator.stats = this.sendEchoStats;
+      if (b.sendEchoStats && typeof b.sendEchoStats === "object") {
+        b.echoCorrelator.stats = b.sendEchoStats;
       } else {
-        this.sendEchoStats = this.echoCorrelator.stats;
+        b.sendEchoStats = b.echoCorrelator.stats;
       }
     }
-    return this.echoCorrelator;
-  },
+    return b.echoCorrelator;
+  }
 
+  /**
+   * @param {any} userId
+   * @param {any} [groupId]
+   * @returns {Promise<{ chatType: number, peerUid: string, guildId: string }>}
+   */
   async _resolvePeerForUser(userId, groupId) {
     const uinStr = String(userId || "").trim();
-    const uid = await this.uinUidStore.resolveUid(uinStr, this.invokeNt.bind(this));
+    const uid = await this.uinUidStore.resolveUid(uinStr, this.bridge.invokeNt.bind(this.bridge));
     if (groupId && Number(groupId) > 0) {
       return {
         chatType: 100,
@@ -125,12 +219,17 @@ const outboundPipelineMixin = {
       peerUid: uid || uinStr,
       guildId: "",
     };
-  },
+  }
 
+  /**
+   * @param {any} media
+   * @param {number} [subType=0]
+   * @returns {Promise<any>}
+   */
   async _prepareNtImagePath(media, subType = 0) {
     const elemSubType = Number(subType || 0);
     try {
-      const exifRes = await this.invokeNt(
+      const exifRes = await this.bridge.invokeNt(
         "nodeIKernelMsgService/copyFileWithDelExifInfo",
         {
           sourcePath: media.localPath,
@@ -145,7 +244,9 @@ const outboundPipelineMixin = {
           if (fs.existsSync(newPath)) {
             fileSize = fs.statSync(newPath).size || media.fileSize;
           }
-        } catch (_) {}
+        } catch (statErr) {
+          this.logger?.debug?.("outbound", statErr);
+        }
         return {
           localPath: newPath,
           md5HexStr: String(exifRes.md5 || media.md5HexStr),
@@ -153,7 +254,9 @@ const outboundPipelineMixin = {
           fileName: path.basename(newPath) || media.fileName,
         };
       }
-    } catch (_) {}
+    } catch (exifErr) {
+      this.logger?.debug?.("outbound", exifErr);
+    }
 
     try {
       const pathInfo = {
@@ -166,7 +269,7 @@ const outboundPipelineMixin = {
         downloadType: 1,
         file_uuid: "",
       };
-      const pathRes = await this.invokeNt(
+      const pathRes = await this.bridge.invokeNt(
         "nodeIKernelMsgService/getRichMediaFilePathForGuild",
         { path_info: pathInfo },
         [pathInfo]
@@ -177,8 +280,9 @@ const outboundPipelineMixin = {
           fs.mkdirSync(path.dirname(targetPath), { recursive: true });
           fs.copyFileSync(media.localPath, targetPath);
           return targetPath;
-        } catch (_) {
-          await this.invokeNt(
+        } catch (copyErr) {
+          this.logger?.debug?.("outbound", copyErr);
+          await this.bridge.invokeNt(
             "nodeIKernelFileAssistantService/copyFile",
             { fromPath: media.localPath, toPath: targetPath },
             [media.localPath, targetPath]
@@ -186,10 +290,16 @@ const outboundPipelineMixin = {
           return targetPath;
         }
       }
-    } catch (_) {}
+    } catch (stageErr) {
+      this.logger?.debug?.("outbound", stageErr);
+    }
     return media.localPath;
-  },
+  }
 
+  /**
+   * @param {any} media
+   * @returns {Promise<{ localPath: string, fileName: string, md5HexStr: string, fileSize: number }>}
+   */
   async _prepareNtRecordPath(media) {
     const fileName = media.fileName || `${media.md5HexStr}.amr`;
     try {
@@ -203,7 +313,7 @@ const outboundPipelineMixin = {
         downloadType: 1,
         file_uuid: "",
       };
-      const pathRes = await this.invokeNt(
+      const pathRes = await this.bridge.invokeNt(
         "nodeIKernelMsgService/getRichMediaFilePathForGuild",
         { path_info: pathInfo },
         [pathInfo]
@@ -219,8 +329,9 @@ const outboundPipelineMixin = {
             md5HexStr: media.md5HexStr,
             fileSize: media.fileSize,
           };
-        } catch (_) {
-          await this.invokeNt(
+        } catch (copyErr) {
+          this.logger?.debug?.("outbound", copyErr);
+          await this.bridge.invokeNt(
             "nodeIKernelFileAssistantService/copyFile",
             { fromPath: media.localPath, toPath: targetPath },
             [media.localPath, targetPath]
@@ -233,15 +344,30 @@ const outboundPipelineMixin = {
           };
         }
       }
-    } catch (_) {}
+    } catch (stageErr) {
+      this.logger?.debug?.("outbound", stageErr);
+    }
     return {
       localPath: media.localPath,
       fileName,
       md5HexStr: media.md5HexStr,
       fileSize: media.fileSize,
     };
-  },
+  }
 
+  /**
+   * @param {any} media
+   * @param {any} thumbInfo
+   * @returns {Promise<{
+   *   videoPath: string,
+   *   fileName: string,
+   *   videoMd5: string,
+   *   fileSize: number,
+   *   thumbPath: string,
+   *   thumbMd5: string,
+   *   thumbSize: number
+   * }>}
+   */
   async _prepareNtVideoPath(media, thumbInfo) {
     const videoFileName = media.fileName || `${media.md5HexStr}.mp4`;
     const result = {
@@ -264,7 +390,7 @@ const outboundPipelineMixin = {
         downloadType: 1,
         file_uuid: "",
       };
-      const videoPathRes = await this.invokeNt(
+      const videoPathRes = await this.bridge.invokeNt(
         "nodeIKernelMsgService/getRichMediaFilePathForGuild",
         { path_info: videoPathInfo },
         [videoPathInfo]
@@ -277,8 +403,9 @@ const outboundPipelineMixin = {
           await fs.promises.copyFile(media.localPath, targetVideoPath);
           result.videoPath = targetVideoPath;
           result.fileName = path.basename(targetVideoPath) || videoFileName;
-        } catch (_) {
-          await this.invokeNt(
+        } catch (copyErr) {
+          this.logger?.debug?.("outbound", copyErr);
+          await this.bridge.invokeNt(
             "nodeIKernelFileAssistantService/copyFile",
             { fromPath: media.localPath, toPath: targetVideoPath },
             [media.localPath, targetVideoPath]
@@ -287,7 +414,9 @@ const outboundPipelineMixin = {
           result.fileName = path.basename(targetVideoPath) || videoFileName;
         }
       }
-    } catch (_) {}
+    } catch (videoErr) {
+      this.logger?.debug?.("outbound", videoErr);
+    }
 
     if (thumbInfo?.localPath && thumbInfo?.md5HexStr) {
       const thumbExt = path.extname(thumbInfo.localPath) || ".jpg";
@@ -303,7 +432,7 @@ const outboundPipelineMixin = {
           downloadType: 1,
           file_uuid: "",
         };
-        const thumbPathRes = await this.invokeNt(
+        const thumbPathRes = await this.bridge.invokeNt(
           "nodeIKernelMsgService/getRichMediaFilePathForGuild",
           { path_info: thumbPathInfo },
           [thumbPathInfo]
@@ -315,8 +444,9 @@ const outboundPipelineMixin = {
             await fs.promises.mkdir(path.dirname(targetThumbPath), { recursive: true });
             await fs.promises.copyFile(thumbInfo.localPath, targetThumbPath);
             result.thumbPath = targetThumbPath;
-          } catch (_) {
-            await this.invokeNt(
+          } catch (copyErr) {
+            this.logger?.debug?.("outbound", copyErr);
+            await this.bridge.invokeNt(
               "nodeIKernelFileAssistantService/copyFile",
               { fromPath: thumbInfo.localPath, toPath: targetThumbPath },
               [thumbInfo.localPath, targetThumbPath]
@@ -324,49 +454,68 @@ const outboundPipelineMixin = {
             result.thumbPath = targetThumbPath;
           }
         }
-      } catch (_) {}
+      } catch (thumbErr) {
+        this.logger?.debug?.("outbound", thumbErr);
+      }
     }
     return result;
-  },
+  }
 
+  /** @param {any} peer */
   _sendPeerKey(peer) {
     return this._ensureEchoCorrelator().peerKey(peer);
-  },
+  }
 
+  /**
+   * @param {any} peer
+   * @param {any} elements
+   * @param {((ntMsg: any) => boolean) | null} [elementPredicate=null]
+   */
   _registerSendEchoWaiter(peer, elements, elementPredicate = null) {
     return this._ensureEchoCorrelator().register(peer, elements, elementPredicate);
-  },
+  }
 
+  /** @param {any} ntMsg */
   _matchSendEcho(ntMsg) {
     return this._ensureEchoCorrelator().match(ntMsg);
-  },
+  }
 
+  /** @param {any[]} elements */
   _hasRichMediaElements(elements) {
     return hasRichMediaElements(elements);
-  },
+  }
 
+  /** @param {any[]} elements */
   _computeSendEchoTimeoutMs(elements) {
     return this._ensureEchoCorrelator().computeTimeoutMs(elements, this.config);
-  },
+  }
 
   _mediaSecurityOptions() {
+    const cfg = this.config || {};
     return {
-      ...(this.config.tempDir ? { tempDir: this.config.tempDir } : {}),
-      maxMediaBytes: this.config.maxMediaBytes,
+      ...(cfg.tempDir ? { tempDir: cfg.tempDir } : {}),
+      maxMediaBytes: cfg.maxMediaBytes,
       allowPrivateUrls:
-        this.config.allowPrivateUrls === true || this.config.allowPrivateMediaUrls === true
+        cfg.allowPrivateUrls === true || cfg.allowPrivateMediaUrls === true
           ? true
           : undefined,
-      allowArbitraryLocalFiles:
-        this.config.allowArbitraryLocalFiles === true ? true : undefined,
-      allowedFileDirs: this.config.allowedFileDirs,
+      allowArbitraryLocalFiles: cfg.allowArbitraryLocalFiles === true ? true : undefined,
+      allowedFileDirs: cfg.allowedFileDirs,
     };
-  },
+  }
 
+  /**
+   * @param {any} peer
+   * @param {any} message
+   * @param {boolean} [autoEscape=false]
+   * @param {any} [groupId=undefined]
+   * @param {Record<string, any>} [options={}]
+   * @returns {Promise<{ message_id: number, real_id?: string }>}
+   */
   async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
     this._enforceOutboundRateLimit(peerKey);
-    this._sessionScheduler.cancelPeerReaction(peerKey);
+    this.bridge._sessionScheduler?.cancelPeerReaction?.(peerKey);
 
     // Phase 1 (unlocked): concurrent heavy I/O (HTTP media download, EXIF normalize, @UIN->UID)
     const { elements, sideEffects, cleanupCallbacks } = await oneBotSegmentsToNtElements(message, {
@@ -374,22 +523,22 @@ const outboundPipelineMixin = {
       groupId,
       uinUidStore: this.uinUidStore,
       messageIdStore: this.messageIdStore,
-      invokeNt: this.invokeNt.bind(this),
+      invokeNt: this.bridge.invokeNt.bind(this.bridge),
       prepareNtImagePath: this._prepareNtImagePath.bind(this),
       prepareNtRecordPath: this._prepareNtRecordPath.bind(this),
       prepareNtVideoPath: this._prepareNtVideoPath.bind(this),
-      ffmpegPath: this.config.ffmpegPath,
-      silkEncoderPath: this.config.silkEncoderPath,
+      ffmpegPath: this.config?.ffmpegPath,
+      silkEncoderPath: this.config?.silkEncoderPath,
       ...this._mediaSecurityOptions(),
     });
 
     try {
       // Phase 2 (AIO-mutex serialized): activate target AIO + dispatch sendMsg IPC, then release immediately
-      const { echoWaiter, sendRes } = await this._withAioLock(
+      const { echoWaiter, sendRes } = await this.bridge._withAioLock(
         async () => {
-          this._sessionScheduler.cancelPeerReaction(peerKey);
-          if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
-            await this._activateSessionUnlocked({
+          this.bridge._sessionScheduler?.cancelPeerReaction?.(peerKey);
+          if (this.config?.humanSimulation !== false && !options.skipHumanSimulation) {
+            await this.bridge._activateSessionUnlocked({
               chatType: peer.chatType,
               peerUid: peer.peerUid,
               guildId: peer.guildId || "",
@@ -402,7 +551,8 @@ const outboundPipelineMixin = {
             if (effect.type === "poke") {
               await this._sendPokeInternal(
                 peer.chatType === 2 ? Number(peer.peerUid) : undefined,
-                effect.qq || (peer.chatType === 1 ? Number(this.uinUidStore.getUinSync(peer.peerUid)) : 0)
+                effect.qq ||
+                  (peer.chatType === 1 ? Number(this.uinUidStore.getUinSync(peer.peerUid)) : 0)
               );
             }
           }
@@ -413,7 +563,7 @@ const outboundPipelineMixin = {
 
           const waiter = this._registerSendEchoWaiter(peer, elements);
           try {
-            const res = await this.invokeNt(
+            const res = await this.bridge.invokeNt(
               "nodeIKernelMsgService/sendMsg",
               {
                 msgId: "0",
@@ -423,8 +573,8 @@ const outboundPipelineMixin = {
               },
               ["0", peer, elements, new Map()]
             );
-            if (this.config.humanSimulation !== false && !options.skipHumanSimulation) {
-              this._touchAioActivity();
+            if (this.config?.humanSimulation !== false && !options.skipHumanSimulation) {
+              this.bridge._touchAioActivity?.();
             }
             return { echoWaiter: waiter, sendRes: res };
           } catch (err) {
@@ -445,12 +595,13 @@ const outboundPipelineMixin = {
       }
 
       // Phase 3 (unlocked): await onAddSendMsg echo correlation without holding _aioMutex
-      const normId = (v) => (v !== undefined && v !== null && String(v) !== "0" ? String(v) : "");
+      const normId = (/** @type {any} */ v) =>
+        v !== undefined && v !== null && String(v) !== "0" ? String(v) : "";
       let realMsgId = normId(sendRes?.msgId || sendRes?.msgRecord?.msgId);
       let msgSeq = String(sendRes?.msgSeq || sendRes?.msgRecord?.msgSeq || "0");
       let msgTime = Math.floor(Date.now() / 1000);
       let echoRawMsg = sendRes?.msgRecord || null;
-      const echoStats = this.sendEchoStats || this._ensureEchoCorrelator().stats;
+      const echoStats = this.bridge.sendEchoStats || this._ensureEchoCorrelator().stats;
       if (realMsgId) {
         echoWaiter.cancel();
         echoStats.fromResult += 1;
@@ -460,7 +611,7 @@ const outboundPipelineMixin = {
         if (echo && echo.msgId) {
           realMsgId = echo.msgId;
           if (msgSeq === "0" && echo.msgSeq) msgSeq = echo.msgSeq;
-          if (Number.isFinite(echo.msgTime) && echo.msgTime > 0) msgTime = echo.msgTime;
+          if (Number.isFinite(echo.msgTime) && Number(echo.msgTime) > 0) msgTime = Number(echo.msgTime);
           if (echo.rawMsg) echoRawMsg = echo.rawMsg;
           echoStats.matched += 1;
         } else {
@@ -468,8 +619,8 @@ const outboundPipelineMixin = {
           const peerKeyStr = this._sendPeerKey(peer);
           const warnKey = `send-echo-timeout:${peerKeyStr}`;
           const warnMsg = `sendMsg to ${peerKeyStr} succeeded but no onAddSendMsg echo arrived within ${echoTimeoutMs}ms; message_id will not be recallable`;
-          if (typeof this._logWarn === "function") {
-            this._logWarn(warnKey, warnMsg);
+          if (typeof this.bridge._logWarn === "function") {
+            this.bridge._logWarn(warnKey, warnMsg);
           } else {
             this.logger?.warnThrottled?.(warnKey, warnMsg, 60000);
           }
@@ -492,10 +643,16 @@ const outboundPipelineMixin = {
 
       return { message_id: shortId, real_id: realMsgId };
     } finally {
-      this._scheduleTempCleanup(cleanupCallbacks, Boolean(options.cleanupTempImmediately));
+      this.bridge._scheduleTempCleanup?.(cleanupCallbacks, Boolean(options.cleanupTempImmediately));
     }
-  },
+  }
 
+  /**
+   * @param {any} peer
+   * @param {() => Promise<any>} invokeFn
+   * @param {string} [fallbackSeed=""]
+   * @returns {Promise<{ message_id: number, real_id: string, msgId: string }>}
+   */
   async _invokeForwardWithEcho(peer, invokeFn, fallbackSeed = "") {
     const peerKey = `${peer?.chatType || 0}:${peer?.peerUid || ""}:${peer?.guildId || ""}`;
     this._enforceOutboundRateLimit(peerKey);
@@ -522,7 +679,8 @@ const outboundPipelineMixin = {
       throw new Error(res.errMsg || `forward failed with code ${res.result}`);
     }
 
-    const normId = (v) => (v !== undefined && v !== null && String(v) !== "0" ? String(v) : "");
+    const normId = (/** @type {any} */ v) =>
+      v !== undefined && v !== null && String(v) !== "0" ? String(v) : "";
     const directMsgId = normId(res?.msgId || res?.result?.msgId || res?.msgRecord?.msgId);
     const directSeq = String(res?.msgSeq || res?.result?.msgSeq || res?.msgRecord?.msgSeq || "0");
     if (directMsgId) {
@@ -547,7 +705,9 @@ const outboundPipelineMixin = {
         senderUin: this.selfUin,
         senderUid: this.selfUid,
         groupId: peer.chatType === 2 ? peer.peerUid : "",
-        ...(Number.isFinite(echo.msgTime) && echo.msgTime > 0 ? { msgTime: echo.msgTime } : {}),
+        ...(Number.isFinite(echo.msgTime) && Number(echo.msgTime) > 0
+          ? { msgTime: Number(echo.msgTime) }
+          : {}),
         rawMsg,
       });
       if (rawMsg && typeof this.messageIdStore.indexMsgMedia === "function") {
@@ -564,20 +724,24 @@ const outboundPipelineMixin = {
       groupId: peer.chatType === 2 ? peer.peerUid : "",
     });
     return { message_id: oneBotId, real_id: String(syntheticId), msgId: String(syntheticId) };
-  },
+  }
 
+  /**
+   * @param {any} groupId
+   * @param {any} userId
+   */
   async _sendPokeInternal(groupId, userId) {
     const rawUserStr = String(userId ?? "").trim();
     let targetUin = /^\d+$/.test(rawUserStr) ? Number(rawUserStr) : 0;
     if (!targetUin && rawUserStr && this.uinUidStore) {
       targetUin = Number(this.uinUidStore.getUinSync(rawUserStr) || 0);
-      if (!targetUin && typeof this._ensureUinForUid === "function") {
-        targetUin = Number((await this._ensureUinForUid(rawUserStr)) || 0);
+      if (!targetUin && typeof this.bridge._ensureUinForUid === "function") {
+        targetUin = Number((await this.bridge._ensureUinForUid(rawUserStr)) || 0);
       }
     }
     const targetGroup = groupId ? Number(groupId) : 0;
     const targetUid = targetUin
-      ? await this.uinUidStore.resolveUid(targetUin, this.invokeNt.bind(this))
+      ? await this.uinUidStore.resolveUid(targetUin, this.bridge.invokeNt.bind(this.bridge))
       : rawUserStr.startsWith("u_")
       ? rawUserStr
       : "";
@@ -591,7 +755,7 @@ const outboundPipelineMixin = {
 
     // 1. Primary: genuine NTQQ 3.2.32 `nodeIKernelMsgService/sendNudge(peer, toUin, chatUin)` (3 args)
     try {
-      await this.invokeNt(
+      await this.bridge.invokeNt(
         "nodeIKernelMsgService/sendNudge",
         {
           peer,
@@ -609,7 +773,7 @@ const outboundPipelineMixin = {
     // 2. Fallback: legacy `sendPoke` if bridged by a custom adapter
     try {
       if (targetGroup > 0) {
-        await this.invokeNt("nodeIKernelMsgService/sendPoke", {
+        await this.bridge.invokeNt("nodeIKernelMsgService/sendPoke", {
           groupCode: String(targetGroup),
           toUin: String(targetUin),
           peer,
@@ -617,7 +781,7 @@ const outboundPipelineMixin = {
         });
         return;
       }
-      await this.invokeNt("nodeIKernelMsgService/sendPoke", {
+      await this.bridge.invokeNt("nodeIKernelMsgService/sendPoke", {
         toUin: String(targetUin),
         peer,
         targetUid: targetUid || String(targetUin),
@@ -645,7 +809,7 @@ const outboundPipelineMixin = {
           },
         },
       ];
-      await this.invokeNt(
+      await this.bridge.invokeNt(
         "nodeIKernelMsgService/sendMsg",
         {
           msgId: "0",
@@ -658,10 +822,79 @@ const outboundPipelineMixin = {
       return;
     }
     throw makeBridgeUnavailableError("NTQQ service unavailable for sendNudge/sendPoke");
-  },
-};
+  }
+}
+
+/**
+ * Resolves or lazily binds an `OutboundPipeline` for legacy `outboundPipelineMixin` hosts.
+ * @param {any} host
+ * @returns {OutboundPipeline}
+ */
+function _resolveLegacyOutboundPipeline(host) {
+  if (host instanceof OutboundPipeline) return host;
+  if (host && host.outboundPipeline instanceof OutboundPipeline) return host.outboundPipeline;
+  if (host && host[LEGACY_OUTBOUND_CTRL_SYM] instanceof OutboundPipeline) {
+    return host[LEGACY_OUTBOUND_CTRL_SYM];
+  }
+  const ctrl = new OutboundPipeline(host);
+  if (host && typeof host === "object") {
+    Object.defineProperty(host, LEGACY_OUTBOUND_CTRL_SYM, {
+      value: ctrl,
+      enumerable: false,
+      configurable: true,
+    });
+    for (const key of LEGACY_OUTBOUND_STATE_KEYS) {
+      const desc = Object.getOwnPropertyDescriptor(host, key);
+      if (!desc || ("value" in desc && desc.configurable !== false)) {
+        Object.defineProperty(host, key, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            return /** @type {any} */ (ctrl)[key];
+          },
+          set(val) {
+            /** @type {any} */ (ctrl)[key] = val;
+          },
+        });
+      }
+    }
+  }
+  return ctrl;
+}
+
+const OUTBOUND_PIPELINE_METHODS = /** @type {const} */ ([
+  "_ensureRateLimiter",
+  "_enforceOutboundRateLimit",
+  "_ensureEchoCorrelator",
+  "_resolvePeerForUser",
+  "_prepareNtImagePath",
+  "_prepareNtRecordPath",
+  "_prepareNtVideoPath",
+  "_sendPeerKey",
+  "_registerSendEchoWaiter",
+  "_matchSendEcho",
+  "_hasRichMediaElements",
+  "_computeSendEchoTimeoutMs",
+  "_mediaSecurityOptions",
+  "_sendMessageToPeer",
+  "_invokeForwardWithEcho",
+  "_sendPokeInternal",
+]);
+
+/**
+ * Backward-compatible mixin facade delegating to `OutboundPipeline`.
+ * @type {Record<string, (...args: any[]) => any>}
+ */
+const outboundPipelineMixin = {};
+for (const methodName of OUTBOUND_PIPELINE_METHODS) {
+  outboundPipelineMixin[methodName] = function (/** @type {any[]} */ ...args) {
+    const ctrl = _resolveLegacyOutboundPipeline(this);
+    return /** @type {any} */ (ctrl)[methodName](...args);
+  };
+}
 
 module.exports = {
+  OutboundPipeline,
   outboundPipelineMixin,
   _ntElementsSignature,
   _elementsSignatureMatch,

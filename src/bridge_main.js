@@ -1,14 +1,15 @@
+// @ts-check
 "use strict";
 
 /**
  * NTQQ Main-Process & Renderer-Coordinated OneBot v11 Bridge (`bridge_main.js`)
  *
  * Pure JavaScript coordinator (zero C++ hooks, zero npm dependencies) composing
- * `src/core/*` runtime subsystems, `src/bridge_onebot.js` (`src/onebot/*`) codecs,
- * and `src/actions/*` declarative OneBot v11 action routers.
+ * `src/core/*` runtime subsystems (`NtCaptureController`, `RendererIpcController`,
+ * `InboundPipeline`, `OutboundPipeline`, `ServerRuntime`), `src/bridge_onebot.js`
+ * (`src/onebot/*`) codecs, and `src/actions/*` declarative OneBot v11 action routers.
  */
 
-const crypto = require("crypto");
 const path = require("path");
 const { EventEmitter } = require("events");
 
@@ -18,7 +19,7 @@ const {
 } = require("./bridge_onebot");
 const { isAutoInstallDisabledFromEnv } = require("./core/env");
 const {
-  BoundedMap, BridgeLogger, TtlDedupeSet, TempCleanupQueue, setBoundedMap, safeJsJson,
+  BridgeLogger, TtlDedupeSet, TempCleanupQueue, setBoundedMap, safeJsJson,
 } = require("./core/primitives");
 const {
   EchoCorrelator, _ntElementsSignature, _elementsSignatureMatch,
@@ -35,22 +36,29 @@ const {
   assertWebCredentialApiEnabled, fetchClientKey, getCookiesObject,
 } = require("./core/qzone_actions");
 
-const { ntCaptureMixin } = require("./core/nt_capture");
-const { rendererIpcMixin } = require("./core/renderer_ipc");
-const { inboundPipelineMixin } = require("./core/inbound_pipeline");
-const { outboundPipelineMixin } = require("./core/outbound_pipeline");
-const { serverRuntimeMixin } = require("./core/server_runtime");
+const { NtCaptureController } = require("./core/nt_capture");
+const { RendererIpcController } = require("./core/renderer_ipc");
+const { InboundPipeline } = require("./core/inbound_pipeline");
+const { OutboundPipeline } = require("./core/outbound_pipeline");
+const { ServerRuntime } = require("./core/server_runtime");
 
 const messageActions = require("./actions/message_actions");
 const contactActions = require("./actions/contact_actions");
 const groupActions = require("./actions/group_actions");
 const fileMediaActions = require("./actions/file_media_actions");
 
+/** @typedef {import("./types").BridgeOptions} BridgeOptions */
+/** @typedef {import("./types").BridgeConfig} BridgeConfig */
+/** @typedef {import("./types").CapturedServices} CapturedServices */
+/** @typedef {import("./types").ActionContext} ActionContext */
+/** @typedef {import("./types").OneBotActionResponse} OneBotActionResponse */
+
 const WEB_HTTP_HELPERS = Object.freeze({
   computeBkn, cookieObjToString, httpsGetCookies, httpRequestText, parseJsonpOrJson,
 });
 
 const ACTION_MODULES = [messageActions, contactActions, groupActions, fileMediaActions];
+/** @type {Map<string, (action: string, p: Record<string, any>, context?: any) => Promise<any>>} */
 const ACTION_DISPATCH_MAP = new Map();
 for (const mod of ACTION_MODULES) {
   for (const act of mod.HANDLED_ACTIONS) {
@@ -66,9 +74,13 @@ for (const mod of ACTION_MODULES) {
 // ============================================================================
 
 class NtqqOneBotBridge extends EventEmitter {
+  /**
+   * @param {BridgeOptions} [options={}]
+   */
   constructor(options = {}) {
     super();
     this._configDir = options.configDir;
+    /** @type {BridgeConfig} */
     this.config = options.config || loadBridgeConfig(options.configDir);
     this.messageIdStore = options.messageIdStore || new MessageIdStore(10000);
     this.uinUidStore = options.uinUidStore || new UinUidStore(20000);
@@ -77,14 +89,17 @@ class NtqqOneBotBridge extends EventEmitter {
     this.eventDedupe = new TtlDedupeSet(5000, 30000);
     this.tempCleanupQueue = new TempCleanupQueue(() => this.config);
     this.echoCorrelator = new EchoCorrelator({
-      getSignatureFns: () => ({
-        _ntElementsSignature: this.constructor._ntElementsSignature,
-        _elementsSignatureMatch: this.constructor._elementsSignatureMatch,
-      }),
+      getSignatureFns: () => {
+        const ctor = /** @type {typeof NtqqOneBotBridge} */ (this.constructor);
+        return {
+          _ntElementsSignature: ctor._ntElementsSignature,
+          _elementsSignatureMatch: ctor._elementsSignatureMatch,
+        };
+      },
     });
     this.sessionController = new HumanSessionController({
       getConfig: () => this.config,
-      invokeNt: (...args) => this.invokeNt(...args),
+      invokeNt: (cmd, payload, positionalArgs) => this.invokeNt(cmd, payload, positionalArgs),
       canInvokeRenderer: () => this._canInvokeRendererBridge(),
       invokeRendererCommand: (action, payload, timeoutMs) =>
         this._invokeRendererBridgeCommand(action, payload, timeoutMs),
@@ -110,6 +125,7 @@ class NtqqOneBotBridge extends EventEmitter {
     this.online = options.online !== undefined ? Boolean(options.online) : !isLiveElectron;
     this.lastQrCodeBase64 = "";
 
+    /** @type {CapturedServices} */
     this.capturedServices = {
       ntApi: options.ntApi || null, ntApiContainer: null, ntStore: null,
       WindowApi: null, PerformanceApi: null, LoggerApi: null,
@@ -121,47 +137,18 @@ class NtqqOneBotBridge extends EventEmitter {
     this.rendererExecute = options.rendererExecute || null;
     this.rendererSimulateSession = options.rendererSimulateSession || null;
     this.rendererLeaveSession = options.rendererLeaveSession || null;
-    this.activeWebContents = null;
-    this._knownWebContents = new Set();
-    this._attachedEmitters = new WeakSet();
-    this._ipcAuthToken = crypto.randomBytes(32).toString("hex");
-    this._pendingRendererCmds = new Map();
-    this._ipcCmdAckInstalled = false;
 
-    this._pttTextWaiters = new Map();
-    this._richMediaWaiters = new Map();
-    this._groupNotifiesCache = new BoundedMap(2000);
-    this._buddyReqsCache = new BoundedMap(2000);
-    this._groupListCache = new BoundedMap(2000);
-    this._buddyCategoriesCache = [];
-    this._groupListWaiters = new Set();
-    this._qrCodeWaiters = new Set();
-    this._buddyListWaiters = new Set();
-    this._profileDetailWaiters = new Map();
-    this._doubtBuddyWaiters = new Set();
-    this._recentSentMsgByPeer = new BoundedMap(2000);
-
-    this.invokeStats = {
-      tier1: 0, tier2: 0, tier3: 0, directMain: 0, degraded: 0,
-      blockedReplays: 0, failed: 0, lastDegraded: null,
-    };
-
-    this._httpServers = [];
-    this._wsServers = [];
-    this._wsServerClients = new Set();
-    this._reverseWsClients = [];
-    this._wsClientHandles = this._reverseWsClients;
-    this._activeWebhookReqs = new Set();
-    this._webhookRetryTimers = new Set();
-    this._webhookQueue = [];
-    this._webhookGeneration = 0;
-    this.webhookStats = { ok: 0, failed: 0, retries: 0, dropped: 0, inFlight: 0, queued: 0 };
-    this._sighupHandler = null;
-    this.listenErrors = [];
-    this._heartbeatTimer = null;
-    this._wsPingTimer = null;
+    // Composed Core Subsystems
+    this.ntCapture = new NtCaptureController(this);
+    this.rendererIpc = new RendererIpcController(this);
+    this.inboundPipeline = new InboundPipeline(this);
+    this.outboundPipeline = new OutboundPipeline(this);
+    this.serverRuntime = new ServerRuntime(this);
   }
 
+  /**
+   * @param {BridgeOptions} [options={}]
+   */
   _initStorePersistence(options = {}) {
     const stateDir = typeof this.config?.stateDir === "string" ? this.config.stateDir.trim() : "";
     if (!stateDir || this.config?.persistStores === false) return;
@@ -191,7 +178,7 @@ class NtqqOneBotBridge extends EventEmitter {
   }
 
   // --------------------------------------------------------------------------
-  // Subsystem State Accessors & Delegates
+  // Primitive & Session Subsystem Accessors
   // --------------------------------------------------------------------------
 
   get _seenEventKeys() { return this.eventDedupe.entries; }
@@ -199,7 +186,7 @@ class NtqqOneBotBridge extends EventEmitter {
   get _tempCleanupRing() { return this.tempCleanupQueue.ring; }
   set _tempCleanupRing(v) { if (Array.isArray(v)) this.tempCleanupQueue._ring = v; }
   get _logThrottle() { return this.logger._throttleMap; }
-  set _logThrottle(v) { if (v instanceof Map) this.logger._throttleMap = v; }
+  set _logThrottle(v) { if (v instanceof Map) this.logger._throttleMap = /** @type {any} */ (v); }
   get _sendEchoWaiters() { return this.echoCorrelator.waiters; }
   set _sendEchoWaiters(v) { if (v instanceof Map) this.echoCorrelator.waiters = v; }
   get sendEchoStats() { return this.echoCorrelator.stats; }
@@ -219,35 +206,440 @@ class NtqqOneBotBridge extends EventEmitter {
   get _recentReadByPeer() { return this.sessionController.recentReadByPeer; }
   get _recentTypingByPeer() { return this.sessionController.recentTypingByPeer; }
   get _sessionScheduler() { return this.sessionController.scheduler; }
-  get wsClients() { return this._wsServerClients; }
-  get reverseWsClients() { return this._reverseWsClients; }
 
+  // --------------------------------------------------------------------------
+  // Composed Subsystem State Accessors (Backward-Compatible Property Facade)
+  // --------------------------------------------------------------------------
+
+  // NtCaptureController state
+  get _mapSetHook() { return this.ntCapture._mapSetHook; }
+  set _mapSetHook(v) { this.ntCapture._mapSetHook = v; }
+  get _mapHookMaxTimer() { return this.ntCapture._mapHookMaxTimer; }
+  set _mapHookMaxTimer(v) { this.ntCapture._mapHookMaxTimer = v; }
+  get _mapHookReleaseTimer() { return this.ntCapture._mapHookReleaseTimer; }
+  set _mapHookReleaseTimer(v) { this.ntCapture._mapHookReleaseTimer = v; }
+  get mapHookRelease() { return this.ntCapture.mapHookRelease; }
+  set mapHookRelease(v) { this.ntCapture.mapHookRelease = v; }
+  get _moduleLoadHook() { return this.ntCapture._moduleLoadHook; }
+  set _moduleLoadHook(v) { this.ntCapture._moduleLoadHook = v; }
+  get _attachedEmitters() { return this.ntCapture._attachedEmitters; }
+  set _attachedEmitters(v) { if (v instanceof WeakSet) this.ntCapture._attachedEmitters = v; }
+
+  // RendererIpcController state
+  get activeWebContents() { return this.rendererIpc.activeWebContents; }
+  set activeWebContents(v) { this.rendererIpc.activeWebContents = v; }
+  get _knownWebContents() { return this.rendererIpc._knownWebContents; }
+  set _knownWebContents(v) { if (v instanceof Set) this.rendererIpc._knownWebContents = v; }
+  get _ipcAuthToken() { return this.rendererIpc._ipcAuthToken; }
+  set _ipcAuthToken(v) { this.rendererIpc._ipcAuthToken = v; }
+  get _pendingRendererCmds() { return this.rendererIpc._pendingRendererCmds; }
+  set _pendingRendererCmds(v) { if (v instanceof Map) this.rendererIpc._pendingRendererCmds = v; }
+  get _ipcCmdAckInstalled() { return this.rendererIpc._ipcCmdAckInstalled; }
+  set _ipcCmdAckInstalled(v) { this.rendererIpc._ipcCmdAckInstalled = Boolean(v); }
+  get invokeStats() { return this.rendererIpc.invokeStats; }
+  set invokeStats(v) { if (v && typeof v === "object") this.rendererIpc.invokeStats = v; }
+  get rendererHealthStats() { return this.rendererIpc.rendererHealthStats; }
+  set rendererHealthStats(v) { this.rendererIpc.rendererHealthStats = v; }
+  get _rendererReloadTimestamps() { return this.rendererIpc._rendererReloadTimestamps; }
+  set _rendererReloadTimestamps(v) { this.rendererIpc._rendererReloadTimestamps = v; }
+  get _rendererReloadTimers() { return this.rendererIpc._rendererReloadTimers; }
+  set _rendererReloadTimers(v) { this.rendererIpc._rendererReloadTimers = v; }
+
+  // InboundPipeline state
+  get _pttTextWaiters() { return this.inboundPipeline._pttTextWaiters; }
+  set _pttTextWaiters(v) { this.inboundPipeline._pttTextWaiters = v; }
+  get _richMediaWaiters() { return this.inboundPipeline._richMediaWaiters; }
+  set _richMediaWaiters(v) { this.inboundPipeline._richMediaWaiters = v; }
+  get _groupNotifiesCache() { return this.inboundPipeline._groupNotifiesCache; }
+  set _groupNotifiesCache(v) { this.inboundPipeline._groupNotifiesCache = v; }
+  get _buddyReqsCache() { return this.inboundPipeline._buddyReqsCache; }
+  set _buddyReqsCache(v) { this.inboundPipeline._buddyReqsCache = v; }
+  get _groupListCache() { return this.inboundPipeline._groupListCache; }
+  set _groupListCache(v) { this.inboundPipeline._groupListCache = v; }
+  get _buddyCategoriesCache() { return this.inboundPipeline._buddyCategoriesCache; }
+  set _buddyCategoriesCache(v) { this.inboundPipeline._buddyCategoriesCache = v; }
+  get _groupListWaiters() { return this.inboundPipeline._groupListWaiters; }
+  set _groupListWaiters(v) { this.inboundPipeline._groupListWaiters = v; }
+  get _qrCodeWaiters() { return this.inboundPipeline._qrCodeWaiters; }
+  set _qrCodeWaiters(v) { this.inboundPipeline._qrCodeWaiters = v; }
+  get _buddyListWaiters() { return this.inboundPipeline._buddyListWaiters; }
+  set _buddyListWaiters(v) { this.inboundPipeline._buddyListWaiters = v; }
+  get _profileDetailWaiters() { return this.inboundPipeline._profileDetailWaiters; }
+  set _profileDetailWaiters(v) { this.inboundPipeline._profileDetailWaiters = v; }
+  get _doubtBuddyWaiters() { return this.inboundPipeline._doubtBuddyWaiters; }
+  set _doubtBuddyWaiters(v) { this.inboundPipeline._doubtBuddyWaiters = v; }
+  get _recentSentMsgByPeer() { return this.inboundPipeline._recentSentMsgByPeer; }
+  set _recentSentMsgByPeer(v) { this.inboundPipeline._recentSentMsgByPeer = v; }
+  get _autoQuickLoginAttempts() { return this.inboundPipeline._autoQuickLoginAttempts; }
+  set _autoQuickLoginAttempts(v) { this.inboundPipeline._autoQuickLoginAttempts = v; }
+  get _lastAutoQuickLoginAt() { return this.inboundPipeline._lastAutoQuickLoginAt; }
+  set _lastAutoQuickLoginAt(v) { this.inboundPipeline._lastAutoQuickLoginAt = v; }
+
+  // OutboundPipeline state
+  get rateLimiter() { return this.outboundPipeline.rateLimiter; }
+  set rateLimiter(v) { this.outboundPipeline.rateLimiter = v; }
+
+  // ServerRuntime state
+  get _httpServers() { return this.serverRuntime._httpServers; }
+  set _httpServers(v) { this.serverRuntime._httpServers = v; }
+  get _wsServers() { return this.serverRuntime._wsServers; }
+  set _wsServers(v) { this.serverRuntime._wsServers = v; }
+  get _wsServerClients() { return this.serverRuntime._wsServerClients; }
+  set _wsServerClients(v) { this.serverRuntime._wsServerClients = v; }
+  get _reverseWsClients() { return this.serverRuntime._reverseWsClients; }
+  set _reverseWsClients(v) {
+    this.serverRuntime._reverseWsClients = v;
+    this.serverRuntime._wsClientHandles = v;
+  }
+  get _wsClientHandles() { return this.serverRuntime._wsClientHandles; }
+  set _wsClientHandles(v) { this.serverRuntime._wsClientHandles = v; }
+  get _activeWebhookReqs() { return this.serverRuntime._activeWebhookReqs; }
+  set _activeWebhookReqs(v) { this.serverRuntime._activeWebhookReqs = v; }
+  get _webhookRetryTimers() { return this.serverRuntime._webhookRetryTimers; }
+  set _webhookRetryTimers(v) { this.serverRuntime._webhookRetryTimers = v; }
+  get _webhookQueue() { return this.serverRuntime._webhookQueue; }
+  set _webhookQueue(v) { this.serverRuntime._webhookQueue = v; }
+  get _webhookGeneration() { return this.serverRuntime._webhookGeneration; }
+  set _webhookGeneration(v) { this.serverRuntime._webhookGeneration = v; }
+  get webhookStats() { return this.serverRuntime.webhookStats; }
+  set webhookStats(v) { this.serverRuntime.webhookStats = v; }
+  get _sighupHandler() { return this.serverRuntime._sighupHandler; }
+  set _sighupHandler(v) { this.serverRuntime._sighupHandler = v; }
+  get listenErrors() { return this.serverRuntime.listenErrors; }
+  set listenErrors(v) { this.serverRuntime.listenErrors = v; }
+  get _heartbeatTimer() { return this.serverRuntime._heartbeatTimer; }
+  set _heartbeatTimer(v) { this.serverRuntime._heartbeatTimer = v; }
+  get _wsPingTimer() { return this.serverRuntime._wsPingTimer; }
+  set _wsPingTimer(v) { this.serverRuntime._wsPingTimer = v; }
+  get _stopped() { return this.serverRuntime._stopped; }
+  set _stopped(v) { this.serverRuntime._stopped = Boolean(v); }
+  get _pendingNetworkRestart() { return this.serverRuntime._pendingNetworkRestart; }
+  set _pendingNetworkRestart(v) { this.serverRuntime._pendingNetworkRestart = v; }
+  get wsClients() { return this.serverRuntime._wsServerClients; }
+  get reverseWsClients() { return this.serverRuntime._reverseWsClients; }
+
+  // --------------------------------------------------------------------------
+  // Shared Primitive & Session Delegates
+  // --------------------------------------------------------------------------
+
+  /** @param {any} val */
   _safeJsJson(val) { return safeJsJson(val); }
+  /**
+   * @param {Map<any, any>} map
+   * @param {any} key
+   * @param {any} value
+   * @param {number} [maxEntries=2000]
+   */
   _setBoundedMap(map, key, value, maxEntries = 2000) { return setBoundedMap(map, key, value, maxEntries); }
+  /**
+   * @param {string} key
+   * @param {string} msg
+   * @param {number} [windowMs=60000]
+   */
   _logWarn(key, msg, windowMs = 60000) { return this.logger.warnThrottled(key, msg, windowMs); }
+  /**
+   * @param {Array<() => void> | (() => void)} cbs
+   * @param {boolean} [immediate]
+   */
   _scheduleTempCleanup(cbs, immediate) { return this.tempCleanupQueue.schedule(cbs, immediate); }
+  /** @param {any} media */
   _scheduleMediaCleanup(media) { return this.tempCleanupQueue.scheduleMedia(media); }
   flushTempCleanup() { return this.tempCleanupQueue.flush(); }
+  /**
+   * @param {string} key
+   * @param {number} [ttlMs=30000]
+   */
   _isDuplicateEvent(key, ttlMs = 30000) { return this.eventDedupe.isDuplicate(key, ttlMs); }
-  _canInvokeRendererBridge() { return Boolean(this._canInvokeRenderer?.(this.activeWebContents)); }
+  _canInvokeRendererBridge() { return Boolean(this._canInvokeRenderer(this.activeWebContents)); }
+  /**
+   * @param {string} action
+   * @param {Record<string, any>} payload
+   * @param {number} [timeoutMs]
+   */
   _invokeRendererBridgeCommand(action, payload, timeoutMs) { return this._invokeRendererCommand(action, payload, timeoutMs); }
 
+  /**
+   * @param {() => Promise<any>} fn
+   * @param {Record<string, any>} [options]
+   */
   _withAioLock(fn, options) { return this.sessionController.withLock(fn, options); }
   _clearAioIdleTimers() { return this.sessionController.clearIdleTimers(); }
   _clearIdleTimers() { return this.sessionController.clearIdleTimers(); }
+  /** @param {Record<string, any>} [opts] */
   _resetSessionState(opts) { return this.sessionController.reset(opts || undefined); }
+  /** @param {Record<string, any>} [opts] */
   _resetHumanSessionState(opts) { return this.sessionController.reset(opts || undefined); }
   _touchAioActivity() { return this.sessionController.touchActivity(); }
+  /** @param {Record<string, any>} [opts] */
   _leaveSessionUnlocked(opts) { return this.sessionController.leaveUnlocked(opts); }
+  /** @param {Record<string, any>} [opts] */
   _leaveSession(opts) { return this.sessionController.leave(opts); }
+  /** @param {Record<string, any>} [opts] */
   leaveHumanSession(opts) { return this.sessionController.leave(opts); }
+  /** @param {Record<string, any>} [opts] */
   _activateSessionUnlocked(opts) { return this.sessionController.activateUnlocked(opts); }
+  /** @param {Record<string, any>} [opts] */
   simulateHumanSession(opts) { return this.sessionController.simulate(opts); }
+
+  // --------------------------------------------------------------------------
+  // Composed Subsystem Method Delegates
+  // --------------------------------------------------------------------------
+
+  // 1. NtCaptureController
+  installMapPrototypeHook() { return this.ntCapture.installMapPrototypeHook(); }
+  /** @param {string} [reason] */
+  releaseMapPrototypeHook(reason) { return this.ntCapture.releaseMapPrototypeHook(reason); }
+  installWrapperHook() { return this.ntCapture.installWrapperHook(); }
+  /** @param {Record<string, any>} [options] */
+  probeExistingRuntime(options) { return this.ntCapture.probeExistingRuntime(options); }
+  _mapHookReleaseDisabled() { return this.ntCapture._mapHookReleaseDisabled(); }
+  _maybeScheduleMapHookRelease() { return this.ntCapture._maybeScheduleMapHookRelease(); }
+  /**
+   * @param {any} mapInstance
+   * @param {any} k
+   * @param {any} v
+   */
+  _inspectMapEntry(mapInstance, k, v) { return this.ntCapture._inspectMapEntry(mapInstance, k, v); }
+  /** @param {any} obj */
+  _inspectInversifyCache(obj) { return this.ntCapture._inspectInversifyCache(obj); }
+  /** @param {any} ntStore */
+  _inspectNtStore(ntStore) { return this.ntCapture._inspectNtStore(ntStore); }
+  /** @param {any} emitter */
+  _attachNtStoreRootEmitter(emitter) { return this.ntCapture._attachNtStoreRootEmitter(emitter); }
+  /**
+   * @param {string} listenerName
+   * @param {any} emitterOrMap
+   */
+  _attachKernelListenerEmitter(listenerName, emitterOrMap) {
+    return this.ntCapture._attachKernelListenerEmitter(listenerName, emitterOrMap);
+  }
+  /** @param {Record<string, any>} [identity] */
+  _updateSelfIdentity(identity) { return this.ntCapture._updateSelfIdentity(identity); }
+  _reconnectUnidentifiedReverseWs() { return this.ntCapture._reconnectUnidentifiedReverseWs(); }
+
+  // 2. RendererIpcController
+  /** @param {any} [electronModule] */
+  installElectronHooks(electronModule) { return this.rendererIpc.installElectronHooks(electronModule); }
+  /**
+   * @param {string} cmd
+   * @param {Record<string, any>} [payload]
+   * @param {any[] | null} [positionalArgs]
+   * @param {{ preferMainProcess?: boolean, timeoutMs?: number } | null} [invokeOptions]
+   */
+  invokeNt(cmd, payload, positionalArgs, invokeOptions) {
+    return this.rendererIpc.invokeNt(cmd, payload, positionalArgs, invokeOptions);
+  }
+  /** @param {any} url */
+  _isTrustedRendererUrl(url) { return this.rendererIpc._isTrustedRendererUrl(url); }
+  /**
+   * @param {any} event
+   * @param {any} payload
+   */
+  _isTrustedIpcEvent(event, payload) { return this.rendererIpc._isTrustedIpcEvent(event, payload); }
+  /**
+   * @param {any} event
+   * @param {any} ack
+   */
+  _handleRendererCmdAck(event, ack) { return this.rendererIpc._handleRendererCmdAck(event, ack); }
+  _ensureRendererHealthStats() { return this.rendererIpc._ensureRendererHealthStats(); }
+  /** @param {any} [webContents] */
+  _clearRendererReloadTimers(webContents) { return this.rendererIpc._clearRendererReloadTimers(webContents); }
+  /**
+   * @param {any} [webContents]
+   * @param {string} [reason]
+   */
+  _rejectPendingRendererCmds(webContents, reason) {
+    return this.rendererIpc._rejectPendingRendererCmds(webContents, reason);
+  }
+  /** @param {any} wc */
+  _isWebContentsAlive(wc) { return this.rendererIpc._isWebContentsAlive(wc); }
+  /** @param {any} wc */
+  _canInvokeRenderer(wc) { return this.rendererIpc._canInvokeRenderer(wc); }
+  /** @param {any} url */
+  _isMainChatUrl(url) { return this.rendererIpc._isMainChatUrl(url); }
+  /** @param {any} wc */
+  _shouldPromoteWebContents(wc) { return this.rendererIpc._shouldPromoteWebContents(wc); }
+  /** @param {any} wc */
+  _attachToWebContents(wc) { return this.rendererIpc._attachToWebContents(wc); }
+  /** @param {any} val */
+  _reviveBridgeResult(val) { return this.rendererIpc._reviveBridgeResult(val); }
+  /** @param {any} val */
+  _reviveBridgePayload(val) { return this.rendererIpc._reviveBridgePayload(val); }
+  /** @param {any} rawData */
+  _handleRendererForwardedEvent(rawData) { return this.rendererIpc._handleRendererForwardedEvent(rawData); }
+  /** @param {any} value */
+  _serializeBridgeArgs(value) { return this.rendererIpc._serializeBridgeArgs(value); }
+  /** @param {any} value */
+  _serializeBridgePayload(value) { return this.rendererIpc._serializeBridgePayload(value); }
+  /**
+   * @param {string} type
+   * @param {Record<string, any>} [cmdPayload]
+   * @param {number} [timeoutMs]
+   */
+  _invokeRendererCommand(type, cmdPayload, timeoutMs) {
+    return this.rendererIpc._invokeRendererCommand(type, cmdPayload, timeoutMs);
+  }
+  /**
+   * @param {string} key
+   * @param {string} message
+   */
+  _logInvokeWarning(key, message) { return this.rendererIpc._logInvokeWarning(key, message); }
+
+  // 3. InboundPipeline
+  /** @param {any} v */
+  _isPositiveUin(v) { return this.inboundPipeline._isPositiveUin(v); }
+  _isNtReady() { return this.inboundPipeline._isNtReady(); }
+  /** @param {any} ev */
+  _dispatchInboundEvent(ev) { return this.inboundPipeline._dispatchInboundEvent(ev); }
+  /** @param {any} uid */
+  _ensureUinForUid(uid) { return this.inboundPipeline._ensureUinForUid(uid); }
+  /** @param {any} ntMsg */
+  _resolveNtMsgUids(ntMsg) { return this.inboundPipeline._resolveNtMsgUids(ntMsg); }
+  /** @param {any} ntMsg */
+  _enqueueInboundNtMessage(ntMsg) { return this.inboundPipeline._enqueueInboundNtMessage(ntMsg); }
+  /**
+   * @param {string} listenerName
+   * @param {string} eventName
+   * @param {any[]} args
+   */
+  _handleKernelEvent(listenerName, eventName, args) {
+    return this.inboundPipeline._handleKernelEvent(listenerName, eventName, args);
+  }
+  /** @param {any} ntMsg */
+  _processIncomingNtMessage(ntMsg) { return this.inboundPipeline._processIncomingNtMessage(ntMsg); }
+  /** @param {any} firstArg */
+  _handleRichMediaDownloadComplete(firstArg) {
+    return this.inboundPipeline._handleRichMediaDownloadComplete(firstArg);
+  }
+  /** @param {Record<string, any>} [options] */
+  _downloadRichMediaElement(options) { return this.inboundPipeline._downloadRichMediaElement(options); }
+  /**
+   * @param {any} ntMsg
+   * @param {Record<string, any>} [options]
+   */
+  _hydrateNtMsgMedia(ntMsg, options) { return this.inboundPipeline._hydrateNtMsgMedia(ntMsg, options); }
+  /**
+   * @param {any} rawIdentity
+   * @param {{ markOnline?: boolean }} [options]
+   */
+  _syncSelfIdentityFromLogin(rawIdentity, options) {
+    return this.inboundPipeline._syncSelfIdentityFromLogin(rawIdentity, options);
+  }
+  /**
+   * @param {string} eventName
+   * @param {any[]} args
+   */
+  _handleLoginKernelEvent(eventName, args) {
+    return this.inboundPipeline._handleLoginKernelEvent(eventName, args);
+  }
+  /** @param {Record<string, any>} [options] */
+  _tryAutoQuickLogin(options) { return this.inboundPipeline._tryAutoQuickLogin(options); }
+
+  // 4. OutboundPipeline
+  _ensureRateLimiter() { return this.outboundPipeline._ensureRateLimiter(); }
+  /** @param {string} peerKey */
+  _enforceOutboundRateLimit(peerKey) { return this.outboundPipeline._enforceOutboundRateLimit(peerKey); }
+  _ensureEchoCorrelator() { return this.outboundPipeline._ensureEchoCorrelator(); }
+  /**
+   * @param {any} userId
+   * @param {any} [groupId]
+   */
+  _resolvePeerForUser(userId, groupId) { return this.outboundPipeline._resolvePeerForUser(userId, groupId); }
+  /**
+   * @param {any} media
+   * @param {number} [subType]
+   */
+  _prepareNtImagePath(media, subType) { return this.outboundPipeline._prepareNtImagePath(media, subType); }
+  /** @param {any} media */
+  _prepareNtRecordPath(media) { return this.outboundPipeline._prepareNtRecordPath(media); }
+  /**
+   * @param {any} media
+   * @param {any} thumbInfo
+   */
+  _prepareNtVideoPath(media, thumbInfo) { return this.outboundPipeline._prepareNtVideoPath(media, thumbInfo); }
+  /** @param {any} peer */
+  _sendPeerKey(peer) { return this.outboundPipeline._sendPeerKey(peer); }
+  /**
+   * @param {any} peer
+   * @param {any} elements
+   * @param {((ntMsg: any) => boolean) | null} [elementPredicate]
+   */
+  _registerSendEchoWaiter(peer, elements, elementPredicate) {
+    return this.outboundPipeline._registerSendEchoWaiter(peer, elements, elementPredicate);
+  }
+  /** @param {any} ntMsg */
+  _matchSendEcho(ntMsg) { return this.outboundPipeline._matchSendEcho(ntMsg); }
+  /** @param {any[]} elements */
+  _hasRichMediaElements(elements) { return this.outboundPipeline._hasRichMediaElements(elements); }
+  /** @param {any[]} elements */
+  _computeSendEchoTimeoutMs(elements) { return this.outboundPipeline._computeSendEchoTimeoutMs(elements); }
+  _mediaSecurityOptions() { return this.outboundPipeline._mediaSecurityOptions(); }
+  /**
+   * @param {any} peer
+   * @param {any} message
+   * @param {boolean} [autoEscape]
+   * @param {any} [groupId]
+   * @param {Record<string, any>} [options]
+   */
+  _sendMessageToPeer(peer, message, autoEscape, groupId, options) {
+    return this.outboundPipeline._sendMessageToPeer(peer, message, autoEscape, groupId, options);
+  }
+  /**
+   * @param {any} peer
+   * @param {() => Promise<any>} invokeFn
+   * @param {string} [fallbackSeed]
+   */
+  _invokeForwardWithEcho(peer, invokeFn, fallbackSeed) {
+    return this.outboundPipeline._invokeForwardWithEcho(peer, invokeFn, fallbackSeed);
+  }
+  /**
+   * @param {any} groupId
+   * @param {any} userId
+   */
+  _sendPokeInternal(groupId, userId) { return this.outboundPipeline._sendPokeInternal(groupId, userId); }
+
+  // 5. ServerRuntime
+  startServers() { return this.serverRuntime.startServers(); }
+  stopServers() { return this.serverRuntime.stopServers(); }
+  /** @param {Record<string, any>} [options] */
+  reloadConfig(options) { return this.serverRuntime.reloadConfig(options); }
+  /**
+   * @param {any} req
+   * @param {string | undefined} expectedToken
+   * @param {URL | null} [parsedUrl]
+   */
+  _checkAuth(req, expectedToken, parsedUrl) {
+    return this.serverRuntime._checkAuth(req, expectedToken, parsedUrl);
+  }
+  _computeReadiness() { return this.serverRuntime._computeReadiness(); }
+  _formatPrometheusMetrics() { return this.serverRuntime._formatPrometheusMetrics(); }
+  /**
+   * @param {any} rawText
+   * @param {(payload: any) => void} sendJsonFn
+   * @param {Record<string, any>} [actionContext]
+   */
+  _handleWsActionMessage(rawText, sendJsonFn, actionContext) {
+    return this.serverRuntime._handleWsActionMessage(rawText, sendJsonFn, actionContext);
+  }
+  /** @param {any} event */
+  _dispatchHttpWebhookEvent(event) { return this.serverRuntime._dispatchHttpWebhookEvent(event); }
+  /**
+   * @param {Record<string, any>} clientCfg
+   * @param {any} event
+   */
+  _postEventToHttpClient(clientCfg, event) {
+    return this.serverRuntime._postEventToHttpClient(clientCfg, event);
+  }
+  _stopNetworkRuntime() { return this.serverRuntime._stopNetworkRuntime(); }
 
   // --------------------------------------------------------------------------
   // Event Formatting & Broadcast
   // --------------------------------------------------------------------------
 
+  /**
+   * @param {any} eventObj
+   * @param {string} messageFormat
+   */
   _formatEventForEndpoint(eventObj, messageFormat) {
     if (
       messageFormat === "string" &&
@@ -267,6 +659,7 @@ class NtqqOneBotBridge extends EventEmitter {
     return eventObj;
   }
 
+  /** @param {any} event */
   broadcastOneBotEvent(event) {
     if (!event || typeof event !== "object") return;
     if (!event.self_id && this.selfUin) {
@@ -307,11 +700,19 @@ class NtqqOneBotBridge extends EventEmitter {
     return await fetchClientKey(this);
   }
 
+  /** @param {string} [domain="qun.qq.com"] */
   async _getCookiesObject(domain = "qun.qq.com") {
     assertWebCredentialApiEnabled(this.config, "get_cookies");
     return await getCookiesObject(this, domain, WEB_HTTP_HELPERS);
   }
 
+  /**
+   * @param {string} action
+   * @param {Record<string, any>} [params={}]
+   * @param {any} [echo=undefined]
+   * @param {ActionContext} [context={}]
+   * @returns {Promise<OneBotActionResponse>}
+   */
   async handleOneBotAction(action, params = {}, echo = undefined, context = {}) {
     const act = String(action || "").replace(/^\/+/, "").trim();
     const p = params && typeof params === "object" ? params : {};
@@ -326,7 +727,7 @@ class NtqqOneBotBridge extends EventEmitter {
         wording: "",
         ...(echo !== undefined ? { echo } : {}),
       };
-    } catch (err) {
+    } catch (/** @type {any} */ err) {
       const msg = err && err.message ? err.message : String(err);
       const retcode = Number(
         err?.retcode || (err?.code === "ERR_WEB_CREDENTIAL_API_DISABLED" ? 1403 : 1400)
@@ -342,6 +743,11 @@ class NtqqOneBotBridge extends EventEmitter {
     }
   }
 
+  /**
+   * @param {string} action
+   * @param {Record<string, any>} p
+   * @param {ActionContext} [context={}]
+   */
   async _dispatchAction(action, p, context = {}) {
     const handler = ACTION_DISPATCH_MAP.get(action);
     if (!handler) {
@@ -357,27 +763,30 @@ class NtqqOneBotBridge extends EventEmitter {
 NtqqOneBotBridge._ntElementsSignature = _ntElementsSignature;
 NtqqOneBotBridge._elementsSignatureMatch = _elementsSignatureMatch;
 
-Object.assign(
-  NtqqOneBotBridge.prototype,
-  ntCaptureMixin, rendererIpcMixin, inboundPipelineMixin, outboundPipelineMixin, serverRuntimeMixin
-);
-
 // ============================================================================
 // Bootstrap & Public Exports
 // ============================================================================
 
+/** @type {NtqqOneBotBridge | null} */
 let singletonBridge = null;
 
+/**
+ * @param {BridgeOptions} [options={}]
+ * @returns {NtqqOneBotBridge}
+ */
 function installMainBridge(options = {}) {
   if (singletonBridge && !options.forceNew) {
     if (options.config || options.configDir) {
       singletonBridge.config = options.config || loadBridgeConfig(options.configDir);
-      singletonBridge
+      const active = singletonBridge;
+      active
         .stopServers()
         .then(() => {
-          if (options.autoStartServers !== false) return singletonBridge.startServers();
+          if (options.autoStartServers !== false) return active.startServers();
         })
-        .catch(() => {});
+        .catch((err) => {
+          active.logger?.debug?.("bridge_main", err);
+        });
     }
     return singletonBridge;
   }
@@ -386,7 +795,9 @@ function installMainBridge(options = {}) {
   bridge.installWrapperHook();
   bridge.installElectronHooks(options.electron);
   if (options.autoStartServers !== false) {
-    bridge.startServers().catch(() => {});
+    bridge.startServers().catch((err) => {
+      bridge.logger?.debug?.("bridge_main", err);
+    });
   }
   singletonBridge = bridge;
   return bridge;

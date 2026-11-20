@@ -1,4 +1,14 @@
+// @ts-check
 "use strict";
+
+/**
+ * Built-in HTTP API, Forward/Reverse WebSocket, Webhook Queue & Hot-Reload Runtime (`src/core/server_runtime.js`)
+ *
+ * Composed controller (`ServerRuntime`) owning HTTP API servers (`/health`, `/ready`,
+ * Prometheus `/metrics`), Forward WS servers (`/` `/api` `/event`), Reverse WS loops,
+ * bounded HTTP POST webhook queues with exponential backoff retries and Quick Operations,
+ * and deadlock-free `reloadConfig` / `SIGHUP` hot reload.
+ */
 
 const http = require("http");
 const https = require("https");
@@ -27,6 +37,10 @@ const {
 
 const { isQuietLogsEnabled } = require("./env");
 
+/** @typedef {import("../types").ListenErrorEntry} ListenErrorEntry */
+/** @typedef {import("../types").WebhookStats} WebhookStats */
+/** @typedef {import("../types").ReloadConfigResult} ReloadConfigResult */
+
 const JSON_CONTENT_TYPE_HEADERS = Object.freeze({
   "Content-Type": "application/json; charset=utf-8",
 });
@@ -44,6 +58,13 @@ const NETWORK_RELOAD_KEYS = Object.freeze([
   "wsPongTimeoutMs",
 ]);
 
+/**
+ * @param {any} res
+ * @param {number} statusCode
+ * @param {any} payload
+ * @param {Record<string, string> | null} [extraHeaders=null]
+ * @returns {boolean}
+ */
 function writeHttpJson(res, statusCode, payload, extraHeaders = null) {
   if (!res || res.writableEnded) return false;
   const headers =
@@ -55,6 +76,10 @@ function writeHttpJson(res, statusCode, payload, extraHeaders = null) {
   return true;
 }
 
+/**
+ * @param {string} pathname
+ * @returns {"api" | "event" | "universal"}
+ */
 function classifyForwardWsRole(pathname) {
   const raw = typeof pathname === "string" && pathname.length > 0 ? pathname : "/";
   const normalized = raw.length > 1 ? raw.replace(/\/+$/, "") : raw;
@@ -63,6 +88,10 @@ function classifyForwardWsRole(pathname) {
   return "universal";
 }
 
+/**
+ * @param {any} val
+ * @returns {string}
+ */
 function _stableSerialize(val) {
   if (val === undefined) return "undefined";
   if (val === null || typeof val !== "object") return JSON.stringify(val);
@@ -78,10 +107,16 @@ function _stableSerialize(val) {
   return `{${pairs.join(",")}}`;
 }
 
+/**
+ * @param {Record<string, any>} [prevConfig={}]
+ * @param {Record<string, any>} [nextConfig={}]
+ * @returns {{ changedKeys: string[], networkChangedKeys: string[], networkChanged: boolean }}
+ */
 function computeConfigDiff(prevConfig = {}, nextConfig = {}) {
   const prev = prevConfig && typeof prevConfig === "object" ? prevConfig : {};
   const next = nextConfig && typeof nextConfig === "object" ? nextConfig : {};
   const allKeys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+  /** @type {string[]} */
   const changedKeys = [];
   for (const key of Array.from(allKeys).sort()) {
     if (_stableSerialize(prev[key]) !== _stableSerialize(next[key])) {
@@ -97,11 +132,19 @@ function computeConfigDiff(prevConfig = {}, nextConfig = {}) {
   };
 }
 
+/**
+ * @param {number} statusCode
+ * @returns {boolean}
+ */
 function isRetryableWebhookStatus(statusCode) {
   const code = Number(statusCode || 0);
   return code === 429 || code >= 500;
 }
 
+/**
+ * @param {Record<string, any>} [endpointCfg={}]
+ * @param {string} [defaultMsgFormat="array"]
+ */
 function buildEndpointActionContext(endpointCfg = {}, defaultMsgFormat = "array") {
   const cfg = endpointCfg && typeof endpointCfg === "object" ? endpointCfg : {};
   return {
@@ -112,6 +155,11 @@ function buildEndpointActionContext(endpointCfg = {}, defaultMsgFormat = "array"
   };
 }
 
+/**
+ * @param {number} retcode
+ * @param {any} message
+ * @param {any} [echo=undefined]
+ */
 function buildFailedActionReply(retcode, message, echo = undefined) {
   const msg = message !== undefined && message !== null ? String(message) : "";
   return {
@@ -138,6 +186,10 @@ const QUICK_OP_KEYS = Object.freeze([
   "remark",
 ]);
 
+/**
+ * @param {any} obj
+ * @returns {boolean}
+ */
 function hasMeaningfulQuickOperation(obj) {
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
   for (const key of QUICK_OP_KEYS) {
@@ -148,18 +200,188 @@ function hasMeaningfulQuickOperation(obj) {
   return false;
 }
 
-const serverRuntimeMixin = {
+const LEGACY_SERVER_CTRL_SYM = Symbol("rosmontisLegacyServerRuntime");
+const LEGACY_SERVER_STATE_KEYS = Object.freeze([
+  "_httpServers",
+  "_wsServers",
+  "_wsServerClients",
+  "_reverseWsClients",
+  "_wsClientHandles",
+  "_activeWebhookReqs",
+  "_webhookRetryTimers",
+  "_webhookQueue",
+  "_webhookGeneration",
+  "webhookStats",
+  "_sighupHandler",
+  "listenErrors",
+  "_heartbeatTimer",
+  "_wsPingTimer",
+  "_stopped",
+  "_transportAsyncLocal",
+  "_reloadChain",
+  "_pendingDeferredReloadCancels",
+  "_pendingNetworkRestart",
+]);
+
+/**
+ * Composed HTTP / WebSocket / Webhook / Hot-Reload transport runtime.
+ */
+class ServerRuntime {
+  /**
+   * @param {any} [bridge]
+   */
+  constructor(bridge = {}) {
+    /** @type {any} */
+    this.bridge = bridge || {};
+    /** @type {http.Server[]} */
+    this._httpServers =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_httpServers") &&
+      Array.isArray(this.bridge._httpServers)
+        ? this.bridge._httpServers
+        : [];
+    /** @type {http.Server[]} */
+    this._wsServers =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_wsServers") &&
+      Array.isArray(this.bridge._wsServers)
+        ? this.bridge._wsServers
+        : [];
+    /** @type {Set<any>} */
+    this._wsServerClients =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_wsServerClients") &&
+      this.bridge._wsServerClients instanceof Set
+        ? this.bridge._wsServerClients
+        : new Set();
+    /** @type {any[]} */
+    this._reverseWsClients =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_reverseWsClients") &&
+      Array.isArray(this.bridge._reverseWsClients)
+        ? this.bridge._reverseWsClients
+        : [];
+    /** @type {any[]} */
+    this._wsClientHandles = this._reverseWsClients;
+    /** @type {Set<any>} */
+    this._activeWebhookReqs =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_activeWebhookReqs") &&
+      this.bridge._activeWebhookReqs instanceof Set
+        ? this.bridge._activeWebhookReqs
+        : new Set();
+    /** @type {Set<any>} */
+    this._webhookRetryTimers =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_webhookRetryTimers") &&
+      this.bridge._webhookRetryTimers instanceof Set
+        ? this.bridge._webhookRetryTimers
+        : new Set();
+    /** @type {any[]} */
+    this._webhookQueue =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_webhookQueue") &&
+      Array.isArray(this.bridge._webhookQueue)
+        ? this.bridge._webhookQueue
+        : [];
+    /** @type {number} */
+    this._webhookGeneration = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_webhookGeneration"
+    )
+      ? Number(this.bridge._webhookGeneration) || 0
+      : 0;
+    /** @type {WebhookStats} */
+    this.webhookStats =
+      Object.prototype.hasOwnProperty.call(this.bridge, "webhookStats") &&
+      this.bridge.webhookStats &&
+      typeof this.bridge.webhookStats === "object"
+        ? this.bridge.webhookStats
+        : { ok: 0, failed: 0, retries: 0, dropped: 0, inFlight: 0, queued: 0 };
+    /** @type {(() => void) | null} */
+    this._sighupHandler = Object.prototype.hasOwnProperty.call(this.bridge, "_sighupHandler")
+      ? this.bridge._sighupHandler
+      : null;
+    /** @type {ListenErrorEntry[]} */
+    this.listenErrors =
+      Object.prototype.hasOwnProperty.call(this.bridge, "listenErrors") &&
+      Array.isArray(this.bridge.listenErrors)
+        ? this.bridge.listenErrors
+        : [];
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._heartbeatTimer = Object.prototype.hasOwnProperty.call(this.bridge, "_heartbeatTimer")
+      ? this.bridge._heartbeatTimer
+      : null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._wsPingTimer = Object.prototype.hasOwnProperty.call(this.bridge, "_wsPingTimer")
+      ? this.bridge._wsPingTimer
+      : null;
+    /** @type {boolean} */
+    this._stopped = Object.prototype.hasOwnProperty.call(this.bridge, "_stopped")
+      ? Boolean(this.bridge._stopped)
+      : false;
+    /** @type {AsyncLocalStorage<any> | null} */
+    this._transportAsyncLocal = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_transportAsyncLocal"
+    )
+      ? this.bridge._transportAsyncLocal
+      : null;
+    /** @type {Promise<any> | null} */
+    this._reloadChain = Object.prototype.hasOwnProperty.call(this.bridge, "_reloadChain")
+      ? this.bridge._reloadChain
+      : null;
+    /** @type {Set<() => void>} */
+    this._pendingDeferredReloadCancels =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_pendingDeferredReloadCancels") &&
+      this.bridge._pendingDeferredReloadCancels instanceof Set
+        ? this.bridge._pendingDeferredReloadCancels
+        : new Set();
+    /** @type {Promise<void> | null} */
+    this._pendingNetworkRestart = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_pendingNetworkRestart"
+    )
+      ? this.bridge._pendingNetworkRestart
+      : null;
+  }
+
+  /** @returns {any} */
+  get config() {
+    return this.bridge.config;
+  }
+
+  /** @returns {any} */
+  get logger() {
+    return this.bridge.logger;
+  }
+
+  /** @param {any} err */
+  _debugSafe(err) {
+    try {
+      this.logger?.debug?.("server_runtime", err);
+    } catch (_logErr) {
+      // Benign: never let debug logging fail inside transport/cleanup handlers.
+    }
+  }
+
+  /**
+   * @param {any} req
+   * @param {string | undefined} expectedToken
+   * @param {URL | null} [parsedUrl=null]
+   * @returns {boolean}
+   */
   _checkAuth(req, expectedToken, parsedUrl = null) {
     return checkRequestAuth(req, expectedToken, {
-      allowQueryToken: this.config.allowQueryAccessToken !== false,
+      allowQueryToken: this.config?.allowQueryAccessToken !== false,
       parsedUrl,
     });
-  },
+  }
 
+  /**
+   * @param {string} kind
+   * @param {string} host
+   * @param {number} port
+   * @param {any} err
+   */
   _recordListenError(kind, host, port, err) {
     if (!Array.isArray(this.listenErrors)) {
       this.listenErrors = [];
     }
+    /** @type {ListenErrorEntry} */
     const entry = {
       kind: String(kind || "server"),
       host: String(host || ""),
@@ -189,10 +411,20 @@ const serverRuntimeMixin = {
     } else if (!isQuietLogsEnabled(this.config)) {
       try {
         process.stderr.write(`[rosmontis] ${warnMsg}\n`);
-      } catch (_) {}
+      } catch (_writeErr) {
+        // Benign: stderr may be closed in detached daemon environments.
+      }
     }
-  },
+  }
 
+  /**
+   * @param {http.Server} srv
+   * @param {string} kind
+   * @param {string} listenHost
+   * @param {number} listenPort
+   * @param {http.Server[]} targetList
+   * @returns {Promise<void>}
+   */
   _listenServerInstance(srv, kind, listenHost, listenPort, targetList) {
     return new Promise((resolve) => {
       let settled = false;
@@ -214,19 +446,23 @@ const serverRuntimeMixin = {
         this._recordListenError(kind, listenHost, listenPort, syncErr);
         try {
           srv.close();
-        } catch (_) {}
+        } catch (closeErr) {
+          this._debugSafe(closeErr);
+        }
         settleOnce();
       }
     });
-  },
+  }
 
+  /** @returns {AsyncLocalStorage<any>} */
   _getTransportAls() {
     if (!this._transportAsyncLocal) {
       this._transportAsyncLocal = new AsyncLocalStorage();
     }
     return this._transportAsyncLocal;
-  },
+  }
 
+  /** @returns {WebhookStats} */
   _ensureWebhookState() {
     if (!this.webhookStats || typeof this.webhookStats !== "object") {
       this.webhookStats = { ok: 0, failed: 0, retries: 0, dropped: 0, inFlight: 0, queued: 0 };
@@ -244,31 +480,33 @@ const serverRuntimeMixin = {
       this._webhookGeneration = 0;
     }
     return this.webhookStats;
-  },
+  }
 
   _computeReadiness() {
-    const online = Boolean(this.online);
-    const ntReady =
-      typeof this._isNtReady === "function" ? Boolean(this._isNtReady()) : true;
-    const rendererUnresponsive = Boolean(this.rendererHealthStats?.unresponsiveActive);
+    const b = this.bridge;
+    const online = Boolean(b.online);
+    const ntReady = typeof b._isNtReady === "function" ? Boolean(b._isNtReady()) : true;
+    const rendererUnresponsive = Boolean(b.rendererHealthStats?.unresponsiveActive);
     const ready = online && ntReady && !rendererUnresponsive;
     return {
       ready,
       online,
       nt_ready: ntReady,
       renderer_unresponsive: rendererUnresponsive,
-      self_id: Number(this.selfUin || 0),
+      self_id: Number(b.selfUin || 0),
     };
-  },
+  }
 
+  /** @returns {string} */
   _formatPrometheusMetrics() {
+    const b = this.bridge;
     const readiness = this._computeReadiness();
     const uptimeSec = Math.max(
       0,
-      Math.floor((Date.now() - (this.startedAtMs || Date.now())) / 1000)
+      Math.floor((Date.now() - (b.startedAtMs || Date.now())) / 1000)
     );
-    const inv = this.invokeStats || {};
-    const echo = this.sendEchoStats || {};
+    const inv = b.invokeStats || {};
+    const echo = b.sendEchoStats || {};
     const wh = this._ensureWebhookState();
 
     let wsServerClients = 0;
@@ -284,14 +522,10 @@ const serverRuntimeMixin = {
       }
     }
 
-    const rateLimitRejected = Number(this.rateLimiter?.getStats?.()?.rejected || 0);
-    const rendererCrashes = Number(this.rendererHealthStats?.crashes || 0);
-    const msgStoreSize = Number(
-      this.messageIdStore?.byShortId?.size ?? this.messageIdStore?.size ?? 0
-    );
-    const uinUidStoreSize = Number(
-      this.uinUidStore?.uinToUid?.size ?? this.uinUidStore?.size ?? 0
-    );
+    const rateLimitRejected = Number(b.rateLimiter?.getStats?.()?.rejected || 0);
+    const rendererCrashes = Number(b.rendererHealthStats?.crashes || 0);
+    const msgStoreSize = Number(b.messageIdStore?.byShortId?.size ?? b.messageIdStore?.size ?? 0);
+    const uinUidStoreSize = Number(b.uinUidStore?.uinToUid?.size ?? b.uinUidStore?.size ?? 0);
 
     const lines = [
       "# HELP rosmontis_up Whether the Rosmontis bridge process is up.",
@@ -356,7 +590,7 @@ const serverRuntimeMixin = {
       `rosmontis_store_uin_uid_size ${uinUidStoreSize}`,
     ];
     return `${lines.join("\n")}\n`;
-  },
+  }
 
   _installSighupHandler() {
     if (process.platform === "win32" || this.config?.reloadOnSighup === false) {
@@ -365,8 +599,12 @@ const serverRuntimeMixin = {
     }
     if (this._sighupHandler) return;
     this._sighupHandler = () => {
-      this.reloadConfig().catch((err) => {
-        this._logWarn?.(
+      const reloadFn =
+        typeof this.bridge.reloadConfig === "function"
+          ? this.bridge.reloadConfig.bind(this.bridge)
+          : this.reloadConfig.bind(this);
+      reloadFn().catch((/** @type {any} */ err) => {
+        this.bridge._logWarn?.(
           "sighup-reload-err",
           `SIGHUP config reload failed: ${err?.message || err}`,
           5000
@@ -375,18 +613,21 @@ const serverRuntimeMixin = {
     };
     try {
       process.on("SIGHUP", this._sighupHandler);
-    } catch (_) {
+    } catch (err) {
+      this._debugSafe(err);
       this._sighupHandler = null;
     }
-  },
+  }
 
   _removeSighupHandler() {
     if (!this._sighupHandler) return;
     try {
       process.removeListener("SIGHUP", this._sighupHandler);
-    } catch (_) {}
+    } catch (err) {
+      this._debugSafe(err);
+    }
     this._sighupHandler = null;
-  },
+  }
 
   _syncSighupHandler() {
     if (process.platform === "win32" || this.config?.reloadOnSighup === false) {
@@ -399,14 +640,20 @@ const serverRuntimeMixin = {
     ) {
       this._installSighupHandler();
     }
-  },
+  }
 
+  /**
+   * @param {any} rawText
+   * @param {(payload: any) => void} sendJsonFn
+   * @param {Record<string, any>} [actionContext={}]
+   */
   async _handleWsActionMessage(rawText, sendJsonFn, actionContext = {}) {
     if (typeof sendJsonFn !== "function") return;
     let payload;
     try {
       payload = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
-    } catch (_) {
+    } catch (err) {
+      this._debugSafe(err);
       return;
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || !payload.action) {
@@ -416,34 +663,39 @@ const serverRuntimeMixin = {
       payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)
         ? payload.params
         : {};
+    /** @type {{ kind: string, deferredTask: (() => void) | null, _ran: boolean }} */
     const transportCtx = { kind: "ws", deferredTask: null, _ran: false };
     let reply;
     try {
       reply = await this._getTransportAls().run(transportCtx, () =>
-        this.handleOneBotAction(
+        this.bridge.handleOneBotAction(
           payload.action,
           actParams,
           payload.echo,
           actionContext
         )
       );
-    } catch (err) {
+    } catch (/** @type {any} */ err) {
       const msg = err && err.message ? err.message : String(err);
       const retcode = Number(err?.retcode) || 1400;
       reply = buildFailedActionReply(retcode, msg, payload.echo);
     }
     try {
       sendJsonFn(reply);
-    } catch (_) {}
+    } catch (err) {
+      this._debugSafe(err);
+    }
     if (typeof transportCtx.deferredTask === "function" && !transportCtx._ran) {
       transportCtx._ran = true;
       setImmediate(() => {
         try {
-          transportCtx.deferredTask();
-        } catch (_) {}
+          transportCtx.deferredTask?.();
+        } catch (err) {
+          this._debugSafe(err);
+        }
       });
     }
-  },
+  }
 
   async startServers() {
     this._stopped = false;
@@ -451,26 +703,28 @@ const serverRuntimeMixin = {
     this._ensureWebhookState();
 
     enforceProtectedModeOnServers(
-      [...(this.config.httpServers || []), ...(this.config.wsServers || [])],
+      [...(this.config?.httpServers || []), ...(this.config?.wsServers || [])],
       this.config,
-      (msg) => {
+      (/** @type {string} */ msg) => {
         try {
           process.stderr.write("[rosmontis] SECURITY WARNING: " + msg + "\n");
-        } catch (_) {}
+        } catch (_writeErr) {
+          // Benign: stderr may be unavailable in headless daemon environments.
+        }
       }
     );
 
-    const globalMsgFormat = this.config.messageFormat || "array";
+    const globalMsgFormat = this.config?.messageFormat || "array";
 
     // 1. Start HTTP Server(s)
-    for (const httpCfg of this.config.httpServers || []) {
+    for (const httpCfg of this.config?.httpServers || []) {
       const actionContext = buildEndpointActionContext(httpCfg, globalMsgFormat);
       const srv = http.createServer(async (req, res) => {
-        req.on("error", () => {});
-        res.on("error", () => {});
+        req.on("error", (err) => this._debugSafe(err));
+        res.on("error", (err) => this._debugSafe(err));
 
         const originRes = checkOriginHeader(req, {
-          allowedOrigins: httpCfg.allowedOrigins || this.config.allowedOrigins || [],
+          allowedOrigins: httpCfg.allowedOrigins || this.config?.allowedOrigins || [],
         });
         if (!originRes.allowed) {
           writeHttpJson(res, 403, buildFailedActionReply(1403, "Forbidden: Origin not allowed"));
@@ -480,7 +734,8 @@ const serverRuntimeMixin = {
         let u;
         try {
           u = new URL(req.url || "/", "http://127.0.0.1");
-        } catch (_) {
+        } catch (urlErr) {
+          this._debugSafe(urlErr);
           u = new URL("/", "http://127.0.0.1");
         }
 
@@ -494,8 +749,8 @@ const serverRuntimeMixin = {
           writeHttpJson(res, 200, {
             status: "ok",
             retcode: 0,
-            self_id: Number(this.selfUin || 0),
-            online: this.online,
+            self_id: Number(this.bridge.selfUin || 0),
+            online: this.bridge.online,
           });
           return;
         }
@@ -524,7 +779,7 @@ const serverRuntimeMixin = {
 
         try {
           const params = await readHttpJsonBody(req, {
-            maxBodyBytes: this.config.maxHttpBodyBytes || DEFAULT_MAX_HTTP_BODY_BYTES,
+            maxBodyBytes: this.config?.maxHttpBodyBytes || DEFAULT_MAX_HTTP_BODY_BYTES,
           });
           for (const [k, v] of u.searchParams.entries()) {
             if (!(k in params)) params[k] = v;
@@ -536,9 +791,10 @@ const serverRuntimeMixin = {
                 ? params.params
                 : {}
               : params;
+          /** @type {{ kind: string, res: http.ServerResponse, deferredTask: (() => void) | null, _ran: boolean }} */
           const transportCtx = { kind: "http", res, deferredTask: null, _ran: false };
           const reply = await this._getTransportAls().run(transportCtx, () =>
-            this.handleOneBotAction(act, actParams, params.echo, actionContext)
+            this.bridge.handleOneBotAction(act, actParams, params.echo, actionContext)
           );
           if (typeof transportCtx.deferredTask === "function") {
             writeHttpJson(res, 200, reply, { Connection: "close" });
@@ -546,8 +802,10 @@ const serverRuntimeMixin = {
               if (transportCtx._ran) return;
               transportCtx._ran = true;
               try {
-                transportCtx.deferredTask();
-              } catch (_) {}
+                transportCtx.deferredTask?.();
+              } catch (err) {
+                this._debugSafe(err);
+              }
             };
             if (res.writableFinished) {
               setImmediate(triggerDeferred);
@@ -558,7 +816,7 @@ const serverRuntimeMixin = {
           } else {
             writeHttpJson(res, 200, reply);
           }
-        } catch (err) {
+        } catch (/** @type {any} */ err) {
           if (err && (err.statusCode === 413 || err.code === "ERR_HTTP_BODY_TOO_LARGE")) {
             writeHttpJson(res, 413, buildFailedActionReply(1413, err.message));
             return;
@@ -574,17 +832,17 @@ const serverRuntimeMixin = {
     }
 
     // 2. Start Forward WebSocket Server(s)
-    for (const wsCfg of this.config.wsServers || []) {
+    for (const wsCfg of this.config?.wsServers || []) {
       const baseActionContext = buildEndpointActionContext(wsCfg, globalMsgFormat);
       const srv = http.createServer((_req, res) => {
         res.writeHead(426);
         res.end("Upgrade Required");
       });
       srv.on("upgrade", (req, socket, head) => {
-        socket.on("error", () => {});
+        socket.on("error", (err) => this._debugSafe(err));
 
         const originRes = checkOriginHeader(req, {
-          allowedOrigins: wsCfg.allowedOrigins || this.config.allowedOrigins || [],
+          allowedOrigins: wsCfg.allowedOrigins || this.config?.allowedOrigins || [],
         });
         if (!originRes.allowed) {
           socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
@@ -592,10 +850,13 @@ const serverRuntimeMixin = {
           return;
         }
 
+        /** @type {URL | null} */
         let u = null;
         try {
           u = new URL(req.url || "/", "http://127.0.0.1");
-        } catch (_) {}
+        } catch (urlErr) {
+          this._debugSafe(urlErr);
+        }
 
         if (!this._checkAuth(req, wsCfg.accessToken, u)) {
           socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
@@ -624,24 +885,29 @@ const serverRuntimeMixin = {
             "",
           ].join("\r\n")
         );
-        const conn = new Rfc6455Connection(socket, {
-          isClient: false,
-          maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
-          maxSendBufferBytes:
-            this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
-          allowUnmaskedClientFrames: Boolean(this.config.allowUnmaskedClientFrames),
-        });
+        const conn = /** @type {any} */ (
+          new Rfc6455Connection(socket, {
+            isClient: false,
+            maxPayloadBytes: this.config?.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
+            maxSendBufferBytes:
+              this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
+            allowUnmaskedClientFrames: Boolean(this.config?.allowUnmaskedClientFrames),
+          })
+        );
         const wsRole = classifyForwardWsRole(u ? u.pathname : "/");
         conn._wsRole = wsRole;
         conn.reportSelfMessage = Boolean(wsCfg.reportSelfMessage);
         conn._messageFormat = baseActionContext.messageFormat;
         this._wsServerClients.add(conn);
 
-        conn.on("error", () => {
+        conn.on("error", (/** @type {any} */ connErr) => {
+          this._debugSafe(connErr);
           this._wsServerClients.delete(conn);
           try {
             socket.destroy();
-          } catch (_) {}
+          } catch (destroyErr) {
+            this._debugSafe(destroyErr);
+          }
         });
         conn.on("close", () => {
           this._wsServerClients.delete(conn);
@@ -649,16 +915,17 @@ const serverRuntimeMixin = {
 
         if (wsRole !== "api") {
           conn.sendJson(
-            formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
+            formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.bridge.selfUin })
           );
         }
 
-        conn.on("message", (text) => {
+        conn.on("message", (/** @type {any} */ text) => {
           if (wsRole === "event") {
             let payload = null;
             try {
               payload = typeof text === "string" ? JSON.parse(text) : text;
-            } catch (_) {
+            } catch (parseErr) {
+              this._debugSafe(parseErr);
               return;
             }
             if (
@@ -675,7 +942,9 @@ const serverRuntimeMixin = {
                     payload.echo
                   )
                 );
-              } catch (_) {}
+              } catch (sendErr) {
+                this._debugSafe(sendErr);
+              }
             }
             return;
           }
@@ -699,29 +968,29 @@ const serverRuntimeMixin = {
     }
 
     // 3. Start Reverse WebSocket Client(s)
-    for (const clientCfg of this.config.wsClients || []) {
+    for (const clientCfg of this.config?.wsClients || []) {
       if (!clientCfg.url) continue;
       this._startReverseWsLoop(clientCfg);
     }
 
     // 4. Start Heartbeat Timer
-    if (!this._heartbeatTimer && this.config.heartbeatIntervalMs > 0) {
+    if (!this._heartbeatTimer && this.config?.heartbeatIntervalMs > 0) {
       this._heartbeatTimer = setInterval(() => {
-        this.broadcastOneBotEvent(
+        this.bridge.broadcastOneBotEvent?.(
           formatMetaEvent(
             "heartbeat",
             {
               status: {
-                online: this.online,
-                good: this.online,
+                online: this.bridge.online,
+                good: this.bridge.online,
                 time: Math.max(
                   0,
-                  Math.floor((Date.now() - (this.startedAtMs || Date.now())) / 1000)
+                  Math.floor((Date.now() - (this.bridge.startedAtMs || Date.now())) / 1000)
                 ),
               },
               interval: this.config.heartbeatIntervalMs,
             },
-            { selfId: this.selfUin }
+            { selfId: this.bridge.selfUin }
           )
         );
       }, this.config.heartbeatIntervalMs);
@@ -743,7 +1012,7 @@ const serverRuntimeMixin = {
       );
       this._wsPingTimer = setInterval(() => {
         const now = Date.now();
-        const serverClients = this._wsServerClients || this.wsClients;
+        const serverClients = this._wsServerClients || this.bridge.wsClients;
         if (serverClients) {
           for (const conn of Array.from(serverClients)) {
             if (!conn || conn.closed || conn._closed) {
@@ -758,7 +1027,7 @@ const serverRuntimeMixin = {
             }
           }
         }
-        const revClients = this._reverseWsClients || this.reverseWsClients;
+        const revClients = this._reverseWsClients || this.bridge.reverseWsClients;
         if (Array.isArray(revClients)) {
           for (const rc of revClients) {
             const conn = rc?.conn;
@@ -776,13 +1045,15 @@ const serverRuntimeMixin = {
 
     // 6. Install SIGHUP hot-reload handler (POSIX only)
     this._installSighupHandler();
-  },
+  }
 
+  /** @param {Record<string, any>} clientCfg */
   _startReverseWsLoop(clientCfg) {
     const baseActionContext = buildEndpointActionContext(
       clientCfg,
-      this.config.messageFormat || "array"
+      this.config?.messageFormat || "array"
     );
+    /** @type {any} */
     const entry = {
       cfg: clientCfg,
       conn: null,
@@ -803,7 +1074,8 @@ const serverRuntimeMixin = {
         entry.timer = null;
       }
       entry.connecting = true;
-      const currentSelfId = sanitizeHeaderValue(String(this.selfUin || "0"));
+      const currentSelfId = sanitizeHeaderValue(String(this.bridge.selfUin || "0"));
+      /** @type {Record<string, string>} */
       const headers = {
         "X-Self-ID": currentSelfId,
         "X-Client-Role": sanitizeHeaderValue(clientCfg.role || "Universal"),
@@ -815,16 +1087,16 @@ const serverRuntimeMixin = {
       entry.handle = connectReverseWebSocket(
         clientCfg.url,
         headers,
-        (conn) => {
+        (/** @type {any} */ conn) => {
           entry.connecting = false;
           entry.conn = conn;
           entry.connectedSelfId = currentSelfId;
           conn._messageFormat = entry.messageFormat;
           conn.sendJson(
-            formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.selfUin })
+            formatMetaEvent("lifecycle", { sub_type: "connect" }, { selfId: this.bridge.selfUin })
           );
         },
-        (text, conn) => {
+        (/** @type {any} */ text, /** @type {any} */ conn) => {
           this._handleWsActionMessage(
             text,
             (reply) => conn.sendJson(reply),
@@ -852,7 +1124,7 @@ const serverRuntimeMixin = {
           }
         },
         {
-          maxPayloadBytes: this.config.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
+          maxPayloadBytes: this.config?.maxWsPayloadBytes || DEFAULT_MAX_WS_PAYLOAD_BYTES,
           maxSendBufferBytes:
             this.config?.maxWsSendBufferBytes || DEFAULT_MAX_WS_SEND_BUFFER_BYTES,
         }
@@ -860,11 +1132,16 @@ const serverRuntimeMixin = {
     };
 
     connectOnce();
-  },
+  }
 
+  /**
+   * @param {any} event
+   * @returns {Promise<any>[]}
+   */
   _dispatchHttpWebhookEvent(event) {
     const clients = this.config?.httpClients;
     if (!Array.isArray(clients) || clients.length === 0) return [];
+    /** @type {Promise<any>[]} */
     const tasks = [];
     for (const clientCfg of clients) {
       if (!clientCfg || clientCfg.enable === false || clientCfg.enabled === false) continue;
@@ -880,7 +1157,7 @@ const serverRuntimeMixin = {
       tasks.push(
         this._enqueueWebhookDelivery(clientCfg, event).catch((err) => {
           const warnKey = `webhook-err:${clientCfg.name || clientCfg.url}`;
-          this._logWarn?.(
+          this.bridge._logWarn?.(
             warnKey,
             `HTTP POST webhook delivery failed (${clientCfg.url}): ${err?.message || err}`,
             60000
@@ -889,8 +1166,13 @@ const serverRuntimeMixin = {
       );
     }
     return tasks;
-  },
+  }
 
+  /**
+   * @param {Record<string, any>} clientCfg
+   * @param {any} event
+   * @returns {Promise<any>}
+   */
   _enqueueWebhookDelivery(clientCfg, event) {
     const stats = this._ensureWebhookState();
     const rawMaxConc = Number(this.config?.webhookMaxConcurrency);
@@ -903,7 +1185,7 @@ const serverRuntimeMixin = {
     if (stats.inFlight >= maxConcurrency && this._webhookQueue.length >= maxQueueSize) {
       stats.dropped += 1;
       stats.queued = this._webhookQueue.length;
-      this._logWarn?.(
+      this.bridge._logWarn?.(
         `webhook-queue-full:${clientCfg.name || clientCfg.url}`,
         `HTTP POST webhook queue full (max=${maxQueueSize}); dropping event for ${clientCfg.url}`,
         30000
@@ -916,7 +1198,7 @@ const serverRuntimeMixin = {
       stats.queued = this._webhookQueue.length;
       this._drainWebhookQueue();
     });
-  },
+  }
 
   _drainWebhookQueue() {
     const stats = this._ensureWebhookState();
@@ -940,14 +1222,20 @@ const serverRuntimeMixin = {
           this._drainWebhookQueue();
         });
     }
-  },
+  }
 
+  /**
+   * @param {number} delayMs
+   * @param {number} generation
+   * @returns {Promise<boolean>}
+   */
   _waitWebhookRetry(delayMs, generation) {
     return new Promise((resolve) => {
       if (generation !== this._webhookGeneration) {
         resolve(false);
         return;
       }
+      /** @type {{ timer: ReturnType<typeof setTimeout> | null, cancel: () => void }} */
       const entry = {
         timer: null,
         cancel: () => {
@@ -969,8 +1257,14 @@ const serverRuntimeMixin = {
       }
       this._webhookRetryTimers.add(entry);
     });
-  },
+  }
 
+  /**
+   * @param {Record<string, any>} clientCfg
+   * @param {any} event
+   * @param {number} generation
+   * @returns {Promise<any>}
+   */
   async _runWebhookTaskWithRetry(clientCfg, event, generation) {
     const stats = this._ensureWebhookState();
     const rawMaxRetries =
@@ -1015,11 +1309,12 @@ const serverRuntimeMixin = {
           continue;
         }
         stats.failed += 1;
+        /** @type {Error & { statusCode?: number, _webhookFinalized?: boolean }} */
         const statusErr = new Error(`Webhook HTTP ${resp.statusCode}`);
         statusErr.statusCode = resp.statusCode;
         statusErr._webhookFinalized = true;
         throw statusErr;
-      } catch (err) {
+      } catch (/** @type {any} */ err) {
         if (generation !== this._webhookGeneration) {
           return null;
         }
@@ -1039,7 +1334,7 @@ const serverRuntimeMixin = {
       }
     }
     return null;
-  },
+  }
 
   _clearWebhookRuntime() {
     const stats = this._ensureWebhookState();
@@ -1047,29 +1342,41 @@ const serverRuntimeMixin = {
     for (const entry of Array.from(this._webhookRetryTimers)) {
       try {
         entry.cancel();
-      } catch (_) {}
+      } catch (err) {
+        this._debugSafe(err);
+      }
     }
     this._webhookRetryTimers.clear();
     while (this._webhookQueue.length > 0) {
       const pending = this._webhookQueue.shift();
       try {
         pending.resolve(null);
-      } catch (_) {}
+      } catch (err) {
+        this._debugSafe(err);
+      }
     }
     stats.queued = 0;
     for (const req of Array.from(this._activeWebhookReqs)) {
       try {
         req.destroy();
-      } catch (_) {}
+      } catch (err) {
+        this._debugSafe(err);
+      }
     }
     this._activeWebhookReqs.clear();
-  },
+  }
 
+  /**
+   * @param {Record<string, any>} clientCfg
+   * @param {any} event
+   * @returns {Promise<{ statusCode: number, bodyText: string } | null>}
+   */
   async _postEventToHttpClient(clientCfg, event) {
     let parsedUrl;
     try {
       parsedUrl = new URL(String(clientCfg.url));
-    } catch (_) {
+    } catch (urlErr) {
+      this._debugSafe(urlErr);
       return null;
     }
     if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
@@ -1079,20 +1386,25 @@ const serverRuntimeMixin = {
     const defaultFormat = this.config?.messageFormat || "array";
     const targetFormat = clientCfg.messageFormat || defaultFormat;
     const formatted =
-      typeof this._formatEventForEndpoint === "function"
-        ? this._formatEventForEndpoint(event, targetFormat)
+      typeof this.bridge._formatEventForEndpoint === "function"
+        ? this.bridge._formatEventForEndpoint(event, targetFormat)
         : event;
     const bodyBuf = Buffer.from(JSON.stringify(formatted), "utf8");
+    /** @type {Record<string, string>} */
     const headers = {
       "Content-Type": "application/json; charset=utf-8",
       "Content-Length": String(bodyBuf.length),
-      "X-Self-ID": sanitizeHeaderValue(String(formatted?.self_id || this.selfUin || "0")),
+      "X-Self-ID": sanitizeHeaderValue(String(formatted?.self_id || this.bridge.selfUin || "0")),
       "User-Agent": "OneBot/11 Rosmontis/1.0.0",
     };
     if (clientCfg.accessToken) {
       headers["Authorization"] = `Bearer ${sanitizeHeaderValue(clientCfg.accessToken)}`;
     }
-    if (clientCfg.secret !== undefined && clientCfg.secret !== null && String(clientCfg.secret) !== "") {
+    if (
+      clientCfg.secret !== undefined &&
+      clientCfg.secret !== null &&
+      String(clientCfg.secret) !== ""
+    ) {
       const sig = crypto
         .createHmac("sha1", String(clientCfg.secret))
         .update(bodyBuf)
@@ -1109,8 +1421,13 @@ const serverRuntimeMixin = {
       this._activeWebhookReqs = new Set();
     }
 
+    /** @type {{ statusCode: number, bodyText: string }} */
     const resp = await new Promise((resolve, reject) => {
       let settled = false;
+      /**
+       * @param {any} err
+       * @param {any} [val]
+       */
       const finish = (err, val) => {
         if (settled) return;
         settled = true;
@@ -1127,6 +1444,7 @@ const serverRuntimeMixin = {
           timeout: timeoutMs,
         },
         (res) => {
+          /** @type {Buffer[]} */
           const chunks = [];
           let total = 0;
           let overflow = false;
@@ -1172,13 +1490,15 @@ const serverRuntimeMixin = {
       let quickOp = null;
       try {
         quickOp = JSON.parse(resp.bodyText);
-      } catch (_) {}
+      } catch (parseErr) {
+        this._debugSafe(parseErr);
+      }
       if (
         hasMeaningfulQuickOperation(quickOp) &&
         (formatted.post_type === "message" || formatted.post_type === "request")
       ) {
         const actionContext = buildEndpointActionContext(clientCfg, defaultFormat);
-        await this.handleOneBotAction(
+        await this.bridge.handleOneBotAction(
           ".handle_quick_operation",
           { context: formatted, operation: quickOp },
           undefined,
@@ -1187,7 +1507,7 @@ const serverRuntimeMixin = {
       }
     }
     return resp;
-  },
+  }
 
   async _stopNetworkRuntime() {
     this._removeSighupHandler();
@@ -1217,6 +1537,7 @@ const serverRuntimeMixin = {
     for (const srv of serversToClose) {
       await new Promise((resolve) => {
         let done = false;
+        /** @type {ReturnType<typeof setTimeout> | null} */
         let forceTimer = null;
         const finish = () => {
           if (done) return;
@@ -1225,14 +1546,16 @@ const serverRuntimeMixin = {
             clearTimeout(forceTimer);
             forceTimer = null;
           }
-          resolve();
+          resolve(undefined);
         };
         forceTimer = setTimeout(() => {
           try {
             if (typeof srv.closeAllConnections === "function") {
               srv.closeAllConnections();
             }
-          } catch (_) {}
+          } catch (err) {
+            this._debugSafe(err);
+          }
           finish();
         }, 2000);
         if (typeof forceTimer.unref === "function") {
@@ -1243,48 +1566,57 @@ const serverRuntimeMixin = {
           if (typeof srv.closeIdleConnections === "function") {
             srv.closeIdleConnections();
           }
-        } catch (_) {
+        } catch (err) {
+          this._debugSafe(err);
           finish();
         }
       });
     }
     this._clearWebhookRuntime();
-  },
+  }
 
+  /**
+   * @param {Record<string, any>} [options={}]
+   * @returns {Promise<ReloadConfigResult>}
+   */
   async reloadConfig(options = {}) {
     const opts = options && typeof options === "object" ? options : {};
     const prevChain = this._reloadChain || Promise.resolve();
-    let releaseMain;
+    /** @type {() => void} */
+    let releaseMain = () => {};
     const mainDone = new Promise((resolve) => {
-      releaseMain = resolve;
+      releaseMain = () => resolve(undefined);
     });
-    let resolveDeferredDone;
+    /** @type {() => void} */
+    let resolveDeferredDone = () => {};
     const deferredGate = new Promise((resolve) => {
-      resolveDeferredDone = resolve;
+      resolveDeferredDone = () => resolve(undefined);
     });
 
     const transportCtx = this._getTransportAls().getStore() || null;
 
     this._reloadChain = prevChain
-      .catch(() => {})
+      .catch((err) => this._debugSafe(err))
       .then(() => mainDone)
       .then(() => deferredGate);
 
-    await prevChain.catch(() => {});
+    await prevChain.catch((err) => this._debugSafe(err));
 
     try {
       const prevConfig = this.config || {};
       const nextConfig =
         opts.config && typeof opts.config === "object"
           ? opts.config
-          : loadBridgeConfig(opts.configDir !== undefined ? opts.configDir : this._configDir);
+          : loadBridgeConfig(
+              opts.configDir !== undefined ? opts.configDir : this.bridge._configDir
+            );
 
       const diff = computeConfigDiff(prevConfig, nextConfig);
       const needNetworkRestart = Boolean(opts.restartServers) || diff.networkChanged;
 
-      this.config = nextConfig;
-      if (this.rateLimiter && typeof this.rateLimiter.updateConfig === "function") {
-        this.rateLimiter.updateConfig(nextConfig.rateLimit);
+      this.bridge.config = nextConfig;
+      if (this.bridge.rateLimiter && typeof this.bridge.rateLimiter.updateConfig === "function") {
+        this.bridge.rateLimiter.updateConfig(nextConfig.rateLimit);
       }
       this._syncSighupHandler();
 
@@ -1300,10 +1632,11 @@ const serverRuntimeMixin = {
       }
 
       if (transportCtx) {
-        let fireTrigger;
+        /** @type {() => void} */
+        let fireTrigger = () => {};
         let cancelled = false;
         const triggerPromise = new Promise((resolve) => {
-          fireTrigger = resolve;
+          fireTrigger = () => resolve(undefined);
         });
         const cancelPending = () => {
           cancelled = true;
@@ -1322,8 +1655,8 @@ const serverRuntimeMixin = {
             await this._stopNetworkRuntime();
             if (cancelled || this._stopped) return;
             await this.startServers();
-          } catch (err) {
-            this._logWarn?.(
+          } catch (/** @type {any} */ err) {
+            this.bridge._logWarn?.(
               "reload-restart-err",
               `Deferred network reload failed: ${err?.message || err}`,
               5000
@@ -1366,7 +1699,7 @@ const serverRuntimeMixin = {
     } finally {
       releaseMain();
     }
-  },
+  }
 
   async stopServers() {
     this._stopped = true;
@@ -1374,28 +1707,110 @@ const serverRuntimeMixin = {
       for (const cancel of Array.from(this._pendingDeferredReloadCancels)) {
         try {
           cancel();
-        } catch (_) {}
+        } catch (err) {
+          this._debugSafe(err);
+        }
       }
       this._pendingDeferredReloadCancels.clear();
     }
-    this._aioInteractionSeq += 1;
-    this._clearIdleTimers();
-    this._sessionScheduler.dispose();
-    if (this.echoCorrelator && typeof this.echoCorrelator.clear === "function") {
-      this.echoCorrelator.clear();
+    if (typeof this.bridge._aioInteractionSeq === "number") {
+      this.bridge._aioInteractionSeq += 1;
     }
-    this._rejectPendingRendererCmds(null, "bridge servers stopped");
+    this.bridge._clearIdleTimers?.();
+    this.bridge._sessionScheduler?.dispose?.();
+    if (this.bridge.echoCorrelator && typeof this.bridge.echoCorrelator.clear === "function") {
+      this.bridge.echoCorrelator.clear();
+    }
+    this.bridge._rejectPendingRendererCmds?.(null, "bridge servers stopped");
     await this._stopNetworkRuntime();
-    if (typeof this.flushStateStores === "function") {
+    if (typeof this.bridge.flushStateStores === "function") {
       try {
-        await this.flushStateStores();
-      } catch (_) {}
+        await this.bridge.flushStateStores();
+      } catch (err) {
+        this._debugSafe(err);
+      }
     }
-    this.flushTempCleanup();
-  },
-};
+    this.bridge.flushTempCleanup?.();
+  }
+}
+
+/**
+ * Resolves or lazily binds a `ServerRuntime` for legacy `serverRuntimeMixin` hosts.
+ * @param {any} host
+ * @returns {ServerRuntime}
+ */
+function _resolveLegacyServerRuntime(host) {
+  if (host instanceof ServerRuntime) return host;
+  if (host && host.serverRuntime instanceof ServerRuntime) return host.serverRuntime;
+  if (host && host[LEGACY_SERVER_CTRL_SYM] instanceof ServerRuntime) {
+    return host[LEGACY_SERVER_CTRL_SYM];
+  }
+  const ctrl = new ServerRuntime(host);
+  if (host && typeof host === "object") {
+    Object.defineProperty(host, LEGACY_SERVER_CTRL_SYM, {
+      value: ctrl,
+      enumerable: false,
+      configurable: true,
+    });
+    for (const key of LEGACY_SERVER_STATE_KEYS) {
+      const desc = Object.getOwnPropertyDescriptor(host, key);
+      if (!desc || ("value" in desc && desc.configurable !== false)) {
+        Object.defineProperty(host, key, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            return /** @type {any} */ (ctrl)[key];
+          },
+          set(val) {
+            /** @type {any} */ (ctrl)[key] = val;
+          },
+        });
+      }
+    }
+  }
+  return ctrl;
+}
+
+const SERVER_RUNTIME_METHODS = /** @type {const} */ ([
+  "_checkAuth",
+  "_recordListenError",
+  "_listenServerInstance",
+  "_getTransportAls",
+  "_ensureWebhookState",
+  "_computeReadiness",
+  "_formatPrometheusMetrics",
+  "_installSighupHandler",
+  "_removeSighupHandler",
+  "_syncSighupHandler",
+  "_handleWsActionMessage",
+  "startServers",
+  "_startReverseWsLoop",
+  "_dispatchHttpWebhookEvent",
+  "_enqueueWebhookDelivery",
+  "_drainWebhookQueue",
+  "_waitWebhookRetry",
+  "_runWebhookTaskWithRetry",
+  "_clearWebhookRuntime",
+  "_postEventToHttpClient",
+  "_stopNetworkRuntime",
+  "reloadConfig",
+  "stopServers",
+]);
+
+/**
+ * Backward-compatible mixin facade delegating to `ServerRuntime`.
+ * @type {Record<string, (...args: any[]) => any>}
+ */
+const serverRuntimeMixin = {};
+for (const methodName of SERVER_RUNTIME_METHODS) {
+  serverRuntimeMixin[methodName] = function (/** @type {any[]} */ ...args) {
+    const ctrl = _resolveLegacyServerRuntime(this);
+    return /** @type {any} */ (ctrl)[methodName](...args);
+  };
+}
 
 module.exports = {
+  ServerRuntime,
   serverRuntimeMixin,
   writeHttpJson,
   buildEndpointActionContext,

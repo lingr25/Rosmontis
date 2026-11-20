@@ -1,10 +1,13 @@
+// @ts-check
 "use strict";
 
 /**
  * Inbound Kernel Event Routing, UID Resolution & Per-Peer Concurrency Pipeline (`src/core/inbound_pipeline.js`)
  *
- * Composes `mediaHydratorMixin` (`./media_hydrator`) and `loginRecoveryMixin` (`./login_recovery`)
- * into `inboundPipelineMixin` for seamless attachment onto `NtqqOneBotBridge.prototype`.
+ * Composed controller (`InboundPipeline`) coordinating incoming NTQQ kernel events,
+ * per-peer causal message ordering with bounded cross-peer media hydration concurrency,
+ * UID->UIN resolution, `mediaHydratorMixin` (`./media_hydrator`), and
+ * `loginRecoveryMixin` (`./login_recovery`).
  */
 
 const bridgeOnebot = require("../bridge_onebot");
@@ -15,11 +18,15 @@ const {
   formatRequestEvent,
 } = bridgeOnebot;
 const { isPrefixedEnvFlagOne } = require("./env");
-const { setBoundedMap } = require("./primitives");
+const { BoundedMap, setBoundedMap } = require("./primitives");
 const { pickPositiveUin } = require("./nt_normalizer");
 const { mediaHydratorMixin, stripTransientMedia } = require("./media_hydrator");
 const { loginRecoveryMixin } = require("./login_recovery");
 
+/**
+ * @param {any} v
+ * @returns {boolean}
+ */
 function _isPositiveUin(v) {
   return (
     v != null &&
@@ -31,11 +38,19 @@ function _isPositiveUin(v) {
   );
 }
 
+/**
+ * @param {...any} candidates
+ * @returns {string}
+ */
 function _pickPositiveUin(...candidates) {
   const picked = pickPositiveUin(...candidates);
   return picked > 0 ? String(picked) : "";
 }
 
+/**
+ * @param {any} ntMsg
+ * @returns {boolean}
+ */
 function _isRecallMsg(ntMsg) {
   if (!ntMsg || typeof ntMsg !== "object") return false;
   if (ntMsg.recallTime && String(ntMsg.recallTime) !== "0" && Number(ntMsg.recallTime) > 0) {
@@ -44,16 +59,20 @@ function _isRecallMsg(ntMsg) {
   if (
     Number(ntMsg.msgType) === 5 &&
     Array.isArray(ntMsg.elements) &&
-    ntMsg.elements.some((e) => Boolean(e?.grayTipElement?.revokeElement))
+    ntMsg.elements.some((/** @type {any} */ e) => Boolean(e?.grayTipElement?.revokeElement))
   ) {
     return true;
   }
   return false;
 }
 
+/**
+ * @param {any} templParam
+ * @param {string[]} out
+ */
 function _collectTemplParamUids(templParam, out) {
   if (!templParam) return;
-  const checkPair = (k, v) => {
+  const checkPair = (/** @type {any} */ k, /** @type {any} */ v) => {
     const keyStr = String(k || "");
     if (
       (keyStr === "uid_str1" ||
@@ -86,24 +105,304 @@ function _collectTemplParamUids(templParam, out) {
   }
 }
 
-const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecoveryMixin, {
+const LEGACY_INBOUND_CTRL_SYM = Symbol("rosmontisLegacyInboundPipeline");
+const LEGACY_INBOUND_STATE_KEYS = Object.freeze([
+  "_pttTextWaiters",
+  "_richMediaWaiters",
+  "_groupNotifiesCache",
+  "_buddyReqsCache",
+  "_groupListCache",
+  "_buddyCategoriesCache",
+  "_groupListWaiters",
+  "_qrCodeWaiters",
+  "_buddyListWaiters",
+  "_profileDetailWaiters",
+  "_doubtBuddyWaiters",
+  "_recentSentMsgByPeer",
+  "_inboundMediaActive",
+  "_inboundMediaWaiters",
+  "_inboundPeerChains",
+  "_emojiLikesSnapshot",
+  "_memberCardCache",
+  "_autoQuickLoginAttempts",
+  "_lastAutoQuickLoginAt",
+]);
+
+/**
+ * Composed inbound kernel event routing, media hydration & login recovery pipeline.
+ */
+class InboundPipeline {
+  /**
+   * @param {any} [bridge]
+   */
+  constructor(bridge = {}) {
+    /** @type {any} */
+    this.bridge = bridge || {};
+    /** @type {Map<string, any>} */
+    this._pttTextWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_pttTextWaiters") &&
+      this.bridge._pttTextWaiters instanceof Map
+        ? this.bridge._pttTextWaiters
+        : new Map();
+    /** @type {Map<string, Set<any>>} */
+    this._richMediaWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_richMediaWaiters") &&
+      this.bridge._richMediaWaiters instanceof Map
+        ? this.bridge._richMediaWaiters
+        : new Map();
+    /** @type {Map<string, any>} */
+    this._groupNotifiesCache =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_groupNotifiesCache") &&
+      this.bridge._groupNotifiesCache instanceof Map
+        ? this.bridge._groupNotifiesCache
+        : new BoundedMap(2000);
+    /** @type {Map<string, any>} */
+    this._buddyReqsCache =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_buddyReqsCache") &&
+      this.bridge._buddyReqsCache instanceof Map
+        ? this.bridge._buddyReqsCache
+        : new BoundedMap(2000);
+    /** @type {Map<string, any>} */
+    this._groupListCache =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_groupListCache") &&
+      this.bridge._groupListCache instanceof Map
+        ? this.bridge._groupListCache
+        : new BoundedMap(2000);
+    /** @type {any[]} */
+    this._buddyCategoriesCache =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_buddyCategoriesCache") &&
+      Array.isArray(this.bridge._buddyCategoriesCache)
+        ? this.bridge._buddyCategoriesCache
+        : [];
+    /** @type {Set<any>} */
+    this._groupListWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_groupListWaiters") &&
+      this.bridge._groupListWaiters instanceof Set
+        ? this.bridge._groupListWaiters
+        : new Set();
+    /** @type {Set<any>} */
+    this._qrCodeWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_qrCodeWaiters") &&
+      this.bridge._qrCodeWaiters instanceof Set
+        ? this.bridge._qrCodeWaiters
+        : new Set();
+    /** @type {Set<any>} */
+    this._buddyListWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_buddyListWaiters") &&
+      this.bridge._buddyListWaiters instanceof Set
+        ? this.bridge._buddyListWaiters
+        : new Set();
+    /** @type {Map<string, Set<any>>} */
+    this._profileDetailWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_profileDetailWaiters") &&
+      this.bridge._profileDetailWaiters instanceof Map
+        ? this.bridge._profileDetailWaiters
+        : new Map();
+    /** @type {Set<any>} */
+    this._doubtBuddyWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_doubtBuddyWaiters") &&
+      this.bridge._doubtBuddyWaiters instanceof Set
+        ? this.bridge._doubtBuddyWaiters
+        : new Set();
+    /** @type {Map<string, any>} */
+    this._recentSentMsgByPeer =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_recentSentMsgByPeer") &&
+      this.bridge._recentSentMsgByPeer instanceof Map
+        ? this.bridge._recentSentMsgByPeer
+        : new BoundedMap(2000);
+    /** @type {number} */
+    this._inboundMediaActive = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_inboundMediaActive"
+    )
+      ? Number(this.bridge._inboundMediaActive) || 0
+      : 0;
+    /** @type {Array<() => void>} */
+    this._inboundMediaWaiters =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_inboundMediaWaiters") &&
+      Array.isArray(this.bridge._inboundMediaWaiters)
+        ? this.bridge._inboundMediaWaiters
+        : [];
+    /** @type {Map<string, Promise<void>>} */
+    this._inboundPeerChains =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_inboundPeerChains") &&
+      this.bridge._inboundPeerChains instanceof Map
+        ? this.bridge._inboundPeerChains
+        : new Map();
+    /** @type {Map<string, string>} */
+    this._emojiLikesSnapshot =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_emojiLikesSnapshot") &&
+      this.bridge._emojiLikesSnapshot instanceof Map
+        ? this.bridge._emojiLikesSnapshot
+        : new Map();
+    /** @type {Map<string, string>} */
+    this._memberCardCache =
+      Object.prototype.hasOwnProperty.call(this.bridge, "_memberCardCache") &&
+      this.bridge._memberCardCache instanceof Map
+        ? this.bridge._memberCardCache
+        : new Map();
+    /** @type {number} */
+    this._autoQuickLoginAttempts = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_autoQuickLoginAttempts"
+    )
+      ? Number(this.bridge._autoQuickLoginAttempts) || 0
+      : 0;
+    /** @type {number} */
+    this._lastAutoQuickLoginAt = Object.prototype.hasOwnProperty.call(
+      this.bridge,
+      "_lastAutoQuickLoginAt"
+    )
+      ? Number(this.bridge._lastAutoQuickLoginAt) || 0
+      : 0;
+  }
+
+  /** @returns {any} */
+  get config() {
+    return this.bridge.config;
+  }
+
+  /** @returns {any} */
+  get logger() {
+    return this.bridge.logger;
+  }
+
+  /** @returns {any} */
+  get messageIdStore() {
+    return this.bridge.messageIdStore;
+  }
+
+  /** @returns {any} */
+  get uinUidStore() {
+    return this.bridge.uinUidStore;
+  }
+
+  /** @returns {string} */
+  get selfUin() {
+    return this.bridge.selfUin;
+  }
+
+  /** @param {string} v */
+  set selfUin(v) {
+    this.bridge.selfUin = v;
+  }
+
+  /** @returns {string} */
+  get selfUid() {
+    return this.bridge.selfUid;
+  }
+
+  /** @param {string} v */
+  set selfUid(v) {
+    this.bridge.selfUid = v;
+  }
+
+  /** @returns {string} */
+  get selfNickname() {
+    return this.bridge.selfNickname;
+  }
+
+  /** @param {string} v */
+  set selfNickname(v) {
+    this.bridge.selfNickname = v;
+  }
+
+  /** @returns {boolean} */
+  get online() {
+    return Boolean(this.bridge.online);
+  }
+
+  /** @param {boolean} v */
+  set online(v) {
+    this.bridge.online = Boolean(v);
+  }
+
+  /** @returns {string} */
+  get lastQrCodeBase64() {
+    return this.bridge.lastQrCodeBase64;
+  }
+
+  /** @param {string} v */
+  set lastQrCodeBase64(v) {
+    this.bridge.lastQrCodeBase64 = v;
+  }
+
+  /** @returns {any} */
+  get activeWebContents() {
+    return this.bridge.activeWebContents;
+  }
+
+  /** @returns {any} */
+  get capturedServices() {
+    return this.bridge.capturedServices;
+  }
+
+  /** @returns {any} */
+  get rendererExecute() {
+    return this.bridge.rendererExecute;
+  }
+
+  /** @returns {any} */
+  get ntCall() {
+    return this.bridge.ntCall;
+  }
+
+  /**
+   * @param {string} cmd
+   * @param {any} [payload]
+   * @param {any[] | null} [positionalArgs]
+   * @param {any} [invokeOptions]
+   */
+  invokeNt(cmd, payload, positionalArgs, invokeOptions) {
+    return this.bridge.invokeNt?.(cmd, payload, positionalArgs, invokeOptions);
+  }
+
+  /** @param {Record<string, any>} [identity] */
+  _updateSelfIdentity(identity) {
+    return this.bridge._updateSelfIdentity?.(identity);
+  }
+
+  /** @param {Record<string, any>} [opts] */
+  _resetHumanSessionState(opts) {
+    return this.bridge._resetHumanSessionState?.(opts);
+  }
+
+  /** @param {any} wc */
+  _isWebContentsAlive(wc) {
+    if (typeof this.bridge._isWebContentsAlive === "function") {
+      return this.bridge._isWebContentsAlive(wc);
+    }
+    return Boolean(wc && (typeof wc.isDestroyed !== "function" || !wc.isDestroyed()));
+  }
+
+  /** @param {any} url */
+  _isTrustedRendererUrl(url) {
+    if (typeof this.bridge._isTrustedRendererUrl === "function") {
+      return this.bridge._isTrustedRendererUrl(url);
+    }
+    return true;
+  }
+
+  /** @param {any} v */
   _isPositiveUin(v) {
     return _isPositiveUin(v);
-  },
+  }
 
+  /** @returns {boolean} */
   _isNtReady() {
-    if (this.dispatcher !== undefined) {
-      return Boolean(this.dispatcher?.ready);
+    const b = this.bridge;
+    if (b.dispatcher !== undefined) {
+      return Boolean(b.dispatcher?.ready);
     }
-    if (typeof this.rendererExecute === "function") return true;
+    if (typeof b.rendererExecute === "function") return true;
     if (
-      typeof this._canInvokeRenderer === "function" &&
-      this._canInvokeRenderer(this.activeWebContents)
+      typeof b._canInvokeRenderer === "function" &&
+      b._canInvokeRenderer(b.activeWebContents)
     ) {
       return true;
     }
-    if (this.capturedServices) {
-      const cs = this.capturedServices;
+    if (b.capturedServices) {
+      const cs = b.capturedServices;
       if (
         cs.ntApi ||
         cs.wrapperSession ||
@@ -115,25 +414,30 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         return true;
       }
     }
-    if (typeof this.ntCall === "function") return true;
+    if (typeof b.ntCall === "function") return true;
     if (
-      typeof this.invokeNt === "function" &&
-      (!this.capturedServices || Object.prototype.hasOwnProperty.call(this, "invokeNt"))
+      typeof b.invokeNt === "function" &&
+      (!b.capturedServices || Object.prototype.hasOwnProperty.call(b, "invokeNt"))
     ) {
       return true;
     }
     return false;
-  },
+  }
 
+  /** @param {any} ev */
   _dispatchInboundEvent(ev) {
     if (!ev) return;
-    if (typeof this.broadcastOneBotEvent === "function") {
-      this.broadcastOneBotEvent(ev);
-    } else if (typeof this._dispatchEvent === "function") {
-      this._dispatchEvent(ev);
+    if (typeof this.bridge.broadcastOneBotEvent === "function") {
+      this.bridge.broadcastOneBotEvent(ev);
+    } else if (typeof this.bridge._dispatchEvent === "function") {
+      this.bridge._dispatchEvent(ev);
     }
-  },
+  }
 
+  /**
+   * @param {any} uid
+   * @returns {Promise<string>}
+   */
   async _ensureUinForUid(uid) {
     const uidStr = uid != null ? String(uid).trim() : "";
     if (!uidStr || uidStr === "0" || uidStr === "all") return "";
@@ -145,12 +449,12 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
 
     if (typeof this.uinUidStore.resolveUin === "function") {
       const invoker =
-        typeof this.invokeNt === "function"
-          ? this.invokeNt.bind(this)
-          : typeof this.ntCall === "function"
-          ? (cmd, payload) => {
+        typeof this.bridge.invokeNt === "function"
+          ? this.bridge.invokeNt.bind(this.bridge)
+          : typeof this.bridge.ntCall === "function"
+          ? (/** @type {string} */ cmd, /** @type {any} */ payload) => {
               const [service, method] = String(cmd).split("/");
-              return this.ntCall(service, method, [payload]);
+              return this.bridge.ntCall(service, method, [payload]);
             }
           : undefined;
       try {
@@ -163,15 +467,21 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       }
     }
     return "";
-  },
+  }
 
+  /** @param {any} ntMsg */
   async _resolveNtMsgUids(ntMsg) {
     if (!ntMsg || typeof ntMsg !== "object") return;
     this.uinUidStore?.rememberFromNtMsg?.(ntMsg);
 
+    /** @type {Map<string, Array<(uin: string) => void>>} */
     const pendingByUid = new Map();
     let mutated = false;
 
+    /**
+     * @param {any} rawUid
+     * @param {((uin: string) => void) | null} onResolved
+     */
     const queueUid = (rawUid, onResolved) => {
       const uidStr = rawUid != null ? String(rawUid).trim() : "";
       if (!uidStr || uidStr === "0" || uidStr === "all") return;
@@ -194,7 +504,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         pendingByUid.set(uidStr, []);
       }
       if (onResolved) {
-        pendingByUid.get(uidStr).push(onResolved);
+        pendingByUid.get(uidStr)?.push(onResolved);
       }
     };
 
@@ -316,6 +626,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
             }
           }
 
+          /** @type {string[]} */
           const templUids = [];
           _collectTemplParamUids(gt.xmlElement?.templParam, templUids);
           _collectTemplParamUids(gt.jsonGrayTipElement?.templParam, templUids);
@@ -323,7 +634,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
           _collectTemplParamUids(gt.aioOpGrayTipElement?.templParam, templUids);
           const rawTipBody = `${gt.xmlElement?.content || ""}\n${gt.jsonGrayTipElement?.jsonStr || ""}`;
           if (rawTipBody.includes("u_")) {
-            for (const m of rawTipBody.matchAll(/(?:uid(?:_str\d+)?|memberUid|targetUid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi)) {
+            for (const m of rawTipBody.matchAll(
+              /(?:uid(?:_str\d+)?|memberUid|targetUid|jp|col_uid)"?\s*[:=]\s*"?(u_[A-Za-z0-9_-]+)"?/gi
+            )) {
               if (m[1]) templUids.push(m[1]);
             }
           }
@@ -354,12 +667,12 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     if (mutated) {
       this.uinUidStore?.rememberFromNtMsg?.(ntMsg);
     }
-  },
+  }
 
   _getInboundMediaMaxConcurrent() {
     const raw = Number(this.config?.inboundMediaConcurrency || 4);
     return Number.isFinite(raw) && raw >= 1 ? Math.max(1, Math.trunc(raw)) : 4;
-  },
+  }
 
   _acquireInboundMediaSlot() {
     const maxConcurrent = this._getInboundMediaMaxConcurrent();
@@ -374,9 +687,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       return Promise.resolve();
     }
     return new Promise((resolve) => {
-      this._inboundMediaWaiters.push(resolve);
+      this._inboundMediaWaiters.push(() => resolve(undefined));
     });
-  },
+  }
 
   _releaseInboundMediaSlot() {
     if (!Array.isArray(this._inboundMediaWaiters)) {
@@ -387,10 +700,14 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     while (this._inboundMediaActive < maxConcurrent && this._inboundMediaWaiters.length > 0) {
       this._inboundMediaActive += 1;
       const next = this._inboundMediaWaiters.shift();
-      next();
+      next?.();
     }
-  },
+  }
 
+  /**
+   * @param {any} ntMsg
+   * @returns {Promise<void>}
+   */
   _enqueueInboundNtMessage(ntMsg) {
     if (!ntMsg || typeof ntMsg !== "object") {
       return Promise.resolve();
@@ -402,6 +719,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     const peerKey = `${ntMsg?.chatType || 0}:${ntMsg?.peerUid || ""}`;
     const prev = peerChains.get(peerKey) || null;
 
+    /** @type {Promise<void>} */
     let chainEntry;
     const taskPromise = (async () => {
       if (prev) {
@@ -415,23 +733,28 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       }
     })();
 
-    chainEntry = taskPromise.catch(() => {}).finally(() => {
-      if (peerChains.get(peerKey) === chainEntry) {
-        peerChains.delete(peerKey);
-      }
-    });
+    chainEntry = taskPromise
+      .catch((err) => {
+        this.logger?.debug?.("inbound", err);
+      })
+      .finally(() => {
+        if (peerChains.get(peerKey) === chainEntry) {
+          peerChains.delete(peerKey);
+        }
+      });
     peerChains.set(peerKey, chainEntry);
     return taskPromise;
-  },
+  }
 
+  /** @param {any} firstArg */
   _handleAddSendMsgEvent(firstArg) {
     const ntMsg = firstArg?.msgRecord || firstArg;
     if (!ntMsg || typeof ntMsg !== "object" || !ntMsg.msgId) return;
-    if (this._isDuplicateEvent(`send:${ntMsg.msgId}`)) {
+    if (this.bridge._isDuplicateEvent?.(`send:${ntMsg.msgId}`)) {
       return;
     }
-    this._matchSendEcho(ntMsg);
-    this.uinUidStore.rememberFromNtMsg(ntMsg);
+    this.bridge._matchSendEcho?.(ntMsg);
+    this.uinUidStore?.rememberFromNtMsg?.(ntMsg);
     try {
       const ev = formatNtMsgToOneBotEvent(ntMsg, {
         selfId: this.selfUin,
@@ -448,8 +771,12 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     } finally {
       stripTransientMedia(ntMsg);
     }
-  },
+  }
 
+  /**
+   * @param {string} eventName
+   * @param {any} firstArg
+   */
   async _handleMsgInfoUpdateEvent(eventName, firstArg) {
     const msgList = Array.isArray(firstArg)
       ? firstArg
@@ -466,7 +793,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
 
       // Check PTT voice-to-text completion waiters
       if (Array.isArray(ntMsg.elements)) {
-        const pttEl = ntMsg.elements.find((e) => e?.elementType === 4 && e.pttElement)?.pttElement;
+        const pttEl = ntMsg.elements.find(
+          (/** @type {any} */ e) => e?.elementType === 4 && e.pttElement
+        )?.pttElement;
         if (pttEl && pttEl.text && this._pttTextWaiters.has(String(ntMsg.msgId))) {
           const waiter = this._pttTextWaiters.get(String(ntMsg.msgId));
           this._pttTextWaiters.delete(String(ntMsg.msgId));
@@ -480,7 +809,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
             ? String(ntMsg.recallTime)
             : "revoke";
         const dedupKey = `recall:${ntMsg.msgId}:${recallTag}`;
-        if (!this._isDuplicateEvent(dedupKey)) {
+        if (!this.bridge._isDuplicateEvent?.(dedupKey)) {
           await this._resolveNtMsgUids(ntMsg);
           try {
             const ev = formatNtMsgToOneBotEvent(ntMsg, {
@@ -504,9 +833,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       if (ntMsg.msgId) {
         const emojiSig = Array.isArray(ntMsg.emojiLikesList)
           ? ntMsg.emojiLikesList
-              .filter((item) => item && typeof item === "object")
+              .filter((/** @type {any} */ item) => item && typeof item === "object")
               .map(
-                (item) =>
+                (/** @type {any} */ item) =>
                   `${Number(item.emojiType ?? item.emoji_type ?? 1)}:${String(
                     item.emojiId ?? item.emoji_id ?? ""
                   )}:${Number(item.likesCnt ?? item.count ?? 1)}`
@@ -518,7 +847,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         const updateKey = `msgu:${eventName}:${ntMsg.msgId}:${ntMsg.msgSeq || 0}:${
           ntMsg.recallTime || 0
         }:${elCount}:${emojiSig}`;
-        if (this._isDuplicateEvent(updateKey, 3000)) {
+        if (this.bridge._isDuplicateEvent?.(updateKey, 3000)) {
           continue;
         }
       }
@@ -574,8 +903,8 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
             ntMsg.msgId || `${ntMsg.chatType || 0}:${ntMsg.peerUid || ""}:${ntMsg.msgSeq || ""}`
           );
           const likes = ntMsg.emojiLikesList
-            .filter((item) => item && typeof item === "object")
-            .map((item) => ({
+            .filter((/** @type {any} */ item) => item && typeof item === "object")
+            .map((/** @type {any} */ item) => ({
               emoji_id: String(item.emojiId ?? item.emoji_id ?? ""),
               emoji_type: Number(item.emojiType ?? item.emoji_type ?? 1),
               count: Number(item.likesCnt ?? item.count ?? 1),
@@ -586,7 +915,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
             }
           } else {
             const serializedSnapshot = likes
-              .map((x) => `${x.emoji_type}:${x.emoji_id}:${x.count}`)
+              .map((/** @type {any} */ x) => `${x.emoji_type}:${x.emoji_id}:${x.count}`)
               .sort()
               .join(",");
             const prevSnapshot = snapshotKey
@@ -635,8 +964,12 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         stripTransientMedia(ntMsg);
       }
     }
-  },
+  }
 
+  /**
+   * @param {any[]} args
+   * @param {any} firstArg
+   */
   async _handleGroupNotifiesUpdatedEvent(args, firstArg) {
     const doubt =
       typeof args[0] === "boolean"
@@ -676,7 +1009,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       // status === 1 means pending approval
       if (status === 1 && (notifyType === 1 || notifyType === 2 || notifyType === 7)) {
         const dedupKey = `group_req:${flag}`;
-        if (this._isDuplicateEvent(dedupKey)) continue;
+        if (this.bridge._isDuplicateEvent?.(dedupKey)) continue;
         const userUid = item.user1?.uid || "";
         const resolvedUser1Uin =
           _pickPositiveUin(item.user1?.uin) || (await this._ensureUinForUid(userUid));
@@ -704,8 +1037,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         this._dispatchInboundEvent(ev);
       }
     }
-  },
+  }
 
+  /** @param {any} firstArg */
   async _handleBuddyReqChangeEvent(firstArg) {
     const reqs = Array.isArray(firstArg?.buddyReqs)
       ? firstArg.buddyReqs
@@ -722,7 +1056,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       const flag = `${friendUid}:${reqExtra}`;
       setBoundedMap(this._buddyReqsCache, flag, req);
       const dedupKey = `friend_req:${friendUid}:${req.reqTime || req.flag || req.postscript || req.extWords || ""}`;
-      if (this._isDuplicateEvent(dedupKey)) continue;
+      if (this.bridge._isDuplicateEvent?.(dedupKey)) continue;
       const resolvedUin =
         positiveReqUin || (await this._ensureUinForUid(rawFriendUid || friendUid));
       if (_isPositiveUin(resolvedUin)) {
@@ -745,10 +1079,11 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       );
       this._dispatchInboundEvent(ev);
     }
-  },
+  }
 
+  /** @param {any} firstArg */
   _handleBuddyListChangeEvent(firstArg) {
-    this.uinUidStore.rememberFromBuddyList(firstArg);
+    this.uinUidStore?.rememberFromBuddyList?.(firstArg);
     const cats = Array.isArray(firstArg)
       ? firstArg
       : Array.isArray(firstArg?.buddyCategory)
@@ -767,8 +1102,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         this.logger?.debug?.("inbound", err);
       }
     }
-  },
+  }
 
+  /** @param {any} firstArg */
   _handleProfileSimpleChangedEvent(firstArg) {
     const profiles = firstArg?.profiles || firstArg;
     const entries =
@@ -781,13 +1117,14 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       if (!info || typeof info !== "object") continue;
       const core = info.coreInfo || info.baseInfo || info;
       const uin = _pickPositiveUin(core.uin, info.uin);
-      this.uinUidStore.remember(uin, core.uid || info.uid || uidKey, {
+      this.uinUidStore?.remember?.(uin, core.uid || info.uid || uidKey, {
         nickname: core.nick || info.nick || "",
         remark: core.remark || info.remark || "",
       });
     }
-  },
+  }
 
+  /** @param {any} firstArg */
   _handleProfileDetailInfoChangedEvent(firstArg) {
     const info = firstArg?.info || firstArg;
     if (!info || typeof info !== "object") return;
@@ -796,7 +1133,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     const uid = String(info.uid || simple.uid || core.uid || "");
     const uin = _pickPositiveUin(info.uin, simple.uin, core.uin);
     if (uid || uin) {
-      this.uinUidStore.remember(uin, uid, {
+      this.uinUidStore?.remember?.(uin, uid, {
         nickname: core.nick || info.nick || "",
         remark: core.remark || info.remark || "",
       });
@@ -814,8 +1151,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         }
       }
     }
-  },
+  }
 
+  /** @param {any} firstArg */
   _handleDoubtBuddyReqChangeEvent(firstArg) {
     if (!this._doubtBuddyWaiters) return;
     for (const waiter of Array.from(this._doubtBuddyWaiters)) {
@@ -825,8 +1163,12 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         this.logger?.debug?.("inbound", err);
       }
     }
-  },
+  }
 
+  /**
+   * @param {any[]} args
+   * @param {any} firstArg
+   */
   _handleGroupListUpdateEvent(args, firstArg) {
     const groupList = Array.isArray(args[1])
       ? args[1]
@@ -851,8 +1193,12 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         this.logger?.debug?.("inbound", err);
       }
     }
-  },
+  }
 
+  /**
+   * @param {any[]} args
+   * @param {any} firstArg
+   */
   async _handleMemberInfoChangeEvent(args, firstArg) {
     const rawObj = firstArg && typeof firstArg === "object" ? firstArg : null;
     const groupCode = String(
@@ -875,7 +1221,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         : null);
     if (!groupCode || !members) return;
 
-    this.uinUidStore.rememberFromGroupMemberList(groupCode, members);
+    this.uinUidStore?.rememberFromGroupMemberList?.(groupCode, members);
 
     const groupId = pickPositiveUin(groupCode);
     if (groupId <= 0) return;
@@ -895,7 +1241,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       infos instanceof Map
         ? Array.from(infos.entries())
         : Array.isArray(infos)
-        ? infos.map((m, idx) => [m?.uid || String(idx), m])
+        ? infos.map((/** @type {any} */ m, idx) => [m?.uid || String(idx), m])
         : infos && typeof infos === "object"
         ? Object.entries(infos)
         : [];
@@ -992,8 +1338,13 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         }
       }
     }
-  },
+  }
 
+  /**
+   * @param {string} _listenerName
+   * @param {string} eventName
+   * @param {any[]} args
+   */
   async _handleKernelEvent(_listenerName, eventName, args) {
     const firstArg = args && args.length > 0 ? args[0] : undefined;
 
@@ -1005,7 +1356,9 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         ? firstArg.msgList
         : [];
       if (msgList.length > 0) {
-        const tasksForThisBatch = msgList.map((ntMsg) => this._enqueueInboundNtMessage(ntMsg));
+        const tasksForThisBatch = msgList.map((/** @type {any} */ ntMsg) =>
+          this._enqueueInboundNtMessage(ntMsg)
+        );
         await Promise.all(tasksForThisBatch);
       }
       return;
@@ -1086,12 +1439,13 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         `Unhandled login-like event ${_listenerName || "?"}/${eventName} (shape=${argShape})`
       );
     }
-  },
+  }
 
+  /** @param {any} ntMsg */
   async _processIncomingNtMessage(ntMsg) {
     if (!ntMsg || typeof ntMsg !== "object") return;
     const msgId = String(ntMsg.msgId || "");
-    if (msgId && this._isDuplicateEvent(`msg:${msgId}`)) {
+    if (msgId && this.bridge._isDuplicateEvent?.(`msg:${msgId}`)) {
       return;
     }
 
@@ -1129,7 +1483,7 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
       (Boolean(this.selfUin) && String(ntMsg.senderUin || "") === String(this.selfUin)) ||
       (Boolean(this.selfUid) && String(ntMsg.senderUid || "") === String(this.selfUid));
     if (
-      this.config.humanSimulation !== false &&
+      this.config?.humanSimulation !== false &&
       autoReadAndType &&
       Number(ntMsg.chatType) === 1 &&
       ntMsg.peerUid &&
@@ -1138,27 +1492,207 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     ) {
       const peerUid = String(ntMsg.peerUid);
       const peerKey = `1:${peerUid}:`;
-      this._sessionScheduler.schedulePrivateRecvReaction(
+      this.bridge._sessionScheduler?.schedulePrivateRecvReaction?.(
         peerKey,
         this.config.autoReadReactionDelayMs ?? [500, 1800],
         () =>
-          this.simulateHumanSession({
-            chatType: 1,
-            peerUid,
-            guildId: "",
-            markRead: true,
-            sendTyping: true,
-            eventType: 1,
-            advisory: true,
-          }).catch((err) => {
-            this.logger?.debug?.("inbound", err);
-          })
+          this.bridge
+            .simulateHumanSession?.({
+              chatType: 1,
+              peerUid,
+              guildId: "",
+              markRead: true,
+              sendTyping: true,
+              eventType: 1,
+              advisory: true,
+            })
+            ?.catch?.((/** @type {any} */ err) => {
+              this.logger?.debug?.("inbound", err);
+            })
       );
     }
-  },
-});
+  }
+
+  // --------------------------------------------------------------------------
+  // Media Hydration Delegates (`./media_hydrator`)
+  // --------------------------------------------------------------------------
+
+  /** @param {any} firstArg */
+  _handleRichMediaDownloadComplete(firstArg) {
+    return mediaHydratorMixin._handleRichMediaDownloadComplete.call(this, firstArg);
+  }
+
+  /** @param {Record<string, any>} [options={}] */
+  _downloadRichMediaElement(options = {}) {
+    return mediaHydratorMixin._downloadRichMediaElement.call(this, options);
+  }
+
+  /**
+   * @param {any} ntMsg
+   * @param {any} el
+   * @param {any} ctx
+   */
+  _hydratePicElement(ntMsg, el, ctx) {
+    return mediaHydratorMixin._hydratePicElement.call(this, ntMsg, el, ctx);
+  }
+
+  /**
+   * @param {any} ntMsg
+   * @param {any} el
+   * @param {any} ctx
+   */
+  _hydratePttElement(ntMsg, el, ctx) {
+    return mediaHydratorMixin._hydratePttElement.call(this, ntMsg, el, ctx);
+  }
+
+  /** @param {any} el */
+  _hydrateVideoElement(el) {
+    return mediaHydratorMixin._hydrateVideoElement.call(this, el);
+  }
+
+  /**
+   * @param {any} ntMsg
+   * @param {Record<string, any>} [options={}]
+   */
+  _hydrateNtMsgMedia(ntMsg, options = {}) {
+    return mediaHydratorMixin._hydrateNtMsgMedia.call(this, ntMsg, options);
+  }
+
+  // --------------------------------------------------------------------------
+  // Login & Recovery Delegates (`./login_recovery`)
+  // --------------------------------------------------------------------------
+
+  /**
+   * @param {any} rawIdentity
+   * @param {{ markOnline?: boolean }} [options]
+   */
+  _syncSelfIdentityFromLogin(rawIdentity, options) {
+    return loginRecoveryMixin._syncSelfIdentityFromLogin.call(this, rawIdentity, options);
+  }
+
+  /** @param {any} firstArg */
+  _handleQrCodeEvent(firstArg) {
+    return loginRecoveryMixin._handleQrCodeEvent.call(this, firstArg);
+  }
+
+  /** @param {any} firstArg */
+  _handleUserLoggedInEvent(firstArg) {
+    return loginRecoveryMixin._handleUserLoggedInEvent.call(this, firstArg);
+  }
+
+  /** @param {any} firstArg */
+  _handleSessionInitCompleteEvent(firstArg) {
+    return loginRecoveryMixin._handleSessionInitCompleteEvent.call(this, firstArg);
+  }
+
+  /** @param {any} firstArg */
+  _handleKickedOffLineEvent(firstArg) {
+    return loginRecoveryMixin._handleKickedOffLineEvent.call(this, firstArg);
+  }
+
+  /**
+   * @param {string} eventName
+   * @param {any[]} args
+   * @returns {boolean}
+   */
+  _handleLoginKernelEvent(eventName, args) {
+    return loginRecoveryMixin._handleLoginKernelEvent.call(this, eventName, args);
+  }
+
+  /** @param {Record<string, any>} [options={}] */
+  _tryAutoQuickLogin(options = {}) {
+    return loginRecoveryMixin._tryAutoQuickLogin.call(this, options);
+  }
+}
+
+/**
+ * Resolves or lazily binds an `InboundPipeline` for legacy `inboundPipelineMixin` hosts.
+ * @param {any} host
+ * @returns {InboundPipeline}
+ */
+function _resolveLegacyInboundPipeline(host) {
+  if (host instanceof InboundPipeline) return host;
+  if (host && host.inboundPipeline instanceof InboundPipeline) return host.inboundPipeline;
+  if (host && host[LEGACY_INBOUND_CTRL_SYM] instanceof InboundPipeline) {
+    return host[LEGACY_INBOUND_CTRL_SYM];
+  }
+  const ctrl = new InboundPipeline(host);
+  if (host && typeof host === "object") {
+    Object.defineProperty(host, LEGACY_INBOUND_CTRL_SYM, {
+      value: ctrl,
+      enumerable: false,
+      configurable: true,
+    });
+    for (const key of LEGACY_INBOUND_STATE_KEYS) {
+      const desc = Object.getOwnPropertyDescriptor(host, key);
+      if (!desc || ("value" in desc && desc.configurable !== false)) {
+        Object.defineProperty(host, key, {
+          enumerable: true,
+          configurable: true,
+          get() {
+            return /** @type {any} */ (ctrl)[key];
+          },
+          set(val) {
+            /** @type {any} */ (ctrl)[key] = val;
+          },
+        });
+      }
+    }
+  }
+  return ctrl;
+}
+
+const INBOUND_PIPELINE_METHODS = /** @type {const} */ ([
+  "_isPositiveUin",
+  "_isNtReady",
+  "_dispatchInboundEvent",
+  "_ensureUinForUid",
+  "_resolveNtMsgUids",
+  "_getInboundMediaMaxConcurrent",
+  "_acquireInboundMediaSlot",
+  "_releaseInboundMediaSlot",
+  "_enqueueInboundNtMessage",
+  "_handleAddSendMsgEvent",
+  "_handleMsgInfoUpdateEvent",
+  "_handleGroupNotifiesUpdatedEvent",
+  "_handleBuddyReqChangeEvent",
+  "_handleBuddyListChangeEvent",
+  "_handleProfileSimpleChangedEvent",
+  "_handleProfileDetailInfoChangedEvent",
+  "_handleDoubtBuddyReqChangeEvent",
+  "_handleGroupListUpdateEvent",
+  "_handleMemberInfoChangeEvent",
+  "_handleKernelEvent",
+  "_processIncomingNtMessage",
+  "_handleRichMediaDownloadComplete",
+  "_downloadRichMediaElement",
+  "_hydratePicElement",
+  "_hydratePttElement",
+  "_hydrateVideoElement",
+  "_hydrateNtMsgMedia",
+  "_syncSelfIdentityFromLogin",
+  "_handleQrCodeEvent",
+  "_handleUserLoggedInEvent",
+  "_handleSessionInitCompleteEvent",
+  "_handleKickedOffLineEvent",
+  "_handleLoginKernelEvent",
+  "_tryAutoQuickLogin",
+]);
+
+/**
+ * Backward-compatible mixin facade delegating to `InboundPipeline`.
+ * @type {Record<string, (...args: any[]) => any>}
+ */
+const inboundPipelineMixin = {};
+for (const methodName of INBOUND_PIPELINE_METHODS) {
+  inboundPipelineMixin[methodName] = function (/** @type {any[]} */ ...args) {
+    const ctrl = _resolveLegacyInboundPipeline(this);
+    return /** @type {any} */ (ctrl)[methodName](...args);
+  };
+}
 
 module.exports = {
+  InboundPipeline,
   inboundPipelineMixin,
   mediaHydratorMixin,
   loginRecoveryMixin,
