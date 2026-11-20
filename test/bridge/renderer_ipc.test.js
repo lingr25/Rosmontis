@@ -7,6 +7,7 @@
 
 const test = require("node:test");
 const assert = require("assert");
+const crypto = require("crypto");
 const EventEmitter = require("events");
 const { rendererMod, mainMod } = require("./_helpers");
 // === Section 4: Testing bridge_renderer.js in Simulated Window Environment ===
