@@ -1,24 +1,31 @@
+// @ts-check
 "use strict";
 
 /**
  * Pure Node.js OneBot v11 Protocol & NTQQ Kernel Data Converter (`src/bridge_onebot.js`)
  *
  * Barrel facade re-exporting decomposed protocol modules (`src/onebot/*`) and
- * media security utilities (`src/core/media_security.js`) for backward compatibility.
+ * media/image/metadata utilities (`src/core/image_probe.js`, `src/core/ntqq_meta.js`,
+ * `src/core/media_downloader.js`, `src/core/media_security.js`, `src/core/audio_codec.js`)
+ * for backward compatibility.
  */
+
+const { inspectImageDimensions } = require("./core/image_probe");
+
+const { getNtqqVersionMetadata, buildNtqqUserAgent } = require("./core/ntqq_meta");
 
 const {
   DEFAULT_MAX_MEDIA_BYTES,
-  inspectImageDimensions,
-  getNtqqVersionMetadata,
-  buildNtqqUserAgent,
   resolveMaxMediaBytes,
-  isPrivateOrReservedIp,
-  createSsrfSafeLookup,
   pruneTempDir,
   pruneTempDirAsync,
   downloadBufferFromUrl,
   downloadMediaStreamToTempDir,
+} = require("./core/media_downloader");
+
+const {
+  isPrivateOrReservedIp,
+  createSsrfSafeLookup,
   resolveMediaSource,
 } = require("./core/media_security");
 
@@ -33,8 +40,6 @@ const {
   MessageIdStore,
   UinUidStore,
   pickPositiveUin,
-  stripTransientNtMedia,
-  buildNtMarketFaceUrl,
 } = require("./onebot/stores");
 
 const {
@@ -48,7 +53,9 @@ const {
 
 const {
   buildNtPicUrl,
+  buildNtMarketFaceUrl,
   buildNtRecordUri,
+  stripTransientNtMedia,
   ntMsgToOneBotSegments,
   oneBotSegmentsToNtElements,
 } = require("./onebot/segment_converter");

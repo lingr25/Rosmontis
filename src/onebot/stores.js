@@ -1,47 +1,60 @@
+// @ts-check
 "use strict";
+
+/**
+ * Bounded LRU Protocol Stores (`src/onebot/stores.js`)
+ *
+ * Provides `MessageIdStore` (31-bit OneBot `message_id` <-> NTQQ 64-bit `msgId`
+ * + media/forward index) and `UinUidStore` (bi-directional QQ UIN <-> NTQQ UID
+ * & profile metadata cache) with debounced atomic snapshot persistence.
+ */
 
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const { pathToFileURL } = require("url");
 
-function buildNtMarketFaceUrl(marketFaceElement) {
-  if (typeof marketFaceElement === "string") {
-    const emojiId = marketFaceElement.trim().toLowerCase();
-    if (/^[0-9a-f]{4,64}$/.test(emojiId)) {
-      return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw300.gif`;
-    }
-    return "";
-  }
-  if (!marketFaceElement || typeof marketFaceElement !== "object") return "";
-  if (typeof marketFaceElement.__base64Uri === "string" && marketFaceElement.__base64Uri) {
-    return marketFaceElement.__base64Uri;
-  }
-  const directUrl = String(marketFaceElement.url || "").trim();
-  if (directUrl) {
-    return directUrl;
-  }
-  const emojiId = String(marketFaceElement.emojiId || "").trim().toLowerCase();
-  if (/^[0-9a-f]{4,64}$/.test(emojiId)) {
-    return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw300.gif`;
-  }
-  const candidatePaths = [
-    marketFaceElement.dynamicFacePath,
-    marketFaceElement.staticFacePath,
-  ];
-  for (const rawPath of candidatePaths) {
-    if (typeof rawPath !== "string") continue;
-    const localPath = rawPath.trim();
-    if (!localPath) continue;
-    try {
-      return pathToFileURL(localPath).href;
-    } catch (_) {
-      return `file://${localPath}`;
-    }
-  }
-  return "";
+/**
+ * @typedef {object} PersistBatch
+ * @property {string} filePath
+ * @property {Promise<boolean>} promise
+ * @property {(value: boolean) => void} resolve
+ * @property {(reason?: any) => void} reject
+ */
+
+/**
+ * @typedef {object} PersistState
+ * @property {boolean} enabled
+ * @property {string} filePath
+ * @property {number} debounceMs
+ * @property {ReturnType<typeof setTimeout> | null} timer
+ * @property {boolean} dirty
+ * @property {boolean} running
+ * @property {PersistBatch | null} pendingBatch
+ * @property {PersistBatch[]} queue
+ */
+
+/**
+ * @typedef {{ debug?: (scope: string, err?: any) => any }} StoreLogger
+ */
+
+/**
+ * Lazily retrieves `buildNtMarketFaceUrl` from `./segment_converter` to avoid
+ * a load-order circular require (`segment_converter.js` imports `stores.js`).
+ *
+ * @param {any} marketFaceElement
+ * @returns {string}
+ */
+function _resolveMarketFaceUrl(marketFaceElement) {
+  const { buildNtMarketFaceUrl } = require("./segment_converter");
+  return buildNtMarketFaceUrl(marketFaceElement);
 }
 
+/**
+ * Returns the first positive integer UIN among `candidates`, or `0` if none match.
+ *
+ * @param {...any} candidates
+ * @returns {number}
+ */
 function pickPositiveUin(...candidates) {
   for (const c of candidates) {
     if (c === null || c === undefined || c === "" || typeof c === "boolean") continue;
@@ -54,6 +67,9 @@ function pickPositiveUin(...candidates) {
   return 0;
 }
 
+/**
+ * @returns {PersistState}
+ */
 function createPersistState() {
   return {
     enabled: false,
@@ -67,7 +83,13 @@ function createPersistState() {
   };
 }
 
-async function atomicWriteSnapshot(filePath, getSnapshot) {
+/**
+ * @param {string} filePath
+ * @param {() => Record<string, any>} getSnapshot
+ * @param {StoreLogger | null} [logger=null]
+ * @returns {Promise<void>}
+ */
+async function atomicWriteSnapshot(filePath, getSnapshot, logger = null) {
   const dir = path.dirname(filePath);
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
   const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
@@ -76,7 +98,7 @@ async function atomicWriteSnapshot(filePath, getSnapshot) {
     await fs.promises.writeFile(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
     try {
       await fs.promises.rename(tmpPath, filePath);
-    } catch (renameErr) {
+    } catch (/** @type {any} */ renameErr) {
       if (
         renameErr &&
         (renameErr.code === "EEXIST" ||
@@ -85,7 +107,7 @@ async function atomicWriteSnapshot(filePath, getSnapshot) {
       ) {
         try {
           await fs.promises.unlink(filePath);
-        } catch (unlinkErr) {
+        } catch (/** @type {any} */ unlinkErr) {
           if (unlinkErr && unlinkErr.code !== "ENOENT") {
             throw renameErr;
           }
@@ -98,22 +120,32 @@ async function atomicWriteSnapshot(filePath, getSnapshot) {
   } catch (err) {
     try {
       await fs.promises.unlink(tmpPath);
-    } catch (_) {}
+    } catch (cleanupErr) {
+      // Best-effort removal of orphaned temp snapshot file
+      logger?.debug?.("stores:cleanupTempSnapshot", cleanupErr);
+    }
     throw err;
   }
 }
 
-async function drainPersistQueue(state, getSnapshot) {
+/**
+ * @param {PersistState} state
+ * @param {() => Record<string, any>} getSnapshot
+ * @param {StoreLogger | null} [logger=null]
+ * @returns {Promise<void>}
+ */
+async function drainPersistQueue(state, getSnapshot, logger = null) {
   if (state.running) return;
   state.running = true;
   try {
     while (state.queue.length > 0) {
       const batch = state.queue.shift();
+      if (!batch) continue;
       if (state.pendingBatch === batch) {
         state.pendingBatch = null;
       }
       try {
-        await atomicWriteSnapshot(batch.filePath, getSnapshot);
+        await atomicWriteSnapshot(batch.filePath, getSnapshot, logger);
         batch.resolve(true);
       } catch (err) {
         batch.reject(err);
@@ -124,7 +156,14 @@ async function drainPersistQueue(state, getSnapshot) {
   }
 }
 
-function enqueueCoalescedSave(state, filePath, getSnapshot) {
+/**
+ * @param {PersistState} state
+ * @param {string} filePath
+ * @param {() => Record<string, any>} getSnapshot
+ * @param {StoreLogger | null} [logger=null]
+ * @returns {Promise<boolean>}
+ */
+function enqueueCoalescedSave(state, filePath, getSnapshot, logger = null) {
   const targetPath = typeof filePath === "string" ? filePath.trim() : "";
   if (!targetPath) {
     return Promise.reject(new Error("saveToFile requires a non-empty filePath"));
@@ -132,12 +171,15 @@ function enqueueCoalescedSave(state, filePath, getSnapshot) {
   if (state.running && state.pendingBatch && state.pendingBatch.filePath === targetPath) {
     return state.pendingBatch.promise;
   }
-  let resolveBatch;
-  let rejectBatch;
+  /** @type {(value: boolean) => void} */
+  let resolveBatch = () => {};
+  /** @type {(reason?: any) => void} */
+  let rejectBatch = () => {};
   const promise = new Promise((resolve, reject) => {
     resolveBatch = resolve;
     rejectBatch = reject;
   });
+  /** @type {PersistBatch} */
   const batch = {
     filePath: targetPath,
     promise,
@@ -148,7 +190,7 @@ function enqueueCoalescedSave(state, filePath, getSnapshot) {
   if (state.running) {
     state.pendingBatch = batch;
   } else {
-    drainPersistQueue(state, getSnapshot);
+    drainPersistQueue(state, getSnapshot, logger);
   }
   return promise;
 }
@@ -158,39 +200,65 @@ function enqueueCoalescedSave(state, filePath, getSnapshot) {
 // ============================================================================
 
 class MessageIdStore {
+  /**
+   * @param {number | Record<string, any>} [maxEntries=10000]
+   * @param {number} [maxRawEntries=256]
+   * @param {number | Record<string, any>} [options={}]
+   */
   constructor(maxEntries = 10000, maxRawEntries = 256, options = {}) {
-    if (maxEntries && typeof maxEntries === "object") {
-      options = maxEntries;
-      maxEntries = options.maxEntries ?? 10000;
-      maxRawEntries = options.maxRawEntries ?? 256;
+    /** @type {number | Record<string, any>} */
+    let resolvedMaxEntries = maxEntries;
+    /** @type {number} */
+    let resolvedMaxRaw = maxRawEntries;
+    /** @type {number | Record<string, any>} */
+    let resolvedOptions = options;
+    if (resolvedMaxEntries && typeof resolvedMaxEntries === "object") {
+      resolvedOptions = resolvedMaxEntries;
+      resolvedMaxEntries = resolvedOptions.maxEntries ?? 10000;
+      resolvedMaxRaw = resolvedOptions.maxRawEntries ?? 256;
     }
-    this.maxEntries = Math.max(2, Number(maxEntries) || 10000);
+    this.maxEntries = Math.max(2, Number(resolvedMaxEntries) || 10000);
     const parsedMaxRaw =
-      maxRawEntries !== undefined && maxRawEntries !== null ? Number(maxRawEntries) : 256;
+      resolvedMaxRaw !== undefined && resolvedMaxRaw !== null ? Number(resolvedMaxRaw) : 256;
     this.maxRawEntries =
       Number.isFinite(parsedMaxRaw) && parsedMaxRaw >= 0 ? Math.trunc(parsedMaxRaw) : 256;
     const rawMaxMedia =
-      typeof options === "number"
-        ? options
-        : options && typeof options === "object"
-        ? options.maxMediaKeys
+      typeof resolvedOptions === "number"
+        ? resolvedOptions
+        : resolvedOptions && typeof resolvedOptions === "object"
+        ? resolvedOptions.maxMediaKeys
         : undefined;
     this.maxMediaKeys =
       rawMaxMedia !== undefined && rawMaxMedia !== null && Number(rawMaxMedia) > 0
         ? Math.max(1, Math.trunc(Number(rawMaxMedia)))
         : Math.max(64, this.maxEntries * 4);
+    /** @type {StoreLogger | null} */
+    this._logger =
+      resolvedOptions && typeof resolvedOptions === "object" && resolvedOptions.logger
+        ? resolvedOptions.logger
+        : null;
+    /** @type {Map<number, Record<string, any>>} */
     this.byShortId = new Map();
     this.byOneBotId = this.byShortId;
+    /** @type {Map<string, Record<string, any>>} */
     this.byMsgId = new Map();
     this.byPeerMsgId = this.byMsgId;
+    /** @type {Map<string, Record<string, any>>} */
     this.byPeerSeq = new Map();
+    /** @type {Set<number>} */
     this._rawIds = new Set();
+    /** @type {Map<string, Record<string, any>>} */
     this.byMediaKey = new Map();
+    /** @type {Map<string, Record<string, any>>} */
     this.byForwardId = new Map();
     this._seqCounter = 100000;
     this._persist = createPersistState();
   }
 
+  /**
+   * @param {string} key
+   * @param {Record<string, any>} desc
+   */
   _setMediaKey(key, desc) {
     this.byMediaKey.delete(key);
     this.byMediaKey.set(key, desc);
@@ -208,6 +276,12 @@ class MessageIdStore {
     }
   }
 
+  /**
+   * @param {any} chatType
+   * @param {any} peerUid
+   * @param {any} msgSeq
+   * @returns {string}
+   */
   static _peerSeqKey(chatType, peerUid, msgSeq) {
     if (!peerUid || msgSeq === undefined || msgSeq === null || String(msgSeq) === "0" || String(msgSeq) === "") {
       return "";
@@ -215,6 +289,12 @@ class MessageIdStore {
     return `${Number(chatType) || 0}:${String(peerUid)}:${String(msgSeq)}`;
   }
 
+  /**
+   * @param {string} msgIdStr
+   * @param {Record<string, any> | null | undefined} peer
+   * @param {string} msgSeq
+   * @returns {number}
+   */
   _computeShortId(msgIdStr, peer, msgSeq) {
     const seed = `${msgIdStr || ""}|${peer?.chatType || 0}|${peer?.peerUid || ""}|${msgSeq || ""}`;
     const digest = crypto.createHash("md5").update(seed).digest();
@@ -236,6 +316,9 @@ class MessageIdStore {
     return candidate;
   }
 
+  /**
+   * @param {number | string | null | undefined} oneBotId
+   */
   _touchRawId(oneBotId) {
     if (oneBotId === undefined || oneBotId === null) return;
     const id = Number(oneBotId);
@@ -296,6 +379,10 @@ class MessageIdStore {
     }
   }
 
+  /**
+   * @param {Record<string, any> | null | undefined} entry
+   * @returns {Record<string, any> | null}
+   */
   _touch(entry) {
     if (!entry) return null;
     this.byShortId.delete(entry.shortId);
@@ -307,6 +394,12 @@ class MessageIdStore {
     return this.byShortId.size;
   }
 
+  /**
+   * @param {any} chatType
+   * @param {any} peerUid
+   * @param {any} msgId
+   * @returns {Record<string, any> | null}
+   */
   resolveByNtKey(chatType, peerUid, msgId) {
     if (msgId !== undefined && msgId !== null && String(msgId) !== "" && String(msgId) !== "0") {
       const byId = this.byMsgId.get(String(msgId));
@@ -315,6 +408,10 @@ class MessageIdStore {
     return null;
   }
 
+  /**
+   * @param {any} id
+   * @returns {{ entry: Record<string, any>, msgId: string, peer: Record<string, any>, msgSeq: string } | null}
+   */
   resolve(id) {
     if (id === undefined || id === null || id === "") return null;
     const entry = this.get(id) || this.getByNtMsgId(String(id));
@@ -327,6 +424,13 @@ class MessageIdStore {
     };
   }
 
+  /**
+   * Indexes media & forward references inside an NTQQ raw message for subsequent
+   * `get_image` / `get_record` / `get_file` / `get_forward_msg` resolution.
+   *
+   * @param {Record<string, any>} ntMsg
+   * @param {number | null} [oneBotId=null]
+   */
   indexMsgMedia(ntMsg, oneBotId = null) {
     if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
     if (oneBotId == null && ntMsg.msgId && ntMsg.peerUid) {
@@ -344,6 +448,11 @@ class MessageIdStore {
       ? Number(oneBotId) || null
       : null;
 
+    /**
+     * @param {string} k
+     * @param {Record<string, any>} desc
+     * @param {boolean} [fallbackOnly=false]
+     */
     const setKey = (k, desc, fallbackOnly = false) => {
       if (!k || typeof k !== "string") return;
       const trimmed = k.trim();
@@ -400,7 +509,7 @@ class MessageIdStore {
         md5 = mf.emojiId || "";
         fileName = mf.emojiId ? `${String(mf.emojiId).toLowerCase()}.gif` : "";
         sourcePath = mf.dynamicFacePath || mf.staticFacePath || "";
-        url = buildNtMarketFaceUrl(mf);
+        url = _resolveMarketFaceUrl(mf);
       } else if (elementType === 16 && el.multiForwardMsgElement) {
         const fwd = el.multiForwardMsgElement;
         const fwdPeer =
@@ -484,6 +593,10 @@ class MessageIdStore {
     }
   }
 
+  /**
+   * @param {string} fileToken
+   * @returns {Record<string, any> | null}
+   */
   lookupMedia(fileToken) {
     if (!fileToken || typeof fileToken !== "string") return null;
     const raw = fileToken.trim();
@@ -501,7 +614,7 @@ class MessageIdStore {
         const file = parsed.searchParams.get("file") || "";
         for (const cand of [uuid, md5, md5.toLowerCase(), file, file.toLowerCase()]) {
           if (cand && this.byMediaKey.has(cand)) {
-            return this.byMediaKey.get(cand);
+            return this.byMediaKey.get(cand) || null;
           }
         }
         if (file) {
@@ -513,7 +626,9 @@ class MessageIdStore {
             if (byFileMd5) return byFileMd5;
           }
         }
-      } catch (_) {}
+      } catch (_urlErr) {
+        // Malformed ntqq:// URI token; fall through to raw MD5-prefix matching
+      }
     }
 
     const md5ExtMatch = /^([0-9a-fA-F]{32})\.[a-zA-Z0-9]+$/.exec(raw);
@@ -527,6 +642,10 @@ class MessageIdStore {
     return null;
   }
 
+  /**
+   * @param {any} token
+   * @returns {Record<string, any> | null}
+   */
   lookupForward(token) {
     if (token === undefined || token === null) return null;
     const raw = String(token).trim();
@@ -534,7 +653,17 @@ class MessageIdStore {
     return this.byForwardId.get(raw) || null;
   }
 
-  register(msgId, peer, msgSeq, extra = {}) {
+  /**
+   * Registers or merges a message mapping and returns its positive 31-bit OneBot `message_id`.
+   *
+   * @param {any} msgId
+   * @param {any} [peer]
+   * @param {any} [msgSeq]
+   * @param {Record<string, any>} [extra={}]
+   * @param {...any} _legacyRest
+   * @returns {number}
+   */
+  register(msgId, peer, msgSeq, extra = {}, ..._legacyRest) {
     if (msgId && typeof msgId === "object" && !Array.isArray(msgId)) {
       const obj = msgId;
       return this.register(
@@ -584,18 +713,20 @@ class MessageIdStore {
     const msgRandom =
       rawRandom !== undefined && rawRandom !== null && rawRandom !== "" ? String(rawRandom) : null;
 
+    /** @type {Record<string, any> | null} */
     let existing = null;
     if (msgIdStr && this.byMsgId.has(msgIdStr)) {
-      existing = this.byMsgId.get(msgIdStr);
+      existing = this.byMsgId.get(msgIdStr) || null;
     } else if (psKey && this.byPeerSeq.has(psKey)) {
       const candidate = this.byPeerSeq.get(psKey);
       const candMsgId = candidate && candidate.msgId ? String(candidate.msgId) : "";
       if (
-        !msgIdStr ||
-        !candMsgId ||
-        candMsgId === "0" ||
-        candMsgId.startsWith("sent_") ||
-        candMsgId === String(candidate.shortId)
+        candidate &&
+        (!msgIdStr ||
+          !candMsgId ||
+          candMsgId === "0" ||
+          candMsgId.startsWith("sent_") ||
+          candMsgId === String(candidate.shortId))
       ) {
         existing = candidate;
       }
@@ -707,6 +838,10 @@ class MessageIdStore {
     return shortId;
   }
 
+  /**
+   * @param {number} [maxItems]
+   * @returns {{ version: number, entries: Array<Record<string, any>> }}
+   */
   toSnapshot(maxItems) {
     let limit = this.maxEntries;
     if (maxItems !== undefined && maxItems !== null) {
@@ -723,6 +858,7 @@ class MessageIdStore {
         ? allEntries.slice(-limit)
         : allEntries;
     const entries = slice.map((entry) => {
+      /** @type {Record<string, any>} */
       const item = {
         shortId: entry.shortId,
         msgId: entry.msgId || "",
@@ -748,6 +884,10 @@ class MessageIdStore {
     };
   }
 
+  /**
+   * @param {Record<string, any>} snapshot
+   * @returns {boolean}
+   */
   loadSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== "object" || !Array.isArray(snapshot.entries)) {
       return false;
@@ -830,6 +970,10 @@ class MessageIdStore {
     return true;
   }
 
+  /**
+   * @param {string} filePath
+   * @returns {boolean}
+   */
   loadFromFileSync(filePath) {
     if (!filePath || typeof filePath !== "string" || !filePath.trim()) {
       return false;
@@ -838,15 +982,26 @@ class MessageIdStore {
       const raw = fs.readFileSync(filePath, "utf8");
       const parsed = JSON.parse(raw);
       return Boolean(this.loadSnapshot(parsed));
-    } catch (_) {
+    } catch (err) {
+      // Missing or corrupted snapshot on startup is non-fatal; start with empty store
+      this._logger?.debug?.("stores:loadMessageIdSnapshot", err);
       return false;
     }
   }
 
+  /**
+   * @param {string} filePath
+   * @returns {Promise<boolean>}
+   */
   async saveToFile(filePath) {
-    return enqueueCoalescedSave(this._persist, filePath, () => this.toSnapshot());
+    return enqueueCoalescedSave(this._persist, filePath, () => this.toSnapshot(), this._logger);
   }
 
+  /**
+   * @param {string} filePath
+   * @param {{ debounceMs?: number }} [opts={}]
+   * @returns {boolean}
+   */
   enableAutoPersist(filePath, { debounceMs = 2000 } = {}) {
     const targetPath = typeof filePath === "string" ? filePath.trim() : "";
     if (!targetPath) {
@@ -872,6 +1027,9 @@ class MessageIdStore {
     }
   }
 
+  /**
+   * @returns {boolean}
+   */
   schedulePersist() {
     if (!this._persist.enabled || !this._persist.filePath) return false;
     this._persist.dirty = true;
@@ -883,7 +1041,10 @@ class MessageIdStore {
       this._persist.timer = null;
       if (!this._persist.enabled || !this._persist.dirty) return;
       this._persist.dirty = false;
-      this.saveToFile(targetPath).catch(() => {});
+      this.saveToFile(targetPath).catch((err) => {
+        // Background debounced snapshot write failure must not surface as unhandled rejection
+        this._logger?.debug?.("stores:autoPersistMessageIds", err);
+      });
     }, this._persist.debounceMs);
     if (timer && typeof timer.unref === "function") {
       timer.unref();
@@ -892,6 +1053,9 @@ class MessageIdStore {
     return true;
   }
 
+  /**
+   * @returns {Promise<boolean>}
+   */
   async flushPersist() {
     if (this._persist.timer) {
       clearTimeout(this._persist.timer);
@@ -905,10 +1069,18 @@ class MessageIdStore {
     return true;
   }
 
+  /**
+   * @param {any} shortId
+   * @returns {Record<string, any> | null}
+   */
   get(shortId) {
     return this.getByShortId(shortId);
   }
 
+  /**
+   * @param {any} shortId
+   * @returns {Record<string, any> | null}
+   */
   getByShortId(shortId) {
     if (shortId === undefined || shortId === null) return null;
     const num = Number(shortId);
@@ -922,6 +1094,10 @@ class MessageIdStore {
     return null;
   }
 
+  /**
+   * @param {any} msgId
+   * @returns {Record<string, any> | null}
+   */
   getByMsgId(msgId) {
     if (msgId === undefined || msgId === null) return null;
     const str = String(msgId).trim();
@@ -935,10 +1111,20 @@ class MessageIdStore {
     return null;
   }
 
+  /**
+   * @param {any} msgId
+   * @returns {Record<string, any> | null}
+   */
   getByNtMsgId(msgId) {
     return this.getByMsgId(msgId);
   }
 
+  /**
+   * @param {any} chatType
+   * @param {any} peerUid
+   * @param {any} msgSeq
+   * @returns {Record<string, any> | null}
+   */
   getByPeerAndSeq(chatType, peerUid, msgSeq) {
     const psKey = MessageIdStore._peerSeqKey(chatType, peerUid, msgSeq);
     if (!psKey) return null;
@@ -946,10 +1132,20 @@ class MessageIdStore {
     return entry ? this._touch(entry) : null;
   }
 
+  /**
+   * @param {any} chatType
+   * @param {any} peerUid
+   * @param {any} msgSeq
+   * @returns {Record<string, any> | null}
+   */
   getByPeerSeq(chatType, peerUid, msgSeq) {
     return this.getByPeerAndSeq(chatType, peerUid, msgSeq);
   }
 
+  /**
+   * @param {any} rawId
+   * @returns {Record<string, any> | null}
+   */
   resolveByOneBotId(rawId) {
     const res = this.resolve(rawId);
     return res ? res.entry : this.getByShortId(rawId);
@@ -961,13 +1157,21 @@ class MessageIdStore {
 // ============================================================================
 
 class UinUidStore {
+  /**
+   * @param {number | Record<string, any>} [maxEntries=20000]
+   * @param {Record<string, any>} [options={}]
+   */
   constructor(maxEntries = 20000, options = {}) {
-    if (maxEntries && typeof maxEntries === "object") {
-      options = maxEntries;
-      maxEntries = options.maxEntries ?? 20000;
+    /** @type {number | Record<string, any>} */
+    let resolvedMax = maxEntries;
+    /** @type {Record<string, any>} */
+    let resolvedOpts = options;
+    if (resolvedMax && typeof resolvedMax === "object") {
+      resolvedOpts = resolvedMax;
+      resolvedMax = resolvedOpts.maxEntries ?? 20000;
     }
-    const opts = options && typeof options === "object" ? options : {};
-    this.maxEntries = Math.max(2, Number(maxEntries) || 20000);
+    const opts = resolvedOpts && typeof resolvedOpts === "object" ? resolvedOpts : {};
+    this.maxEntries = Math.max(2, Number(resolvedMax) || 20000);
     this.maxUserMetaEntries = Math.max(
       2,
       Number(opts.maxUserMetaEntries) || this.maxEntries
@@ -976,9 +1180,15 @@ class UinUidStore {
       4,
       Number(opts.maxGroupMemberMetaEntries) || this.maxEntries * 2
     );
+    /** @type {StoreLogger | null} */
+    this._logger = opts.logger || null;
+    /** @type {Map<string, string>} */
     this.uinToUid = new Map();
+    /** @type {Map<string, string>} */
     this.uidToUin = new Map();
+    /** @type {Map<string, Record<string, any>>} */
     this.userMeta = new Map(); // uin -> { uin, uid, nickname, remark, sex, age }
+    /** @type {Map<string, Record<string, any>>} */
     this.groupMemberMeta = new Map(); // `${groupId}:${uin}` -> { uin, uid, nickname, card, role, title }
     this._persist = createPersistState();
   }
@@ -1006,6 +1216,10 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {string} uinStr
+   * @param {Record<string, any>} value
+   */
   _setUserMeta(uinStr, value) {
     this.userMeta.delete(uinStr);
     this.userMeta.set(uinStr, value);
@@ -1016,6 +1230,10 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {string} gKey
+   * @param {Record<string, any>} value
+   */
   _setGroupMemberMeta(gKey, value) {
     this.groupMemberMeta.delete(gKey);
     this.groupMemberMeta.set(gKey, value);
@@ -1026,14 +1244,30 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {any} uin
+   * @param {any} uid
+   * @param {Record<string, any> | null} [meta=null]
+   */
   record(uin, uid, meta = null) {
     return this.remember(uin, uid, meta);
   }
 
+  /**
+   * @param {any} uin
+   * @param {any} uid
+   * @param {Record<string, any> | null} [meta=null]
+   */
   register(uin, uid, meta = null) {
     return this.remember(uin, uid, meta);
   }
 
+  /**
+   * @param {any} groupId
+   * @param {any} [uin]
+   * @param {any} [uid=""]
+   * @param {Record<string, any> | null} [meta=null]
+   */
   recordGroupMember(groupId, uin, uid = "", meta = null) {
     if (groupId && typeof groupId === "object") {
       const obj = groupId;
@@ -1071,6 +1305,11 @@ class UinUidStore {
     });
   }
 
+  /**
+   * @param {any} uin
+   * @param {any} uid
+   * @param {Record<string, any> | null} [meta=null]
+   */
   remember(uin, uid, meta = null) {
     const uinStr = uin !== undefined && uin !== null ? String(uin).trim() : "";
     const uidStr = uid !== undefined && uid !== null ? String(uid).trim() : "";
@@ -1120,6 +1359,9 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {Record<string, any>} ntMsg
+   */
   rememberFromNtMsg(ntMsg) {
     if (!ntMsg || typeof ntMsg !== "object") return;
     if (ntMsg.senderUin && ntMsg.senderUid) {
@@ -1154,6 +1396,9 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {any} buddyData
+   */
   rememberFromBuddyList(buddyData) {
     if (!buddyData) return;
     const simpleInfos = buddyData.userSimpleInfos;
@@ -1187,6 +1432,9 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {Record<string, any>} buddy
+   */
   _rememberBuddyObject(buddy) {
     if (!buddy || typeof buddy !== "object") return;
     const core = buddy.coreInfo || buddy.baseInfo || buddy;
@@ -1197,6 +1445,10 @@ class UinUidStore {
     this.remember(uin, uid, { nickname, remark });
   }
 
+  /**
+   * @param {any} groupId
+   * @param {any} membersContainer
+   */
   rememberFromGroupMemberList(groupId, membersContainer) {
     if (!membersContainer) return;
     let infos = membersContainer;
@@ -1236,14 +1488,26 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @param {any} uin
+   * @returns {string}
+   */
   getUid(uin) {
     return this.getUidSync(uin);
   }
 
+  /**
+   * @param {any} uid
+   * @returns {string}
+   */
   getUin(uid) {
     return this.getUinSync(uid);
   }
 
+  /**
+   * @param {any} uin
+   * @returns {string}
+   */
   getUidSync(uin) {
     if (uin === undefined || uin === null) return "";
     const str = String(uin).trim();
@@ -1252,6 +1516,10 @@ class UinUidStore {
     return this.uinToUid.get(str) || "";
   }
 
+  /**
+   * @param {any} uid
+   * @returns {string}
+   */
   getUinSync(uid) {
     if (uid === undefined || uid === null) return "";
     const str = String(uid).trim();
@@ -1260,6 +1528,11 @@ class UinUidStore {
     return this.uidToUin.get(str) || "";
   }
 
+  /**
+   * @param {any} uin
+   * @param {import("../types").InvokeNtFn | null} [invokeNt]
+   * @returns {Promise<string>}
+   */
   async resolveUid(uin, invokeNt) {
     const str = String(uin ?? "").trim();
     if (!str || str === "0") return "";
@@ -1267,6 +1540,7 @@ class UinUidStore {
     const cached = this.getUidSync(str);
     if (cached) return cached;
     if (typeof invokeNt === "function" && /^\d+$/.test(str) && Number(str) > 0) {
+      /** @param {any} mapOrObj */
       const extractUid = (mapOrObj) => {
         if (mapOrObj instanceof Map) {
           return mapOrObj.get(str) || mapOrObj.get(Number(str)) || "";
@@ -1287,7 +1561,10 @@ class UinUidStore {
           this.remember(str, resolved);
           return String(resolved);
         }
-      } catch (_) {}
+      } catch (err) {
+        // Primary UixConvertService unavailable; fall through to GroupService lookup
+        this._logger?.debug?.("stores:resolveUid:uixConvert", err);
+      }
       try {
         const res2 = await invokeNt(
           "nodeIKernelGroupService/getUidByUins",
@@ -1299,11 +1576,19 @@ class UinUidStore {
           this.remember(str, resolved2);
           return String(resolved2);
         }
-      } catch (_) {}
+      } catch (err) {
+        // Secondary GroupService lookup also unavailable; return empty UID
+        this._logger?.debug?.("stores:resolveUid:groupService", err);
+      }
     }
     return "";
   }
 
+  /**
+   * @param {any} uid
+   * @param {import("../types").InvokeNtFn | null} [invokeNt]
+   * @returns {Promise<string>}
+   */
   async resolveUin(uid, invokeNt) {
     const str = String(uid ?? "").trim();
     if (!str || str === "0") return "";
@@ -1311,6 +1596,7 @@ class UinUidStore {
     const cached = this.getUinSync(str);
     if (cached) return cached;
     if (typeof invokeNt === "function") {
+      /** @param {any} mapOrObj */
       const extractUin = (mapOrObj) => {
         if (mapOrObj instanceof Map) {
           return mapOrObj.get(str) || "";
@@ -1331,7 +1617,10 @@ class UinUidStore {
           this.remember(String(resolved), str);
           return String(resolved);
         }
-      } catch (_) {}
+      } catch (err) {
+        // Primary UixConvertService unavailable; fall through to GroupService lookup
+        this._logger?.debug?.("stores:resolveUin:uixConvert", err);
+      }
       try {
         const res2 = await invokeNt(
           "nodeIKernelGroupService/getUinByUids",
@@ -1343,11 +1632,18 @@ class UinUidStore {
           this.remember(String(resolved2), str);
           return String(resolved2);
         }
-      } catch (_) {}
+      } catch (err) {
+        // Secondary GroupService lookup also unavailable; return empty UIN
+        this._logger?.debug?.("stores:resolveUin:groupService", err);
+      }
     }
     return "";
   }
 
+  /**
+   * @param {number} [maxItems]
+   * @returns {{ version: number, pairs: Array<[string, string]>, userMeta: Array<[string, Record<string, any>]> }}
+   */
   toSnapshot(maxItems) {
     let pairLimit = this.maxEntries;
     let metaLimit = Math.min(this.maxEntries, this.maxUserMetaEntries);
@@ -1359,6 +1655,7 @@ class UinUidStore {
       }
     }
     const allPairs = Array.from(this.uinToUid.entries());
+    /** @type {Array<[string, string]>} */
     const pairs = (
       pairLimit === 0
         ? []
@@ -1368,6 +1665,7 @@ class UinUidStore {
     ).map(([uin, uid]) => [String(uin), String(uid)]);
 
     const allMeta = Array.from(this.userMeta.entries());
+    /** @type {Array<[string, Record<string, any>]>} */
     const userMeta = (
       metaLimit === 0
         ? []
@@ -1383,6 +1681,10 @@ class UinUidStore {
     };
   }
 
+  /**
+   * @param {Record<string, any>} snapshot
+   * @returns {boolean}
+   */
   loadSnapshot(snapshot) {
     if (
       !snapshot ||
@@ -1448,6 +1750,10 @@ class UinUidStore {
     return true;
   }
 
+  /**
+   * @param {string} filePath
+   * @returns {boolean}
+   */
   loadFromFileSync(filePath) {
     if (!filePath || typeof filePath !== "string" || !filePath.trim()) {
       return false;
@@ -1456,15 +1762,26 @@ class UinUidStore {
       const raw = fs.readFileSync(filePath, "utf8");
       const parsed = JSON.parse(raw);
       return Boolean(this.loadSnapshot(parsed));
-    } catch (_) {
+    } catch (err) {
+      // Missing or corrupted snapshot on startup is non-fatal; start with empty cache
+      this._logger?.debug?.("stores:loadUinUidSnapshot", err);
       return false;
     }
   }
 
+  /**
+   * @param {string} filePath
+   * @returns {Promise<boolean>}
+   */
   async saveToFile(filePath) {
-    return enqueueCoalescedSave(this._persist, filePath, () => this.toSnapshot());
+    return enqueueCoalescedSave(this._persist, filePath, () => this.toSnapshot(), this._logger);
   }
 
+  /**
+   * @param {string} filePath
+   * @param {{ debounceMs?: number }} [opts={}]
+   * @returns {boolean}
+   */
   enableAutoPersist(filePath, { debounceMs = 2000 } = {}) {
     const targetPath = typeof filePath === "string" ? filePath.trim() : "";
     if (!targetPath) {
@@ -1490,6 +1807,9 @@ class UinUidStore {
     }
   }
 
+  /**
+   * @returns {boolean}
+   */
   schedulePersist() {
     if (!this._persist.enabled || !this._persist.filePath) return false;
     this._persist.dirty = true;
@@ -1501,7 +1821,10 @@ class UinUidStore {
       this._persist.timer = null;
       if (!this._persist.enabled || !this._persist.dirty) return;
       this._persist.dirty = false;
-      this.saveToFile(targetPath).catch(() => {});
+      this.saveToFile(targetPath).catch((err) => {
+        // Background debounced snapshot write failure must not surface as unhandled rejection
+        this._logger?.debug?.("stores:autoPersistUinUid", err);
+      });
     }, this._persist.debounceMs);
     if (timer && typeof timer.unref === "function") {
       timer.unref();
@@ -1510,6 +1833,9 @@ class UinUidStore {
     return true;
   }
 
+  /**
+   * @returns {Promise<boolean>}
+   */
   async flushPersist() {
     if (this._persist.timer) {
       clearTimeout(this._persist.timer);
@@ -1524,6 +1850,13 @@ class UinUidStore {
   }
 }
 
+/**
+ * Looks up a cached UIN synchronously from a `UinUidStore` (or compatible mock).
+ *
+ * @param {any} uinUidStore
+ * @param {any} uid
+ * @returns {string | number}
+ */
 function lookupCachedUin(uinUidStore, uid) {
   if (!uinUidStore || !uid) return 0;
   const uidStr = String(uid).trim();
@@ -1541,34 +1874,9 @@ function lookupCachedUin(uinUidStore, uid) {
   return 0;
 }
 
-function stripTransientNtMedia(ntMsg) {
-  if (ntMsg && Array.isArray(ntMsg.elements)) {
-    for (const el of ntMsg.elements) {
-      if (!el || typeof el !== "object") continue;
-      if (el.picElement && typeof el.picElement === "object") {
-        try {
-          delete el.picElement.__base64Uri;
-        } catch (_) {
-          el.picElement.__base64Uri = undefined;
-        }
-      }
-      if (el.pttElement && typeof el.pttElement === "object") {
-        try {
-          delete el.pttElement.__base64Uri;
-        } catch (_) {
-          el.pttElement.__base64Uri = undefined;
-        }
-      }
-    }
-  }
-  return ntMsg;
-}
-
 module.exports = {
   pickPositiveUin,
   lookupCachedUin,
-  stripTransientNtMedia,
-  buildNtMarketFaceUrl,
   MessageIdStore,
   UinUidStore,
 };

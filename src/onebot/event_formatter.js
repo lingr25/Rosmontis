@@ -1,14 +1,33 @@
+// @ts-check
 "use strict";
+
+/**
+ * NTQQ -> OneBot v11 Event Formatter (`src/onebot/event_formatter.js`)
+ *
+ * Converts NTQQ raw messages, gray-tip notices (recall, poke, essence, exclusive
+ * title, lucky king, group membership/ban/admin, friend add), group file uploads,
+ * requests, and meta events into standard OneBot v11 event envelopes.
+ */
 
 const { pickPositiveUin, lookupCachedUin } = require("./stores");
 const { ntMsgToOneBotSegments } = require("./segment_converter");
 
+/**
+ * @param {any} roleVal
+ * @returns {"owner" | "admin" | "member"}
+ */
 function mapNtRoleToOneBot(roleVal) {
   if (roleVal === "owner" || roleVal === 4 || roleVal === "4") return "owner";
   if (roleVal === "admin" || roleVal === 3 || roleVal === "3") return "admin";
   return "member";
 }
 
+/**
+ * @param {Record<string, any>} ntMsg
+ * @param {Record<string, any>} el
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Record<string, any> | null}
+ */
 function parseGrayTipEvent(ntMsg, el, ctx = {}) {
   const gt = el.grayTipElement;
   if (!gt) return null;
@@ -90,6 +109,10 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
     gt.jsonGrayTipElement?.xmlToJsonParam?.templParam ||
     gt.aioOpGrayTipElement?.templParam ||
     null;
+  /**
+   * @param {string} key
+   * @returns {any}
+   */
   const getTemplParam = (key) => {
     if (!rawTempl) return undefined;
     if (rawTempl instanceof Map) return rawTempl.get(key);
@@ -453,8 +476,11 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
 }
 
 /**
- * Format an NTQQ `RawMessage` into a OneBot v11 Event (or array of events when a
- * group file message also emits a `group_upload` notice).
+ * Format an NTQQ `RawMessage` into a OneBot v11 Event (or `null` when non-actionable).
+ *
+ * @param {Record<string, any>} ntMsg
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Record<string, any> | null}
  */
 function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
   if (!ntMsg || typeof ntMsg !== "object") return null;
@@ -619,6 +645,11 @@ function formatNtMsgToOneBotEvent(ntMsg, ctx = {}) {
   return event;
 }
 
+/**
+ * @param {Record<string, any>} ntMsg
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Record<string, any> | null}
+ */
 function formatGroupUploadNotice(ntMsg, ctx = {}) {
   if (!ntMsg || Number(ntMsg.chatType) !== 2 || !Array.isArray(ntMsg.elements)) return null;
   const fileEl = ntMsg.elements.find((e) => e?.elementType === 3 && e.fileElement)?.fileElement;
@@ -646,6 +677,12 @@ function formatGroupUploadNotice(ntMsg, ctx = {}) {
   };
 }
 
+/**
+ * @param {string} noticeType
+ * @param {Record<string, any>} [payload={}]
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Record<string, any>}
+ */
 function formatNoticeEvent(noticeType, payload = {}, ctx = {}) {
   const selfId = Number(ctx.selfId ?? payload.self_id ?? 0);
   const time = Number(payload.time || Math.floor(Date.now() / 1000));
@@ -658,6 +695,12 @@ function formatNoticeEvent(noticeType, payload = {}, ctx = {}) {
   return { ...base, ...payload, time, self_id: selfId, post_type: "notice", notice_type: noticeType };
 }
 
+/**
+ * @param {string} requestType
+ * @param {Record<string, any>} [payload={}]
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Record<string, any>}
+ */
 function formatRequestEvent(requestType, payload = {}, ctx = {}) {
   const selfId = Number(ctx.selfId ?? payload.self_id ?? 0);
   const time = Number(payload.time || Math.floor(Date.now() / 1000));
@@ -685,6 +728,12 @@ function formatRequestEvent(requestType, payload = {}, ctx = {}) {
   };
 }
 
+/**
+ * @param {string} metaEventType
+ * @param {Record<string, any>} [payload={}]
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Record<string, any>}
+ */
 function formatMetaEvent(metaEventType, payload = {}, ctx = {}) {
   const selfId = Number(ctx.selfId ?? payload.self_id ?? 0);
   const time = Number(payload.time || Math.floor(Date.now() / 1000));

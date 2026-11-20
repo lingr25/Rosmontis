@@ -1,4 +1,13 @@
+// @ts-check
 "use strict";
+
+/**
+ * NTQQ <-> OneBot v11 Segment & Rich Media Converter (`src/onebot/segment_converter.js`)
+ *
+ * Handles bidirectional conversion between NTQQ kernel `msgElements` and OneBot v11
+ * message segments, market-face/pic/record URL derivation, transient base64 stripping,
+ * and video thumbnail synthesis.
+ */
 
 const fs = require("fs");
 const os = require("os");
@@ -8,13 +17,17 @@ const { execFile } = require("child_process");
 const { pathToFileURL } = require("url");
 
 const { segmentsToCqCode, normalizeOneBotMessage } = require("./cq_codec");
-const { pickPositiveUin, lookupCachedUin, buildNtMarketFaceUrl } = require("./stores");
+const { pickPositiveUin, lookupCachedUin } = require("./stores");
 const { resolveMediaSource } = require("../core/media_security");
 const { resolveFfmpegPathFromEnv } = require("../core/env");
 const {
   prepareVoiceMedia,
   DEFAULT_WAVE_AMPLITUDES,
 } = require("../core/audio_codec");
+
+/**
+ * @typedef {import("../types").OneBotSegment} OneBotSegment
+ */
 
 // Minimal valid 1x1 black RGB PNG (67 bytes) for fallback video thumbnail when ffmpeg is absent
 const FALLBACK_VIDEO_THUMB_PNG = Buffer.from(
@@ -26,6 +39,89 @@ const FALLBACK_VIDEO_THUMB_MD5 = crypto
   .update(FALLBACK_VIDEO_THUMB_PNG)
   .digest("hex");
 
+/**
+ * Resolves the canonical URL (or local `file://` URI) for an NTQQ mall sticker
+ * (`marketFaceElement`) or raw hex `emojiId` string.
+ *
+ * @param {string | Record<string, any> | null | undefined} marketFaceElement
+ * @returns {string}
+ */
+function buildNtMarketFaceUrl(marketFaceElement) {
+  if (typeof marketFaceElement === "string") {
+    const emojiId = marketFaceElement.trim().toLowerCase();
+    if (/^[0-9a-f]{4,64}$/.test(emojiId)) {
+      return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw300.gif`;
+    }
+    return "";
+  }
+  if (!marketFaceElement || typeof marketFaceElement !== "object") return "";
+  if (typeof marketFaceElement.__base64Uri === "string" && marketFaceElement.__base64Uri) {
+    return marketFaceElement.__base64Uri;
+  }
+  const directUrl = String(marketFaceElement.url || "").trim();
+  if (directUrl) {
+    return directUrl;
+  }
+  const emojiId = String(marketFaceElement.emojiId || "").trim().toLowerCase();
+  if (/^[0-9a-f]{4,64}$/.test(emojiId)) {
+    return `https://gxh.vip.qq.com/club/item/parcel/item/${emojiId.slice(0, 2)}/${emojiId}/raw300.gif`;
+  }
+  const candidatePaths = [
+    marketFaceElement.dynamicFacePath,
+    marketFaceElement.staticFacePath,
+  ];
+  for (const rawPath of candidatePaths) {
+    if (typeof rawPath !== "string") continue;
+    const localPath = rawPath.trim();
+    if (!localPath) continue;
+    try {
+      return pathToFileURL(localPath).href;
+    } catch (_urlErr) {
+      // Non-absolute or platform-mismatched local path; fall back to plain file:// URI
+      return `file://${localPath}`;
+    }
+  }
+  return "";
+}
+
+/**
+ * Removes transient hydrated `__base64Uri` properties attached to NTQQ raw
+ * message elements so stored raw messages do not retain megabytes of base64 data.
+ *
+ * @template T
+ * @param {T} ntMsg
+ * @returns {T}
+ */
+function stripTransientNtMedia(ntMsg) {
+  const msgObj = /** @type {any} */ (ntMsg);
+  if (msgObj && Array.isArray(msgObj.elements)) {
+    for (const el of msgObj.elements) {
+      if (!el || typeof el !== "object") continue;
+      if (el.picElement && typeof el.picElement === "object") {
+        try {
+          delete el.picElement.__base64Uri;
+        } catch (_deleteErr) {
+          // Non-configurable or proxy-backed element; clear property value directly
+          el.picElement.__base64Uri = undefined;
+        }
+      }
+      if (el.pttElement && typeof el.pttElement === "object") {
+        try {
+          delete el.pttElement.__base64Uri;
+        } catch (_deleteErr) {
+          // Non-configurable or proxy-backed element; clear property value directly
+          el.pttElement.__base64Uri = undefined;
+        }
+      }
+    }
+  }
+  return ntMsg;
+}
+
+/**
+ * @param {string} stderrText
+ * @returns {number}
+ */
 function parseFfmpegDurationSeconds(stderrText) {
   const m = /Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/i.exec(String(stderrText || ""));
   if (!m) return 0;
@@ -33,6 +129,11 @@ function parseFfmpegDurationSeconds(stderrText) {
   return Number.isFinite(sec) && sec > 0 ? Math.max(1, Math.round(sec)) : 0;
 }
 
+/**
+ * @param {Record<string, any>} videoMedia
+ * @param {Record<string, any>} data
+ * @param {Record<string, any>} [ctx={}]
+ */
 async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
   const explicitCover = String(data.cover || data.thumb || "").trim();
   if (explicitCover) {
@@ -60,7 +161,10 @@ async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
           probedDuration: 0,
         };
       }
-    } catch (_) {}
+    } catch (coverErr) {
+      // Explicit cover image failed to resolve; fall back to ffmpeg frame extraction or 1x1 PNG
+      ctx.logger?.debug?.("segment_converter:videoCoverFallback", coverErr);
+    }
   }
 
   const baseTempDir = String(ctx.tempDir || path.join(os.tmpdir(), "rosmontis-media"));
@@ -71,6 +175,7 @@ async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
   if (ffmpegBin && videoMedia?.localPath) {
     const jpgThumbPath = path.join(baseTempDir, `vthumb_${randSuffix}.jpg`);
     const timeoutMs = Math.max(1500, Number(ctx.transcodeTimeoutMs || 10000));
+    /** @type {{ err: any, stderr: string }} */
     const ffResult = await new Promise((resolve) => {
       execFile(
         ffmpegBin,
@@ -101,7 +206,9 @@ async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
         const cleanup = async () => {
           try {
             await fs.promises.unlink(jpgThumbPath);
-          } catch (_) {}
+          } catch (_unlinkErr) {
+            // Best-effort cleanup of temp ffmpeg thumbnail
+          }
         };
         return {
           thumbMedia: { localPath: jpgThumbPath, isTemp: true, cleanup },
@@ -113,10 +220,15 @@ async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
           probedDuration,
         };
       }
-    } catch (_) {}
+    } catch (readErr) {
+      // ffmpeg absent or failed to emit a thumbnail frame; fall back to synthetic 1x1 PNG
+      ctx.logger?.debug?.("segment_converter:ffmpegThumbReadFallback", readErr);
+    }
     try {
       await fs.promises.unlink(jpgThumbPath);
-    } catch (_) {}
+    } catch (_unlinkErr) {
+      // Temp thumbnail file was never written or already removed
+    }
   }
 
   const pngThumbPath = path.join(baseTempDir, `vthumb_${randSuffix}.png`);
@@ -124,7 +236,9 @@ async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
   const cleanup = async () => {
     try {
       await fs.promises.unlink(pngThumbPath);
-    } catch (_) {}
+    } catch (_unlinkErr) {
+      // Best-effort cleanup of fallback PNG thumbnail
+    }
   };
   return {
     thumbMedia: { localPath: pngThumbPath, isTemp: true, cleanup },
@@ -137,6 +251,10 @@ async function buildVideoThumbnail(videoMedia, data, ctx = {}) {
   };
 }
 
+/**
+ * @param {string} localPath
+ * @returns {string}
+ */
 function safePathToFileUrl(localPath) {
   const trimmed = String(localPath || "").trim();
   if (!trimmed) return "";
@@ -144,11 +262,21 @@ function safePathToFileUrl(localPath) {
     if (path.isAbsolute(trimmed)) {
       return pathToFileURL(trimmed).href;
     }
-  } catch (_) {}
+  } catch (_urlErr) {
+    // Non-standard absolute path; fall back to manual slash-normalized file:// URI
+  }
   return `file://${trimmed.replace(/\\/g, "/")}`;
 }
 
+/**
+ * Builds the best available download/display URL for an NTQQ `picElement`.
+ *
+ * @param {Record<string, any> | null | undefined} picElement
+ * @param {number} [chatType]
+ * @returns {string}
+ */
 function buildNtPicUrl(picElement, chatType) {
+  void chatType;
   if (!picElement || typeof picElement !== "object") return "";
   if (typeof picElement.__base64Uri === "string" && picElement.__base64Uri) {
     return picElement.__base64Uri;
@@ -174,6 +302,7 @@ function buildNtPicUrl(picElement, chatType) {
   if (!origin.startsWith("/download") && md5 && /^[0-9A-F]{32}$/.test(md5)) {
     return `https://gchat.qpic.cn/gchatpic_new/0/0-0-${md5}/0?term=2`;
   }
+  /** @type {string[]} */
   const candidatePaths = [];
   if (picElement.sourcePath) candidatePaths.push(String(picElement.sourcePath));
   if (picElement.thumbPath instanceof Map) {
@@ -197,6 +326,12 @@ function buildNtPicUrl(picElement, chatType) {
   return "";
 }
 
+/**
+ * Builds an internal `ntqq://record?...` token URI for an NTQQ `pttElement`.
+ *
+ * @param {Record<string, any> | null | undefined} pttElement
+ * @returns {string}
+ */
 function buildNtRecordUri(pttElement) {
   if (!pttElement || typeof pttElement !== "object") return "";
   const params = new URLSearchParams();
@@ -210,18 +345,28 @@ function buildNtRecordUri(pttElement) {
 /**
  * Convert NTQQ `ntMsg` (or `{ elements, chatType, peerUid }`) into OneBot v11
  * `{ segments, raw_message }`.
+ *
+ * @param {Record<string, any> | Array<Record<string, any>> | null | undefined} ntMsg
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {{ segments: OneBotSegment[], raw_message: string }}
  */
 function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
-  const elements = Array.isArray(ntMsg) ? ntMsg : Array.isArray(ntMsg?.elements) ? ntMsg.elements : [];
-  const chatType = Number(ntMsg?.chatType || ctx.chatType || 1);
-  const peerUid = String(ntMsg?.peerUid || ctx.peerUid || "");
+  const msgObj = !Array.isArray(ntMsg) && ntMsg && typeof ntMsg === "object" ? ntMsg : null;
+  const elements = Array.isArray(ntMsg)
+    ? ntMsg
+    : Array.isArray(msgObj?.elements)
+    ? msgObj.elements
+    : [];
+  const chatType = Number(msgObj?.chatType || ctx.chatType || 1);
+  const peerUid = String(msgObj?.peerUid || ctx.peerUid || "");
   const uinUidStore = ctx.uinUidStore || null;
   const messageIdStore = ctx.messageIdStore || ctx.msgIdStore || null;
 
-  if (uinUidStore && ntMsg && !Array.isArray(ntMsg)) {
-    uinUidStore.rememberFromNtMsg(ntMsg);
+  if (uinUidStore && msgObj) {
+    uinUidStore.rememberFromNtMsg(msgObj);
   }
 
+  /** @type {OneBotSegment[]} */
   const segments = [];
   for (const el of elements) {
     if (!el || typeof el !== "object") continue;
@@ -488,9 +633,9 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
         ? we.grabUin
         : [];
       const targetUins = rawTargets
-        .map((u) => pickPositiveUin(u))
-        .filter((u) => u > 0)
-        .map((u) => String(u));
+        .map((/** @type {any} */ u) => pickPositiveUin(u))
+        .filter((/** @type {number} */ u) => u > 0)
+        .map((/** @type {number} */ u) => String(u));
       segments.push({
         type: "redbag",
         data: {
@@ -544,7 +689,7 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
         const m = /\b(?:m_resid|resid)="([^"]+)"/i.exec(String(fwd.xmlContent));
         if (m && m[1]) xmlResId = m[1];
       }
-      const resId = String(fwd.resId || xmlResId || ntMsg?.msgId || "");
+      const resId = String(fwd.resId || xmlResId || msgObj?.msgId || "");
       segments.push({
         type: "forward",
         data: {
@@ -556,7 +701,7 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
     }
   }
 
-  if (segments.length === 0 && !Array.isArray(ntMsg) && Number(ntMsg?.msgType) === 10) {
+  if (segments.length === 0 && msgObj && Number(msgObj.msgType) === 10) {
     segments.push({
       type: "redbag",
       data: { title: "QQ红包" },
@@ -569,6 +714,12 @@ function ntMsgToOneBotSegments(ntMsg, ctx = {}) {
   };
 }
 
+/**
+ * Selects the primary media source string from a OneBot segment `data` object.
+ *
+ * @param {Record<string, any>} data
+ * @returns {string}
+ */
 function pickMediaSource(data) {
   const file = String(data.file ?? "").trim();
   const url = String(data.url ?? "").trim();
@@ -587,17 +738,32 @@ function pickMediaSource(data) {
 /**
  * Convert OneBot v11 message (array of segments or CQ-code string) into NTQQ
  * `msgElements` array ready for `nodeIKernelMsgService/sendMsg`.
+ *
+ * @param {string | OneBotSegment | OneBotSegment[]} message
+ * @param {Record<string, any>} [ctx={}]
+ * @returns {Promise<{
+ *   elements: Array<Record<string, any>>,
+ *   sideEffects: Array<Record<string, any>>,
+ *   pokeTargets: Array<Record<string, any>>,
+ *   cleanupCallbacks: Array<() => void>,
+ *   tempFiles: string[],
+ * }>}
  */
 async function oneBotSegmentsToNtElements(message, ctx = {}) {
   const segments = normalizeOneBotMessage(message, Boolean(ctx.autoEscape));
   const uinUidStore = ctx.uinUidStore || null;
   const messageIdStore = ctx.messageIdStore || ctx.msgIdStore || null;
   const invokeNt = ctx.invokeNt || null;
+  /** @type {Array<Record<string, any>>} */
   const elements = [];
+  /** @type {Array<Record<string, any>>} */
   const sideEffects = [];
+  /** @type {Array<() => void>} */
   const cleanupCallbacks = [];
+  /** @type {string[]} */
   const tempFiles = [];
 
+  /** @param {Record<string, any> | null | undefined} media */
   function trackTempMedia(media) {
     if (media && media.isTempFile && media.localPath) {
       const tempPath = media.localPath;
@@ -607,7 +773,10 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
           if (fs.existsSync(tempPath)) {
             fs.unlinkSync(tempPath);
           }
-        } catch (_) {}
+        } catch (unlinkErr) {
+          // Temp file may already have been pruned or transiently locked by NTQQ
+          ctx.logger?.debug?.("segment_converter:cleanupTempMedia", unlinkErr);
+        }
       });
     }
   }
@@ -1170,6 +1339,7 @@ module.exports = {
   buildNtPicUrl,
   buildNtMarketFaceUrl,
   buildNtRecordUri,
+  stripTransientNtMedia,
   ntMsgToOneBotSegments,
   pickMediaSource,
   oneBotSegmentsToNtElements,
