@@ -141,7 +141,7 @@ class NtqqOneBotBridge extends EventEmitter {
     this._recentSentMsgByPeer = new BoundedMap(2000);
 
     this.invokeStats = {
-      tier1: 0, tier2: 0, tier3: 0, degraded: 0,
+      tier1: 0, tier2: 0, tier3: 0, directMain: 0, degraded: 0,
       blockedReplays: 0, failed: 0, lastDegraded: null,
     };
 

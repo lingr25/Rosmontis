@@ -138,6 +138,7 @@
  * @property {boolean} [rendererAutoReload]
  * @property {number} [rendererMaxReloadsPerMinute]
  * @property {number} [rendererReloadBackoffMs]
+ * @property {boolean} [preferMainProcessForBulkReads]
  * @property {RateLimitConfig} [rateLimit]
  */
 

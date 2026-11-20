@@ -282,7 +282,7 @@ const mediaHydratorMixin = {
     let st = await statPositiveFile(localPath);
     if (!st && Number(pe.fileSize || 0) > MAX_HYDRATE_PIC_BYTES) return;
 
-    if (!st && !localPath && pe.md5HexStr && this._isNtReady()) {
+    if (!ctx.skipRemoteDownload && !st && !localPath && pe.md5HexStr && this._isNtReady()) {
       try {
         const pathInfo = {
           md5HexStr: String(pe.md5HexStr),
@@ -417,7 +417,7 @@ const mediaHydratorMixin = {
       }
     }
 
-    if (!st && this._isNtReady() && ptt.md5HexStr) {
+    if (!ctx.skipRemoteDownload && !st && this._isNtReady() && ptt.md5HexStr) {
       try {
         const pathInfo = {
           md5HexStr: String(ptt.md5HexStr),
@@ -501,6 +501,7 @@ const mediaHydratorMixin = {
     };
 
     const ctx = {
+      skipRemoteDownload,
       downSourceType,
       fallbackChatType,
       fallbackPeerUid,

@@ -662,6 +662,12 @@ function loadBridgeConfig(customConfigDir) {
     "HTTP_POST_TIMEOUT_MS"
   );
 
+  defaultConfig.preferMainProcessForBulkReads = _resolveBoolWithDefault(
+    loadedRaw.preferMainProcessForBulkReads ?? loadedRaw.prefer_main_process_for_bulk_reads,
+    true,
+    "PREFER_MAIN_PROCESS_FOR_BULK_READS"
+  );
+
   const envCompatProfile = pickPrefixedEnv("COMPAT_PROFILE").toLowerCase();
   const rawCompatProfile = String(
     envCompatProfile || loadedRaw.compatProfile || loadedRaw.compat_profile || "rosmontis"

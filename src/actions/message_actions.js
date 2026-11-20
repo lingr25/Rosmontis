@@ -465,6 +465,7 @@ async function getMessageHistory(bridge, p, context, isGroup) {
     }
   }
   const queryOrder = startMsgId === "0";
+  const bulkReadOpts = { preferMainProcess: true };
   let res = await bridge.invokeNt(
     "nodeIKernelMsgService/getMsgsIncludeSelf",
     {
@@ -473,7 +474,8 @@ async function getMessageHistory(bridge, p, context, isGroup) {
       cnt: count,
       queryOrder,
     },
-    [peer, startMsgId, count, queryOrder]
+    [peer, startMsgId, count, queryOrder],
+    bulkReadOpts
   );
   let rawList = Array.isArray(res?.msgList) ? res.msgList : [];
   if (rawList.length === 0 && queryOrder) {
@@ -485,7 +487,8 @@ async function getMessageHistory(bridge, p, context, isGroup) {
         cnt: count,
         queryOrder: false,
       },
-      [peer, startMsgId, count, false]
+      [peer, startMsgId, count, false],
+      bulkReadOpts
     );
     rawList = Array.isArray(res?.msgList) ? res.msgList : [];
   }

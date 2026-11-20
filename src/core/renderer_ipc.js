@@ -988,9 +988,13 @@ const rendererIpcMixin = {
     throw makeBridgeUnavailableError("no live renderer command transport");
   },
 
-  _recordInvokeTier(cmd, tier, prevErrors) {
+  _recordInvokeTier(cmd, tier, prevErrors, options = null) {
     const stats = this.invokeStats;
     stats[`tier${tier}`] = (stats[`tier${tier}`] || 0) + 1;
+    if (options && options.intentionalDirect) {
+      stats.directMain = (stats.directMain || 0) + 1;
+      return;
+    }
     if (tier > 1) {
       stats.degraded += 1;
       stats.lastDegraded = { cmd, tier, at: Date.now() };
@@ -1038,17 +1042,60 @@ const rendererIpcMixin = {
     } catch (_) {}
   },
 
+  async _invokeTier2NtApi(cmd, payload, sideEffect, errors, stopAfterDispatchedFailure, options = null) {
+    if (!this.capturedServices?.ntApi) {
+      return { handled: false, value: undefined };
+    }
+    const ntApiTarget =
+      typeof this.capturedServices.ntApi["nodeIKernelMsgService/sendMsg"] === "function"
+        ? this.capturedServices.ntApi
+        : this.capturedServices.ntApi.invoke &&
+          typeof this.capturedServices.ntApi.invoke["nodeIKernelMsgService/sendMsg"] === "function"
+        ? this.capturedServices.ntApi.invoke
+        : this.capturedServices.ntApi;
+    let handler = null;
+    try {
+      handler = ntApiTarget[cmd];
+    } catch (_) {}
+    if (typeof handler === "function") {
+      try {
+        const fakeIpcEvent = {
+          sender: this.activeWebContents || {
+            id: 1,
+            send() {},
+            isDestroyed: () => false,
+          },
+        };
+        const res = await handler(payload, fakeIpcEvent);
+        // A resolved side-effect call has been dispatched even if it returns void.
+        if (res !== undefined || sideEffect) {
+          this._recordInvokeTier(cmd, 2, errors, options);
+          return { handled: true, value: res };
+        }
+      } catch (e) {
+        if (stopAfterDispatchedFailure(e)) throw e;
+      }
+    } else {
+      errors.push(makeBridgeUnavailableError(`ntApi has no handler for ${cmd}`));
+    }
+    return { handled: false, value: undefined };
+  },
+
   /**
    * 3-tier NTQQ invocation.
    *
    * Fallback policy:
    * - Read/idempotent commands: any Tier failure falls through to the next Tier (legacy behaviour).
+   * - Bulk read-only commands (`invokeOptions.preferMainProcess === true` when
+   *   `config.preferMainProcessForBulkReads !== false`): try main-process `ntApi` (Tier 2) first
+   *   to avoid double Mojo structured-clone + JSON serialization round-trips through the renderer
+   *   process, falling back cleanly to Tier 1 / Tier 3 if unavailable.
    * - Side-effect commands (`SIDE_EFFECT_NT_METHODS`, e.g. sendMsg/recallMsg): only fall through
    *   when the previous Tier could not dispatch at all (`BRIDGE_UNAVAILABLE_TAG`). Once a Tier has
    *   actually dispatched the call, its timeout/error is surfaced as-is and never replayed, so a
    *   slow upload or a risk-control rejection can not turn into duplicate messages.
    */
-  async invokeNt(cmd, payload = {}, positionalArgs = null) {
+  async invokeNt(cmd, payload = {}, positionalArgs = null, invokeOptions = null) {
     const errors = [];
     const sideEffect = isSideEffectNtCmd(cmd);
     const stopAfterDispatchedFailure = (err) => {
@@ -1063,6 +1110,31 @@ const rendererIpcMixin = {
       }
       return false;
     };
+
+    const preferMainDirect =
+      !sideEffect &&
+      Boolean(invokeOptions && invokeOptions.preferMainProcess) &&
+      this.config?.preferMainProcessForBulkReads !== false &&
+      typeof this.rendererExecute !== "function" &&
+      Boolean(this.capturedServices?.ntApi);
+
+    // Optional fast-path for bulk read-only queries (e.g. getMsgsIncludeSelf) to avoid
+    // large double-hop Mojo/JSON payloads through the Electron renderer process.
+    let tier2Attempted = false;
+    if (preferMainDirect) {
+      tier2Attempted = true;
+      const directRes = await this._invokeTier2NtApi(
+        cmd,
+        payload,
+        sideEffect,
+        errors,
+        stopAfterDispatchedFailure,
+        { intentionalDirect: true }
+      );
+      if (directRes.handled) {
+        return directRes.value;
+      }
+    }
 
     // Tier 1: Execute via Renderer structured IPC (`__ROSMONTIS_BRIDGE_CMD__`) or safe fallback
     if (typeof this.rendererExecute === "function") {
@@ -1094,38 +1166,16 @@ const rendererIpcMixin = {
     // Tier 2: Execute via Main-Process `ntApi[cmd]` Proxy
     // Note: Real NTQQ 3.2.32 `ntApi.invoke[cmd]` expects `(payload, ipcEvent)` directly
     // (NOT `([payload, null], ipcEvent)`).
-    if (this.capturedServices.ntApi) {
-      const ntApiTarget =
-        typeof this.capturedServices.ntApi["nodeIKernelMsgService/sendMsg"] === "function"
-          ? this.capturedServices.ntApi
-          : this.capturedServices.ntApi.invoke &&
-            typeof this.capturedServices.ntApi.invoke["nodeIKernelMsgService/sendMsg"] === "function"
-          ? this.capturedServices.ntApi.invoke
-          : this.capturedServices.ntApi;
-      let handler = null;
-      try {
-        handler = ntApiTarget[cmd];
-      } catch (_) {}
-      if (typeof handler === "function") {
-        try {
-          const fakeIpcEvent = {
-            sender: this.activeWebContents || {
-              id: 1,
-              send() {},
-              isDestroyed: () => false,
-            },
-          };
-          const res = await handler(payload, fakeIpcEvent);
-          // A resolved side-effect call has been dispatched even if it returns void.
-          if (res !== undefined || sideEffect) {
-            this._recordInvokeTier(cmd, 2, errors);
-            return res;
-          }
-        } catch (e) {
-          if (stopAfterDispatchedFailure(e)) throw e;
-        }
-      } else {
-        errors.push(makeBridgeUnavailableError(`ntApi has no handler for ${cmd}`));
+    if (!tier2Attempted && this.capturedServices.ntApi) {
+      const tier2Res = await this._invokeTier2NtApi(
+        cmd,
+        payload,
+        sideEffect,
+        errors,
+        stopAfterDispatchedFailure
+      );
+      if (tier2Res.handled) {
+        return tier2Res.value;
       }
     }
 

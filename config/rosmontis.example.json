@@ -21,6 +21,7 @@
   "rendererAutoReload": true,
   "rendererMaxReloadsPerMinute": 3,
   "rendererReloadBackoffMs": 1500,
+  "preferMainProcessForBulkReads": true,
   "rateLimit": {
     "enabled": false,
     "globalPerSec": 10,

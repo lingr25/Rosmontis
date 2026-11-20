@@ -498,6 +498,31 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
         continue;
       }
 
+      // Deduplicate identical main + renderer-forwarded msg info update deliveries
+      // within a short window to avoid redundant UID lookups and store churn during
+      // bulk history fetches across many groups.
+      if (ntMsg.msgId) {
+        const emojiSig = Array.isArray(ntMsg.emojiLikesList)
+          ? ntMsg.emojiLikesList
+              .filter((item) => item && typeof item === "object")
+              .map(
+                (item) =>
+                  `${Number(item.emojiType ?? item.emoji_type ?? 1)}:${String(
+                    item.emojiId ?? item.emoji_id ?? ""
+                  )}:${Number(item.likesCnt ?? item.count ?? 1)}`
+              )
+              .sort()
+              .join(",")
+          : "";
+        const elCount = Array.isArray(ntMsg.elements) ? ntMsg.elements.length : 0;
+        const updateKey = `msgu:${eventName}:${ntMsg.msgId}:${ntMsg.msgSeq || 0}:${
+          ntMsg.recallTime || 0
+        }:${elCount}:${emojiSig}`;
+        if (this._isDuplicateEvent(updateKey, 3000)) {
+          continue;
+        }
+      }
+
       await this._resolveNtMsgUids(ntMsg);
       let hit = null;
       let oneBotId = 0;
