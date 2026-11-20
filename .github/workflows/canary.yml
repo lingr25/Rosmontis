@@ -88,7 +88,7 @@ jobs:
       - name: Verify /health, /get_status, /get_login_qrcode & pure-JS invariants
         run: |
           set -euo pipefail
-          node <<'EOF'
+          cat <<'EOF' > /tmp/rosmontis_canary_smoke.js
           const { execFileSync } = require("child_process");
 
           const container = process.env.CONTAINER_NAME;
@@ -250,11 +250,13 @@ jobs:
               `Capture telemetry summary: map_hook_active=${finalBridge.map_hook_active}, map_hook_release=${JSON.stringify(finalBridge.map_hook_release)}`
             );
             console.log("Final sanitized /get_status:", sanitize(JSON.stringify(finalStatus.json, null, 2)));
+            console.log("Canary smoke check PASSED.");
           })().catch((err) => {
             console.error("Canary smoke check failed:", sanitize(err && err.stack ? err.stack : String(err)));
             process.exit(1);
           });
           EOF
+          node /tmp/rosmontis_canary_smoke.js
 
       - name: Dump sanitized container logs & cleanup
         if: always()
