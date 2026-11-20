@@ -135,6 +135,7 @@ class NtqqOneBotBridge extends EventEmitter {
     this._groupListCache = new BoundedMap(2000);
     this._buddyCategoriesCache = [];
     this._groupListWaiters = new Set();
+    this._qrCodeWaiters = new Set();
     this._buddyListWaiters = new Set();
     this._profileDetailWaiters = new Map();
     this._doubtBuddyWaiters = new Set();

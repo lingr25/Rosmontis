@@ -1070,7 +1070,22 @@ const inboundPipelineMixin = Object.assign({}, mediaHydratorMixin, loginRecovery
     }
 
     // 9. Login / QR / Session / Offline (delegated to loginRecoveryMixin)
-    this._handleLoginKernelEvent(eventName, args);
+    const handledLogin = this._handleLoginKernelEvent(eventName, args);
+    if (
+      !handledLogin &&
+      (String(_listenerName || "").includes("Login") ||
+        String(eventName || "").includes("QR") ||
+        String(eventName || "").includes("Login"))
+    ) {
+      const argShape =
+        firstArg && typeof firstArg === "object"
+          ? Object.keys(firstArg).slice(0, 16).join(",")
+          : typeof firstArg;
+      this.logger?.debug?.(
+        "login",
+        `Unhandled login-like event ${_listenerName || "?"}/${eventName} (shape=${argShape})`
+      );
+    }
   },
 
   async _processIncomingNtMessage(ntMsg) {

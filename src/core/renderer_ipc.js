@@ -126,6 +126,8 @@ const SIDE_EFFECT_NT_METHODS = new Set([
   "modifySelfProfile",
   "modifyDesktopMiniProfile",
   "setStatus",
+  "setAutoLogin",
+  "setAutoLoginSwitch",
   "quickLogin",
   "quickLoginWithUin",
 ]);
@@ -1152,10 +1154,8 @@ const rendererIpcMixin = {
           cmd,
           argsSerialized,
         });
-        if (res !== undefined || sideEffect) {
-          this._recordInvokeTier(cmd, 1, errors);
-          return res;
-        }
+        this._recordInvokeTier(cmd, 1, errors);
+        return res;
       } catch (e) {
         if (stopAfterDispatchedFailure(e)) throw e;
       }

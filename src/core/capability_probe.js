@@ -247,18 +247,21 @@ function probeRuntimeCapabilities(bridge, options = {}) {
   const wrapperSession = resolveWrapperSession(bridge);
   const configRef = bridge?.config || null;
   const webCredentialsEnabled = Boolean(configRef?.enableWebCredentialApi);
+  const isOnline = Boolean(bridge?.online);
 
   const cached = bridge && typeof bridge === "object" ? bridge._capabilityProbeCache : null;
   if (
     !forceRefresh &&
     cached &&
     cached.result &&
+    cached.result.notes?.sessionInitialized !== false &&
     ttlMs > 0 &&
     now - cached.at < ttlMs &&
     cached.ntApiRef === ntApiTarget &&
     cached.wrapperSessionRef === wrapperSession &&
     cached.configRef === configRef &&
-    cached.webCredentials === webCredentialsEnabled
+    cached.webCredentials === webCredentialsEnabled &&
+    cached.online === isOnline
   ) {
     return cached.result;
   }
@@ -321,11 +324,27 @@ function probeRuntimeCapabilities(bridge, options = {}) {
   const ffmpegPath = resolveFfmpegPathFromEnv(bridge?.config?.ffmpegPath);
   const silkEncoderPath = resolveSilkEncoderPathFromEnv(bridge?.config?.silkEncoderPath);
   const silkDecoderPath = resolveSilkDecoderPathFromEnv(bridge?.config?.silkDecoderPath);
+  const ntApiMethodCount = countNtApiMethods(ntApiTarget);
+
+  const hasMsgServiceGetter = Boolean(
+    wrapperSession && typeof wrapperSession.getMsgService === "function"
+  );
+  const hasGroupServiceGetter = Boolean(
+    wrapperSession && typeof wrapperSession.getGroupService === "function"
+  );
+  const wrapperSessionInitialized = Boolean(
+    wrapperSession &&
+      ((hasMsgServiceGetter && Boolean(serviceCache.get("getMsgService"))) ||
+        (hasGroupServiceGetter && Boolean(serviceCache.get("getGroupService"))) ||
+        (!hasMsgServiceGetter && !hasGroupServiceGetter))
+  );
+  const hasExplicitNtApi = Boolean(ntApiTarget && !ntApiWildcard && ntApiMethodCount > 0);
+  const sessionInitialized = wrapperSessionInitialized || hasExplicitNtApi;
 
   const result = {
     probedAt: now,
     runtimeDetected: Boolean(ntApiTarget || wrapperSession),
-    ntApiMethodCount: countNtApiMethods(ntApiTarget),
+    ntApiMethodCount,
     wrapperServices: listWrapperServices(wrapperSession),
     mediaTools: {
       ffmpegPath,
@@ -336,7 +355,8 @@ function probeRuntimeCapabilities(bridge, options = {}) {
     notes: {
       copyFileWithDelExifInfo: hasCopyExif,
       getRichMediaFilePathForGuild: hasRichMediaPath,
-      opaqueNtApiProxy: Boolean(ntApiWildcard && !wrapperSession),
+      opaqueNtApiProxy: Boolean(ntApiWildcard && !wrapperSessionInitialized),
+      sessionInitialized,
     },
   };
 
@@ -347,6 +367,7 @@ function probeRuntimeCapabilities(bridge, options = {}) {
       wrapperSessionRef: wrapperSession,
       configRef,
       webCredentials: webCredentialsEnabled,
+      online: isOnline,
       result,
     };
   }

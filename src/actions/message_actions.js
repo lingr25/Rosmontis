@@ -10,8 +10,9 @@ const {
 } = bridgeOneBot;
 
 const { resolveCompatVersionInfo } = require("../core/config");
-const { createActionRouter } = require("../core/primitives");
+const { createActionRouter, waitForEventOnce } = require("../core/primitives");
 const { probeRuntimeCapabilities } = require("../core/capability_probe");
+const { extractQrCodeBase64 } = require("../core/login_recovery");
 
 const MAX_FORWARD_DEPTH = 3;
 const MAX_OVERFLOW_SUMMARY_LINES = 20;
@@ -592,17 +593,33 @@ const ACTION_HANDLERS = {
 
   async get_login_qrcode(p) {
     if (Boolean(p.refresh) || !this.lastQrCodeBase64) {
+      const waitMs =
+        p.wait_ms !== undefined && p.wait_ms !== null && Number.isFinite(Number(p.wait_ms))
+          ? Math.max(0, Math.min(Number(p.wait_ms), 10000))
+          : 2000;
+      const waitQrEvent =
+        waitMs > 0 && this._qrCodeWaiters
+          ? waitForEventOnce(this._qrCodeWaiters, waitMs)
+          : null;
+      let directQr = "";
       try {
         const qrRes = await this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {}, []);
-        const directQr =
-          qrRes?.pngBase64QrcodeData ||
-          qrRes?.qrcodeImage ||
-          qrRes?.result?.pngBase64QrcodeData ||
-          "";
+        directQr = extractQrCodeBase64(qrRes);
         if (directQr) {
-          this.lastQrCodeBase64 = String(directQr);
+          this.lastQrCodeBase64 = directQr;
+        } else {
+          const shape =
+            qrRes && typeof qrRes === "object"
+              ? Object.keys(qrRes).slice(0, 16).join(",")
+              : typeof qrRes;
+          this.logger?.debug?.("login", `getQRCodePicture returned without direct QR (shape=${shape})`);
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("login", err);
+      }
+      if (!directQr && waitQrEvent && (!this.lastQrCodeBase64 || Boolean(p.refresh))) {
+        await waitQrEvent;
+      }
     }
     return {
       online: Boolean(this.online),
@@ -616,7 +633,11 @@ const ACTION_HANDLERS = {
 
   can_send_image() {
     const probe = probeRuntimeCapabilities(this);
-    if (!probe.runtimeDetected || probe.notes?.opaqueNtApiProxy) {
+    if (
+      !probe.runtimeDetected ||
+      probe.notes?.opaqueNtApiProxy ||
+      probe.notes?.sessionInitialized === false
+    ) {
       return { yes: true };
     }
     return { yes: Boolean(probe.capabilities.send_image) };
@@ -624,7 +645,11 @@ const ACTION_HANDLERS = {
 
   can_send_record() {
     const probe = probeRuntimeCapabilities(this);
-    if (!probe.runtimeDetected || probe.notes?.opaqueNtApiProxy) {
+    if (
+      !probe.runtimeDetected ||
+      probe.notes?.opaqueNtApiProxy ||
+      probe.notes?.sessionInitialized === false
+    ) {
       return { yes: true };
     }
     return { yes: Boolean(probe.capabilities.send_record) };

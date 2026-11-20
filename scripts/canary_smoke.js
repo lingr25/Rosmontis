@@ -127,7 +127,7 @@ function requestJson(method, reqPath, body = undefined) {
         'if [ -n "${LD_PRELOAD:-}" ]; then echo "LD_PRELOAD set in container env: ${LD_PRELOAD}" >&2; exit 1; fi',
         'qq_pid="$(pgrep -f "/opt/QQ/qq" | head -n 1 || true)"',
         'if [ -z "${qq_pid}" ]; then echo "QQ process (/opt/QQ/qq) not found" >&2; exit 1; fi',
-        'proc_preload="$(tr "\\0" "\\n" < "/proc/${qq_pid}/environ" | grep "^LD_PRELOAD=" || true)"',
+        'proc_preload="$(tr "\\0" "\\n" < "/proc/${qq_pid}/environ" 2>/dev/null | grep "^LD_PRELOAD=" || true)"',
         'if [ -n "${proc_preload#LD_PRELOAD=}" ]; then echo "LD_PRELOAD active on QQ PID ${qq_pid}: ${proc_preload}" >&2; exit 1; fi',
         "test -f /opt/QQ/resources/app/app_launcher/bridge_main.js",
         'grep -q "bridge_main.js" /opt/QQ/resources/app/app_launcher/index.js',
@@ -160,6 +160,15 @@ function requestJson(method, reqPath, body = undefined) {
   }
   console.log("[canary] Initial /get_status telemetry:", sanitize(JSON.stringify(initialStatus.json, null, 2)));
 
+  // 3b. Verify pre-login can_send_image / can_send_record do not false-negative before session init
+  for (const action of ["can_send_image", "can_send_record"]) {
+    const canRes = await requestJson("POST", `/${action}`, {});
+    if (canRes.status !== 200 || !canRes.json || canRes.json.retcode !== 0 || canRes.json.data?.yes !== true) {
+      throw new Error(`Unexpected pre-login /${action} response: HTTP ${canRes.status} ${sanitize(canRes.text)}`);
+    }
+  }
+  console.log("[canary] Pre-login /can_send_image & /can_send_record verified: { yes: true }");
+
   // 4. Query POST /get_login_qrcode with {"refresh":true} (retry while Electron login UI initializes)
   const qrDeadline = Date.now() + 45_000;
   let qrFetched = false;
@@ -185,6 +194,14 @@ function requestJson(method, reqPath, body = undefined) {
     await sleep(3000);
   }
   if (!qrFetched) {
+    try {
+      const diagStatus = await requestJson("POST", "/get_status", {});
+      console.log("[canary] Diagnostic /get_status after QR timeout:", sanitize(JSON.stringify(diagStatus.json || diagStatus.text, null, 2)));
+      const diagLoginList = await requestJson("POST", "/get_login_list", {});
+      console.log("[canary] Diagnostic /get_login_list after QR timeout:", sanitize(JSON.stringify(diagLoginList.json || diagLoginList.text)));
+    } catch (diagErr) {
+      console.log("[canary] Diagnostic probe failed:", sanitize(diagErr?.message || String(diagErr)));
+    }
     throw new Error(`Failed to fetch login QR code within 45s (${lastQrSummary})`);
   }
 

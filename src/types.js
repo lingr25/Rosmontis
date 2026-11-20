@@ -170,7 +170,8 @@
  * @property {{
  *   copyFileWithDelExifInfo: boolean,
  *   getRichMediaFilePathForGuild: boolean,
- *   opaqueNtApiProxy: boolean
+ *   opaqueNtApiProxy: boolean,
+ *   sessionInitialized: boolean
  * }} notes
  */
 

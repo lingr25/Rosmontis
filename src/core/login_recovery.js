@@ -24,11 +24,22 @@ const LOGIN_KERNEL_EVENTS = Object.freeze(
 );
 
 function extractQrCodeBase64(payload) {
-  if (!payload || typeof payload !== "object") return "";
+  if (!payload) return "";
+  if (typeof payload === "string") {
+    const trimmed = payload.trim();
+    return trimmed.startsWith("data:image/") ? trimmed : "";
+  }
+  if (typeof payload !== "object") return "";
   const raw =
     payload.pngBase64QrcodeData ||
     payload.qrcodeImage ||
+    payload.qrCodeImage ||
+    payload.qrcode_base64 ||
+    payload.pngBase64 ||
     payload.result?.pngBase64QrcodeData ||
+    payload.result?.qrcodeImage ||
+    payload.data?.pngBase64QrcodeData ||
+    payload.data?.qrcodeImage ||
     "";
   return raw ? String(raw) : "";
 }
@@ -88,6 +99,21 @@ const loginRecoveryMixin = {
     const pngBase64 = extractQrCodeBase64(firstArg);
     if (pngBase64) {
       this.lastQrCodeBase64 = pngBase64;
+      if (this._qrCodeWaiters && this._qrCodeWaiters.size > 0) {
+        for (const resolveWaiter of Array.from(this._qrCodeWaiters)) {
+          try {
+            resolveWaiter(pngBase64);
+          } catch (_) {}
+        }
+        this._qrCodeWaiters.clear();
+      }
+      this.logger?.debug?.("login", `QR code updated (length=${pngBase64.length})`);
+    } else {
+      const argShape =
+        firstArg && typeof firstArg === "object"
+          ? Object.keys(firstArg).slice(0, 16).join(",")
+          : typeof firstArg;
+      this.logger?.debug?.("login", `QR event without base64 payload (shape=${argShape})`);
     }
   },
 

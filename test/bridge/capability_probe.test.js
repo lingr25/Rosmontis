@@ -454,3 +454,87 @@ test("wildcard ntApi Proxy avoids false-positive group_special_title and defers 
     yes: false,
   });
 });
+
+test("pre-login uninitialized wrapperSession (getMsgService returns null) avoids false-negative can_send_* and refreshes on login", async () => {
+  let loggedIn = false;
+  const liveSession = {
+    getMsgService: () => (loggedIn ? { sendMsg: async () => ({ result: 0 }), recallMsg: async () => ({ result: 0 }) } : null),
+    getGroupService: () => (loggedIn ? { publishGroupBulletin: async () => ({ result: 0 }) } : null),
+    getNodeMiscService: () => ({ wantWinScreenOCR: async () => ({ result: 0 }) }),
+  };
+  const bridge = new mainMod.NtqqOneBotBridge({
+    selfUin: "",
+    selfUid: "",
+    online: false,
+    wrapperSession: liveSession,
+    config: makeBaseConfig(),
+  });
+
+  // Pre-login: wrapperSession exists (with getNodeMiscService active) but per-account services are null
+  const preLoginProbe = probeRuntimeCapabilities(bridge);
+  assert.strictEqual(preLoginProbe.runtimeDetected, true);
+  assert.strictEqual(preLoginProbe.notes.sessionInitialized, false);
+  assert.strictEqual(preLoginProbe.capabilities.ocr_image, true);
+  assert.strictEqual(preLoginProbe.capabilities.send_msg, false);
+
+  // Must NOT false-negative can_send_image / can_send_record pre-login
+  assert.deepStrictEqual((await bridge.handleOneBotAction("can_send_image", {})).data, { yes: true });
+  assert.deepStrictEqual((await bridge.handleOneBotAction("can_send_record", {})).data, { yes: true });
+
+  // Post-login on the SAME wrapperSession reference: immediately re-probes without stale 10s cache
+  loggedIn = true;
+  bridge.online = true;
+  const postLoginProbe = probeRuntimeCapabilities(bridge);
+  assert.strictEqual(postLoginProbe.notes.sessionInitialized, true);
+  assert.strictEqual(postLoginProbe.capabilities.send_msg, true);
+  assert.strictEqual(postLoginProbe.capabilities.send_image, true);
+  assert.strictEqual(postLoginProbe.capabilities.recall_msg, true);
+  assert.strictEqual(postLoginProbe.capabilities.group_notice, true);
+});
+
+test("get_login_qrcode waits for async onQRCodeGetPicture and Tier 1 void RPC does not degrade to Tier 2", async () => {
+  const tier2Calls = [];
+  const bridge = new mainMod.NtqqOneBotBridge({
+    selfUin: "",
+    selfUid: "",
+    online: false,
+    ntApi: {
+      "nodeIKernelLoginService/setAutoLogin": async () => {
+        tier2Calls.push("setAutoLogin");
+        return { result: 0 };
+      },
+      "nodeIKernelLoginService/getQRCodePicture": async () => {
+        tier2Calls.push("getQRCodePicture");
+        return undefined;
+      },
+    },
+    config: makeBaseConfig(),
+  });
+
+  // Simulate Tier 1 renderer IPC resolving void (undefined) for both setAutoLogin and getQRCodePicture
+  const tier1Calls = [];
+  bridge._canInvokeRenderer = () => true;
+  bridge._invokeRendererCommand = async (_type, cmdPayload) => {
+    tier1Calls.push(cmdPayload.cmd);
+    if (cmdPayload.cmd === "nodeIKernelLoginService/getQRCodePicture") {
+      setTimeout(() => {
+        bridge._handleKernelEvent("nodeIKernelLoginListener", "onQRCodeGetPicture", [
+          { pngBase64QrcodeData: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" },
+        ]);
+      }, 20);
+    }
+    return undefined;
+  };
+
+  await bridge.invokeNt("nodeIKernelLoginService/setAutoLogin", { shouldAutoLogin: true }, [true]);
+  assert.deepStrictEqual(tier1Calls, ["nodeIKernelLoginService/setAutoLogin"]);
+  assert.deepStrictEqual(tier2Calls, [], "Void Tier 1 RPC must not degrade to Tier 2");
+  assert.strictEqual(bridge.invokeStats.tier1, 1);
+  assert.strictEqual(bridge.invokeStats.degraded, 0);
+
+  const qrResp = await bridge.handleOneBotAction("get_login_qrcode", { refresh: true, wait_ms: 1000 });
+  assert.strictEqual(qrResp.status, "ok");
+  assert.strictEqual(qrResp.data.qrcode_base64, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==");
+  assert.strictEqual(bridge.invokeStats.tier1, 2);
+  assert.strictEqual(bridge.invokeStats.degraded, 0);
+});
