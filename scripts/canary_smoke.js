@@ -1,10 +1,19 @@
 "use strict";
 
+const http = require("http");
 const { execFileSync } = require("child_process");
 
 const container = process.env.CONTAINER_NAME || "rosmontis-canary";
 const token = process.env.CANARY_TOKEN || "";
-const baseUrl = `http://127.0.0.1:${process.env.HTTP_PORT || "3000"}`;
+const httpPort = Number(process.env.HTTP_PORT || "3000");
+
+let completed = false;
+process.on("beforeExit", (code) => {
+  if (!completed && code === 0) {
+    console.error("[canary] FATAL: Event loop drained before smoke check completed!");
+    process.exit(1);
+  }
+});
 
 if (!token) {
   throw new Error("CANARY_TOKEN is not set");
@@ -27,44 +36,76 @@ function assertContainerRunning() {
   }
 }
 
-async function requestJson(method, reqPath, body = undefined) {
-  const headers = { Authorization: `Bearer ${token}` };
-  let payload;
-  if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
-    payload = JSON.stringify(body);
-  }
-  const res = await fetch(`${baseUrl}${reqPath}`, {
-    method,
-    headers,
-    body: payload,
-    signal: AbortSignal.timeout(10000),
+function requestJson(method, reqPath, body = undefined) {
+  return new Promise((resolve, reject) => {
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Connection: "close",
+    };
+    let payloadBuf = null;
+    if (body !== undefined) {
+      payloadBuf = Buffer.from(JSON.stringify(body), "utf8");
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = String(payloadBuf.length);
+    }
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: httpPort,
+        path: reqPath,
+        method,
+        headers,
+        timeout: 10000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch (_) {}
+          resolve({ status: Number(res.statusCode || 0), text, json });
+        });
+        res.on("error", reject);
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy(new Error(`HTTP ${method} ${reqPath} timed out after 10000ms`));
+    });
+    req.on("error", reject);
+    if (payloadBuf) {
+      req.write(payloadBuf);
+    }
+    req.end();
   });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch (_) {}
-  return { status: res.status, text, json };
 }
 
 (async () => {
+  console.log(`[canary] Starting smoke check for container=${container} port=${httpPort} node=${process.version}`);
+
   // 1. Poll /health up to 90s
   const healthDeadline = Date.now() + 90_000;
   let healthOk = false;
   let lastHealthErr = "";
+  let healthAttempts = 0;
   while (Date.now() < healthDeadline) {
+    healthAttempts += 1;
     assertContainerRunning();
     try {
       const res = await requestJson("GET", "/health");
       if (res.status === 200 && res.json && res.json.retcode === 0 && res.json.status === "ok") {
-        console.log("Health check passed:", sanitize(JSON.stringify(res.json)));
+        console.log(`[canary] Health check passed on attempt #${healthAttempts}:`, sanitize(JSON.stringify(res.json)));
         healthOk = true;
         break;
       }
       lastHealthErr = `HTTP ${res.status}: ${sanitize(res.text)}`;
     } catch (err) {
       lastHealthErr = err.message || String(err);
+    }
+    if (healthAttempts === 1 || healthAttempts % 5 === 0) {
+      console.log(`[canary] Waiting for /health (attempt #${healthAttempts}, last=${lastHealthErr})...`);
     }
     await sleep(2000);
   }
@@ -100,7 +141,7 @@ async function requestJson(method, reqPath, body = undefined) {
     ],
     { encoding: "utf8" }
   );
-  console.log(sanitize(containerCheck.trim()));
+  console.log("[canary]", sanitize(containerCheck.trim()));
 
   // 3. Query POST /get_status and assert telemetry structure
   const initialStatus = await requestJson("POST", "/get_status", {});
@@ -117,13 +158,15 @@ async function requestJson(method, reqPath, body = undefined) {
   if (typeof initialBridge.map_hook_active !== "boolean") {
     throw new Error(`Invalid bridge.map_hook_active: ${sanitize(JSON.stringify(initialBridge))}`);
   }
-  console.log("Initial /get_status telemetry:", sanitize(JSON.stringify(initialStatus.json, null, 2)));
+  console.log("[canary] Initial /get_status telemetry:", sanitize(JSON.stringify(initialStatus.json, null, 2)));
 
   // 4. Query POST /get_login_qrcode with {"refresh":true} (retry while Electron login UI initializes)
   const qrDeadline = Date.now() + 45_000;
   let qrFetched = false;
   let lastQrSummary = "";
+  let qrAttempts = 0;
   while (Date.now() < qrDeadline) {
+    qrAttempts += 1;
     assertContainerRunning();
     const qrRes = await requestJson("POST", "/get_login_qrcode", { refresh: true });
     if (qrRes.status !== 200 || !qrRes.json || qrRes.json.retcode !== 0) {
@@ -133,11 +176,12 @@ async function requestJson(method, reqPath, body = undefined) {
       const online = Boolean(qrRes.json.data?.online);
       lastQrSummary = `retcode=0 online=${online} qrcode_base64_populated=${qrB64.length > 0} length=${qrB64.length}`;
       if (qrB64.length > 0) {
-        console.log(`/get_login_qrcode succeeded: ${lastQrSummary}`);
+        console.log(`[canary] /get_login_qrcode succeeded on attempt #${qrAttempts}: ${lastQrSummary}`);
         qrFetched = true;
         break;
       }
     }
+    console.log(`[canary] Waiting for login QR (attempt #${qrAttempts}: ${lastQrSummary})...`);
     await sleep(3000);
   }
   if (!qrFetched) {
@@ -159,17 +203,18 @@ async function requestJson(method, reqPath, body = undefined) {
     throw new Error(`Non-empty listenErrors in post-QR /get_status: ${sanitize(JSON.stringify(finalBridge.listenErrors))}`);
   }
   console.log(
-    `Capture telemetry summary: map_hook_active=${finalBridge.map_hook_active}, map_hook_release=${JSON.stringify(finalBridge.map_hook_release)}`
+    `[canary] Capture telemetry summary: map_hook_active=${finalBridge.map_hook_active}, map_hook_release=${JSON.stringify(finalBridge.map_hook_release)}`
   );
-  console.log("Final sanitized /get_status:", sanitize(JSON.stringify(finalStatus.json, null, 2)));
+  console.log("[canary] Final sanitized /get_status:", sanitize(JSON.stringify(finalStatus.json, null, 2)));
 
   const capRes = await requestJson("POST", "/get_capabilities", { refresh: true });
   if (capRes.status === 200 && capRes.json) {
-    console.log("Final sanitized /get_capabilities:", sanitize(JSON.stringify(capRes.json, null, 2)));
+    console.log("[canary] Final sanitized /get_capabilities:", sanitize(JSON.stringify(capRes.json, null, 2)));
   }
 
-  console.log("Canary smoke check PASSED.");
+  completed = true;
+  console.log("[canary] Canary smoke check PASSED.");
 })().catch((err) => {
-  console.error("Canary smoke check failed:", sanitize(err && err.stack ? err.stack : String(err)));
+  console.error("[canary] Canary smoke check failed:", sanitize(err && err.stack ? err.stack : String(err)));
   process.exit(1);
 });
