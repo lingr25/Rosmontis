@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const { createActionRouter, waitForEventOnce } = require("../core/primitives");
@@ -31,6 +32,7 @@ function entriesFromMapOrObject(mapOrObj) {
   return [];
 }
 
+/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
 const ACTION_HANDLERS = {
   async get_friend_list(p) {
     const waitBuddyEvent = waitForEventOnce(
@@ -46,7 +48,9 @@ const ACTION_HANDLERS = {
         { force_update: forceRefresh, noCache: forceRefresh },
         [forceRefresh]
       );
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("contact_actions", err);
+    }
 
     let directCats = extractBuddyCategories(res);
 
@@ -62,7 +66,9 @@ const ACTION_HANDLERS = {
           res = v2Cache;
           directCats = v2Cats;
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("contact_actions", err);
+      }
     }
 
     if (directCats.length === 0 || forceRefresh) {
@@ -77,7 +83,9 @@ const ACTION_HANDLERS = {
           res = v2Res;
           directCats = v2Cats;
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("contact_actions", err);
+      }
     }
 
     if (directCats.length > 0) {
@@ -118,7 +126,9 @@ const ACTION_HANDLERS = {
               this.uinUidStore.remember(String(uin), String(uid));
             }
           }
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("contact_actions", err);
+        }
       }
 
       try {
@@ -141,7 +151,9 @@ const ACTION_HANDLERS = {
             });
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("contact_actions", err);
+      }
     }
 
     const list = [];

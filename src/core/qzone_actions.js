@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -29,6 +30,9 @@ const {
   parseJsonpOrJson: defaultParseJsonpOrJson,
 } = webHttp;
 
+/**
+ * @param {Record<string, any>} [helpers]
+ */
 function resolveHelpers(helpers = {}) {
   const resolvedComputeBkn =
     typeof helpers?.computeBkn === "function"
@@ -76,6 +80,7 @@ function resolveHelpers(helpers = {}) {
       : usesDefaultRequestLayer
       ? defaultHttpPostFormJson
       : async (urlStr, formParams = {}, headers = {}, options = undefined) => {
+          /** @type {string | Buffer} */
           let encodedBody = "";
           if (Buffer.isBuffer(formParams) || typeof formParams === "string") {
             encodedBody = formParams;
@@ -136,10 +141,17 @@ async function fetchClientKey(bridge) {
   };
 }
 
+/**
+ * @param {any} bridge
+ * @param {string} [domain]
+ * @param {Record<string, any>} [helpers]
+ * @returns {Promise<Record<string, string>>}
+ */
 async function getCookiesObject(bridge, domain = "qun.qq.com", helpers = {}) {
   const { httpsGetCookies } = resolveHelpers(helpers);
   const uin = bridge.selfUin || "0";
   const uinCookie = `o${String(uin).padStart(10, "0")}`;
+  /** @type {Record<string, string>} */
   const cookies = {
     uin: uinCookie,
     p_uin: uinCookie,
@@ -160,7 +172,9 @@ async function getCookiesObject(bridge, domain = "qun.qq.com", helpers = {}) {
       const pskey =
         map instanceof Map ? map.get(domain) : map && typeof map === "object" ? map[domain] : "";
       if (pskey) cookies.p_skey = String(pskey);
-    } catch (_) {}
+    } catch (err) {
+      bridge?.logger?.debug?.("qzone_actions", err);
+    }
   }
 
   if (!cookies.p_skey && bridge.config?.allowPtloginJump !== false) {
@@ -175,12 +189,20 @@ async function getCookiesObject(bridge, domain = "qun.qq.com", helpers = {}) {
         const fetched = await httpsGetCookies(jumpUrl);
         Object.assign(cookies, fetched);
       }
-    } catch (_) {}
+    } catch (err) {
+      bridge?.logger?.debug?.("qzone_actions", err);
+    }
   }
 
   return cookies;
 }
 
+/**
+ * @param {any} bridge
+ * @param {string} action
+ * @param {Record<string, any>} [p]
+ * @param {Record<string, any>} [helpers]
+ */
 async function dispatchWebCredentialOrQzoneAction(bridge, action, p = {}, helpers = {}) {
   const act = String(action || "").replace(/^\/+/, "").trim();
   assertWebCredentialApiEnabled(bridge?.config, act);

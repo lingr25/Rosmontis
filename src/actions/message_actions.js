@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const bridgeOneBot = require("../bridge_onebot");
@@ -522,6 +523,7 @@ async function getMessageHistory(bridge, p, context, isGroup) {
 // Declarative Action Handlers & Aliases
 // ============================================================================
 
+/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
 const ACTION_HANDLERS = {
   // ---- 1. Info & Status ----
   async get_login_info() {
@@ -547,7 +549,9 @@ const ACTION_HANDLERS = {
             markOnline: false,
           });
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("message_actions", err);
+      }
     }
     return {
       user_id: Number(this.selfUin || 0),
@@ -691,6 +695,7 @@ const ACTION_HANDLERS = {
     if (typeof this.reloadConfig === "function") {
       return await this.reloadConfig(p);
     }
+    /** @type {Error & { retcode?: number }} */
     const err = new Error("reload_config is not supported on this bridge instance");
     err.retcode = 1404;
     throw err;
@@ -1096,7 +1101,9 @@ const ACTION_HANDLERS = {
     } else if (action === "mark_all_as_read" || action === "_mark_all_as_read") {
       try {
         await this.invokeNt("nodeIKernelMsgService/setAllC2CAndGroupMsgRead", {}, []);
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("message_actions", err);
+      }
     }
     return {};
   },
@@ -1254,6 +1261,7 @@ const ACTION_HANDLERS = {
       typeof op !== "object" ||
       Array.isArray(op)
     ) {
+      /** @type {Error & { retcode?: number }} */
       const err = new Error("context and operation are required");
       err.retcode = 1400;
       throw err;

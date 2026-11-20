@@ -25,10 +25,7 @@ jobs:
           node -e '
             const pkg = require("./package.json");
             if (pkg.dependencies && Object.keys(pkg.dependencies).length > 0) {
-              throw new Error("Rosmontis must remain zero-dependency pure JS");
-            }
-            if (pkg.devDependencies && Object.keys(pkg.devDependencies).length > 0) {
-              throw new Error("Rosmontis package.json must not declare devDependencies");
+              throw new Error("Rosmontis must remain zero-runtime-dependency pure JS");
             }
           '
       - name: Check shell scripts syntax
@@ -52,11 +49,6 @@ jobs:
           fi
       - name: Typecheck JSDoc (@ts-check modules)
         if: matrix.node-version == 22
-        run: |
-          set -euo pipefail
-          TSC_DIR="$(mktemp -d)"
-          trap 'rm -rf "${TSC_DIR}"' EXIT
-          npm --prefix "${TSC_DIR}" install --no-save --no-audit --no-fund typescript @types/node
-          "${TSC_DIR}/node_modules/.bin/tsc" --noEmit -p jsconfig.json --typeRoots "${TSC_DIR}/node_modules/@types"
+        run: node scripts/typecheck.js --install
       - name: Run unit & protocol contract tests
         run: npm test

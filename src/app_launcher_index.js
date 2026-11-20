@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -32,11 +33,18 @@ function bootBridgeMain() {
           err && err.stack ? err.stack : String(err)
         }\n`
       );
-    } catch (_) {}
+    } catch (_) {
+      // Ignore stderr write failure when Electron launches without an attached stdio stream.
+    }
     return null;
   }
 }
 
+/**
+ * @param {any} [targetModule]
+ * @param {{ load: (entry: string, mod: any) => any }} [majorNodeLoader]
+ * @returns {any}
+ */
 function loadOfficialInternalIndex(targetModule, majorNodeLoader) {
   const loader =
     majorNodeLoader ||

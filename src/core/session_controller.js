@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -14,11 +15,15 @@
 const { CausalSessionScheduler } = require("./session_scheduler");
 const { BoundedMap, setBoundedMap } = require("./primitives");
 
+/**
+ * @param {Record<string, any>} [opts]
+ */
 async function runCausalLeaveSteps({
   shouldExitAio = false,
   shouldBlur = false,
   prevPeer = null,
   invokeNt,
+  logger = null,
 } = {}) {
   let exitedAio = false;
   let blurredWindow = false;
@@ -32,7 +37,10 @@ async function runCausalLeaveSteps({
         [exitList]
       );
       exitedAio = true;
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort AIO exit during idle/leave fallback; proceed to optional blur step.
+      logger?.debug?.("session_controller", err);
+    }
   }
 
   if (shouldBlur) {
@@ -44,12 +52,18 @@ async function runCausalLeaveSteps({
         [basePeer]
       );
       blurredWindow = true;
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort window blur during idle/leave fallback.
+      logger?.debug?.("session_controller", err);
+    }
   }
 
   return { fallback: true, exitedAio, blurredWindow };
 }
 
+/**
+ * @param {Record<string, any>} [opts]
+ */
 async function runCausalActivateSteps({
   peer,
   peerKey,
@@ -62,6 +76,7 @@ async function runCausalActivateSteps({
   readToTypingDelayMs = 0,
   invokeNt,
   sleepUnref,
+  logger = null,
 } = {}) {
   const resolvedPeerKey =
     peerKey !== undefined && peerKey !== null && String(peerKey) !== ""
@@ -85,7 +100,10 @@ async function runCausalActivateSteps({
       );
       didFocus = true;
       focused = true;
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort focus activation; continue with AIO/read/typing causal sequence.
+      logger?.debug?.("session_controller", err);
+    }
   } else {
     didFocus = true;
   }
@@ -102,7 +120,10 @@ async function runCausalActivateSteps({
           [exitList]
         );
         exitedPreviousAio = true;
-      } catch (_) {}
+      } catch (err) {
+        // Best-effort exit of previous AIO before entering target peer AIO.
+        logger?.debug?.("session_controller", err);
+      }
     }
     try {
       const enterList = [{ peer, option: 1 }];
@@ -111,7 +132,10 @@ async function runCausalActivateSteps({
         { info_list: enterList },
         [enterList]
       );
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort enter target AIO; continue with read/typing steps.
+      logger?.debug?.("session_controller", err);
+    }
   }
 
   let didMarkRead = false;
@@ -121,7 +145,10 @@ async function runCausalActivateSteps({
     try {
       await invokeNt("nodeIKernelMsgService/setMsgRead", { peer }, [peer]);
       didMarkRead = true;
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort read receipt in fallback session activation.
+      logger?.debug?.("session_controller", err);
+    }
   }
 
   if (shouldMarkRead && shouldSendTyping && readToTypingDelayMs > 0) {
@@ -150,7 +177,10 @@ async function runCausalActivateSteps({
         [resolvedChatType, resolvedEventType, resolvedPeerUid]
       );
       didSendTyping = true;
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort typing indicator in fallback session activation.
+      logger?.debug?.("session_controller", err);
+    }
   }
 
   return {
@@ -165,6 +195,9 @@ async function runCausalActivateSteps({
 }
 
 class HumanSessionController {
+  /**
+   * @param {Record<string, any>} [opts]
+   */
   constructor({
     getConfig,
     config,
@@ -172,6 +205,7 @@ class HumanSessionController {
     canInvokeRenderer,
     invokeRendererCommand,
     getRendererHooks,
+    logger,
   } = {}) {
     this._getConfig =
       typeof getConfig === "function"
@@ -189,12 +223,16 @@ class HumanSessionController {
       typeof getRendererHooks === "function"
         ? getRendererHooks
         : () => ({ simulateSession: null, leaveSession: null });
+    this.logger = logger || null;
 
+    /** @type {any} */
     this.activeAioPeer = null;
     this.activeAioPeerKey = "";
     this.windowFocused = false;
     this.interactionSeq = 0;
+    /** @type {NodeJS.Timeout | null} */
     this.aioIdleTimer = null;
+    /** @type {NodeJS.Timeout | null} */
     this.focusBlurTimer = null;
     this.recentReadByPeer = new BoundedMap(2000);
     this.recentTypingByPeer = new BoundedMap(2000);
@@ -224,6 +262,10 @@ class HumanSessionController {
     }
   }
 
+  /**
+   * @param {() => Promise<any>} fn
+   * @param {Record<string, any>} [options]
+   */
   withLock(fn, options = {}) {
     const opts = options && typeof options === "object" ? options : {};
     return this.scheduler.runExclusive(opts.peerKey || "", fn, opts);
@@ -250,7 +292,9 @@ class HumanSessionController {
     this.recentReadByPeer.clear();
     this.recentTypingByPeer.clear();
     if (resetRenderer && this._canInvokeRenderer()) {
-      Promise.resolve(this._invokeRendererCommand("resetSession", {}, 5000)).catch(() => {});
+      Promise.resolve(this._invokeRendererCommand("resetSession", {}, 5000)).catch((err) => {
+        this.logger?.debug?.("session_controller", err);
+      });
     }
   }
 
@@ -269,7 +313,9 @@ class HumanSessionController {
         this.withLock(async () => {
           if (seq !== this.interactionSeq || !this.activeAioPeer) return;
           await this.leaveUnlocked({ exitAio: true, blurWindow: false });
-        }).catch(() => {});
+        }).catch((err) => {
+          this.logger?.debug?.("session_controller", err);
+        });
       }, aioIdleMs);
       if (typeof this.aioIdleTimer.unref === "function") this.aioIdleTimer.unref();
     }
@@ -286,7 +332,9 @@ class HumanSessionController {
             return;
           }
           await this.leaveUnlocked({ exitAio: true, blurWindow: true });
-        }).catch(() => {});
+        }).catch((err) => {
+          this.logger?.debug?.("session_controller", err);
+        });
       }, focusBlurMs);
       if (typeof this.focusBlurTimer.unref === "function") this.focusBlurTimer.unref();
     }
@@ -325,7 +373,10 @@ class HumanSessionController {
           this._commitLeftState({ shouldExitAio, shouldBlur });
           return res;
         }
-      } catch (_) {}
+      } catch (err) {
+        // Renderer hook failed; fall through to IPC command or direct kernel steps.
+        this.logger?.debug?.("session_controller", err);
+      }
     }
 
     if (this._canInvokeRenderer()) {
@@ -335,7 +386,10 @@ class HumanSessionController {
           this._commitLeftState({ shouldExitAio, shouldBlur });
           return res;
         }
-      } catch (_) {}
+      } catch (err) {
+        // Renderer IPC command failed; fall through to direct kernel leave steps.
+        this.logger?.debug?.("session_controller", err);
+      }
     }
 
     const prevPeer = this.activeAioPeer;
@@ -345,6 +399,7 @@ class HumanSessionController {
       shouldBlur,
       prevPeer,
       invokeNt: this._invokeNt,
+      logger: this.logger,
     });
   }
 
@@ -377,6 +432,9 @@ class HumanSessionController {
     return res;
   }
 
+  /**
+   * @param {Record<string, any>} [opts]
+   */
   async activateUnlocked(opts = {}) {
     const peer = {
       chatType: Number(opts?.chatType || 1),
@@ -454,7 +512,10 @@ class HumanSessionController {
             res,
           });
         }
-      } catch (_) {}
+      } catch (err) {
+        // Renderer hook failed; fall through to IPC command or direct kernel steps.
+        this.logger?.debug?.("session_controller", err);
+      }
     }
 
     if (this._canInvokeRenderer()) {
@@ -475,7 +536,10 @@ class HumanSessionController {
             res,
           });
         }
-      } catch (_) {}
+      } catch (err) {
+        // Renderer IPC command failed; fall through to direct kernel activate steps.
+        this.logger?.debug?.("session_controller", err);
+      }
     }
 
     const fallbackRes = await runCausalActivateSteps({
@@ -490,6 +554,7 @@ class HumanSessionController {
       readToTypingDelayMs,
       invokeNt: this._invokeNt,
       sleepUnref: (ms) => this.scheduler.sleepUnref(ms),
+      logger: this.logger,
     });
     return this._commitActivatedState({
       peer,
@@ -502,6 +567,9 @@ class HumanSessionController {
     });
   }
 
+  /**
+   * @param {Record<string, any>} [opts]
+   */
   async simulate(opts = {}) {
     const peerKey = opts?.peerUid
       ? `${Number(opts.chatType || 1)}:${String(opts.peerUid)}:${String(opts.guildId || "")}`

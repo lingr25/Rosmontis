@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -285,7 +286,12 @@ function formatIpcErrorBody(body) {
   }
 }
 
+/**
+ * @param {any} [targetWindow]
+ * @param {Record<string, any>} [options]
+ */
 function installRendererBridge(targetWindow, options = {}) {
+  /** @type {any} */
   const win =
     targetWindow ||
     (typeof window !== "undefined" ? window : typeof globalThis !== "undefined" ? globalThis : {});
@@ -319,14 +325,18 @@ function installRendererBridge(targetWindow, options = {}) {
     if (diagnosticHandler) {
       try {
         diagnosticHandler(scope, err);
-      } catch (_) {}
+      } catch (_) {
+        // Never allow diagnostic callback failures to disrupt renderer IPC handling.
+      }
     }
     if (win && win.__ROSMONTIS_DEBUG__ === true) {
       try {
         if (typeof console !== "undefined" && typeof console.warn === "function") {
           console.warn(`[Rosmontis:renderer:${scope}]`, err);
         }
-      } catch (_) {}
+      } catch (_) {
+        // Ignore console output failures in restricted renderer contexts.
+      }
     }
   }
 
@@ -381,10 +391,12 @@ function installRendererBridge(targetWindow, options = {}) {
     if (win.qqnt && win.qqnt.ipcRenderer) return win.qqnt.ipcRenderer;
     try {
       if (typeof require === "function") {
-        const el = require("electron");
+        const el = /** @type {any} */ (require)("electron");
         if (el && el.ipcRenderer) return el.ipcRenderer;
       }
-    } catch (_) {}
+    } catch (_) {
+      // Expected when nodeIntegration is disabled or running outside Electron.
+    }
     return null;
   }
 
@@ -452,7 +464,9 @@ function installRendererBridge(targetWindow, options = {}) {
       if (win.crypto && typeof win.crypto.randomUUID === "function") {
         return win.crypto.randomUUID();
       }
-    } catch (_) {}
+    } catch (_) {
+      // Browser crypto.randomUUID unavailable in this context; try global/Node crypto next.
+    }
     try {
       if (typeof crypto !== "undefined" && crypto && typeof crypto.randomUUID === "function") {
         return crypto.randomUUID();
@@ -463,7 +477,9 @@ function installRendererBridge(targetWindow, options = {}) {
           return nodeCrypto.randomUUID();
         }
       }
-    } catch (_) {}
+    } catch (_) {
+      // Global/Node crypto unavailable; fall back to RFC 4122 v4 Math.random generator below.
+    }
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
       const r = (Math.random() * 16) | 0;
       const v = c === "x" ? r : (r & 0x3) | 0x8;
@@ -659,6 +675,7 @@ function installRendererBridge(targetWindow, options = {}) {
         }
 
         default: {
+          /** @type {Error & { code?: string }} */
           const unknownErr = new Error(
             `Unsupported renderer bridge command type: ${String(cmdEnvelope.type || "")}`
           );
@@ -912,6 +929,9 @@ function installRendererBridge(targetWindow, options = {}) {
     };
   }
 
+  /**
+   * @param {Record<string, any>} [patch]
+   */
   function syncSessionState(patch = {}) {
     if (!patch || typeof patch !== "object") {
       return snapshotSessionSummary();
@@ -1221,7 +1241,7 @@ if (typeof window !== "undefined") {
   } catch (err) {
     if (
       window &&
-      window.__ROSMONTIS_DEBUG__ === true &&
+      /** @type {any} */ (window).__ROSMONTIS_DEBUG__ === true &&
       typeof console !== "undefined" &&
       typeof console.warn === "function"
     ) {

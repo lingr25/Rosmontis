@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -57,7 +58,7 @@ function createPttTextWaiter(bridge, ntMsgId, timeoutMs = 10000) {
   }
   const waiterMap = bridge._pttTextWaiters;
   const key = String(ntMsgId || "");
-  let dispatcher = waiterMap.get(key);
+  let dispatcher = /** @type {any} */ (waiterMap.get(key));
   if (typeof dispatcher !== "function" || !(dispatcher._listeners instanceof Set)) {
     const listeners = new Set();
     if (typeof dispatcher === "function") {
@@ -67,7 +68,9 @@ function createPttTextWaiter(bridge, ntMsgId, timeoutMs = 10000) {
       for (const fn of Array.from(listeners)) {
         try {
           fn(txt);
-        } catch (_) {}
+        } catch (err) {
+          bridge?.logger?.debug?.("media_profile_actions", err);
+        }
       }
     };
     dispatcher._listeners = listeners;
@@ -91,7 +94,7 @@ function createPttTextWaiter(bridge, ntMsgId, timeoutMs = 10000) {
     },
   };
 
-  const inner = createEventWaiter(waiterSetAdapter, timeoutMs);
+  const inner = createEventWaiter(/** @type {any} */ (waiterSetAdapter), timeoutMs);
   return {
     promise: inner.promise.then((txt) => (txt === null || txt === undefined ? "" : String(txt))),
     cancel() {
@@ -113,6 +116,12 @@ async function maybeTranscodeGetRecordOutput(bridge, action, rawOutFormat, local
   return converted;
 }
 
+/**
+ * @this {any}
+ * @param {Record<string, any>} p
+ * @param {any} _context
+ * @param {string} action
+ */
 async function resolveOneBotMediaAction(p, _context, action) {
   const rawFile = String(p.file || p.file_id || "").trim();
   const rawFileId = String(p.file_id || "").trim();
@@ -203,7 +212,9 @@ async function resolveOneBotMediaAction(p, _context, action) {
             kernelLocalPath = candidate;
             kernelStat = st;
           }
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("media_profile_actions", err);
+        }
       } else {
         try {
           const getReq = {
@@ -231,7 +242,9 @@ async function resolveOneBotMediaAction(p, _context, action) {
             kernelLocalPath = candidate;
             kernelStat = st;
           }
-        } catch (_) {}
+        } catch (err) {
+          this.logger?.debug?.("media_profile_actions", err);
+        }
       }
     }
   }
@@ -299,7 +312,9 @@ async function resolveOneBotMediaAction(p, _context, action) {
     let urlName = "";
     try {
       urlName = path.basename(new URL(remoteUrl).pathname);
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("media_profile_actions", err);
+    }
     const fileName = String(mediaDesc?.fileName || urlName || "file");
     return {
       file: fileName,
@@ -319,6 +334,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
     /^data:[^;]+;base64,/i.test(directFile) ||
     path.isAbsolute(directFile);
   if (!hasExplicitSchemeOrAbs) {
+    /** @type {Error & { code?: string }} */
     const err = new Error(`Blocked relative or unverified local media path: ${directFile}`);
     err.code = "ERR_LFI_BLOCKED";
     throw err;
@@ -336,6 +352,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
     ) {
       throw err;
     }
+    /** @type {Error & { code?: string }} */
     const notFound = new Error("Media file not found or not accessible");
     if (err && err.code) notFound.code = err.code;
     throw notFound;
@@ -376,6 +393,12 @@ async function resolveOneBotMediaAction(p, _context, action) {
   };
 }
 
+/**
+ * @this {any}
+ * @param {Record<string, any>} p
+ * @param {any} _context
+ * @param {string} action
+ */
 async function handleWebCredentialOrQzoneAction(p, _context, action) {
   return await dispatchWebCredentialOrQzoneAction(this, action, p, WEB_HTTP_HELPERS);
 }
@@ -434,6 +457,7 @@ function normalizeOcrResultLines(res) {
 // Declarative Media, Profile, Ark & Web Credential Action Handlers & Aliases
 // ============================================================================
 
+/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
 const ACTION_HANDLERS = {
   // ---- Media / OCR / Translate / Voice / Profile / Online Status ----
   get_image: resolveOneBotMediaAction,
@@ -548,7 +572,9 @@ const ACTION_HANDLERS = {
           { words, longNick: words },
           [words]
         );
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("media_profile_actions", err);
+      }
     }
     return {};
   },

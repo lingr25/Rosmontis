@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -22,8 +23,13 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const REPO_CONFIG_DIR = path.join(REPO_ROOT, "config");
 const CONFIG_FILE_RE = /^(?:rosmontis|onebot|xiao_bridge)(?:_[a-zA-Z0-9_-]+)?\.json$/;
 
+/** @type {any} */
 let activeBridge = null;
 
+/**
+ * @param {string} dirPath
+ * @returns {boolean}
+ */
 function _hasActiveConfigJson(dirPath) {
   try {
     if (!dirPath || !fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) {
@@ -32,10 +38,15 @@ function _hasActiveConfigJson(dirPath) {
     const files = fs.readdirSync(dirPath);
     return files.some((f) => CONFIG_FILE_RE.test(f) && !f.endsWith(".example.json"));
   } catch (_) {
+    // Directory may not exist or be readable during plugin config discovery.
     return false;
   }
 }
 
+/**
+ * @param {Record<string, any>} [options]
+ * @returns {string | undefined}
+ */
 function resolvePluginConfigDir(options = {}) {
   if (typeof options.configDir === "string" && options.configDir.trim() !== "") {
     return options.configDir.trim();
@@ -50,8 +61,8 @@ function resolvePluginConfigDir(options = {}) {
     return REPO_CONFIG_DIR;
   }
 
-  const liteLoaderObj =
-    options.liteLoader || (typeof globalThis !== "undefined" ? globalThis.LiteLoader : null);
+  const globalObj = /** @type {any} */ (typeof globalThis !== "undefined" ? globalThis : null);
+  const liteLoaderObj = options.liteLoader || globalObj?.LiteLoader || null;
   const liteLoaderDataDir = liteLoaderObj?.plugins?.rosmontis?.path?.data;
   if (typeof liteLoaderDataDir === "string" && liteLoaderDataDir.trim() !== "") {
     const trimmed = liteLoaderDataDir.trim();
@@ -60,8 +71,7 @@ function resolvePluginConfigDir(options = {}) {
     }
   }
 
-  const qwqntObj =
-    options.qwqnt || (typeof globalThis !== "undefined" ? globalThis.qwqnt : null);
+  const qwqntObj = options.qwqnt || globalObj?.qwqnt || null;
   const qwqntSaveRoot = qwqntObj?.core?.configs?.core?.save;
   if (typeof qwqntSaveRoot === "string" && qwqntSaveRoot.trim() !== "") {
     const candidate = path.join(qwqntSaveRoot.trim(), "rosmontis");
@@ -73,13 +83,23 @@ function resolvePluginConfigDir(options = {}) {
   return undefined;
 }
 
+/**
+ * @param {string} bootLogPath
+ * @param {string} message
+ */
 function _appendBootLog(bootLogPath, message) {
   if (!bootLogPath) return;
   try {
     fs.appendFileSync(bootLogPath, `${new Date().toISOString()} [rosmontis] ${message}\n`);
-  } catch (_) {}
+  } catch (_) {
+    // Best-effort diagnostic boot log; ignore unwritable paths or permission errors.
+  }
 }
 
+/**
+ * @param {Record<string, any>} [options]
+ * @returns {any}
+ */
 function bootPluginBridge(options = {}) {
   if (isBridgeDisabledFromEnv()) {
     return null;
@@ -87,7 +107,9 @@ function bootPluginBridge(options = {}) {
   if (activeBridge && !options.forceNew) {
     try {
       activeBridge.probeExistingRuntime?.({ electron: options.electron });
-    } catch (_) {}
+    } catch (err) {
+      activeBridge?.logger?.debug?.("plugin_loader", err);
+    }
     return activeBridge;
   }
 
@@ -114,7 +136,9 @@ function bootPluginBridge(options = {}) {
     activeBridge = bridgeMain.installMainBridge(installOpts);
     try {
       activeBridge?.probeExistingRuntime?.({ electron: options.electron });
-    } catch (_) {}
+    } catch (err) {
+      activeBridge?.logger?.debug?.("plugin_loader", err);
+    }
     _appendBootLog(
       bootLogPath,
       `installMainBridge ok (configDir=${configDir || "auto"}, selfUin=${activeBridge?.selfUin || ""})`
@@ -125,11 +149,16 @@ function bootPluginBridge(options = {}) {
     _appendBootLog(bootLogPath, `error: ${detail}`);
     try {
       process.stderr.write(`[rosmontis] Plugin bridge initialization error (non-fatal): ${detail}\n`);
-    } catch (_) {}
+    } catch (_) {
+      // Ignore stderr write failure when desktop host launches without an attached stdio stream.
+    }
     return null;
   }
 }
 
+/**
+ * @param {any} window
+ */
 function onBrowserWindowCreated(window) {
   if (isBridgeDisabledFromEnv()) {
     return;
@@ -140,7 +169,9 @@ function onBrowserWindowCreated(window) {
   if (bridge && wc) {
     try {
       bridge._attachToWebContents?.(wc);
-    } catch (_) {}
+    } catch (err) {
+      bridge.logger?.debug?.("plugin_loader", err);
+    }
   }
 }
 

@@ -4,7 +4,8 @@
   "description": "Zero-hook, pure-JS Electron Renderer-Layer OneBot v11 bridge for Linux QQ NT",
   "main": "src/bridge_main.js",
   "scripts": {
-    "test": "node test/test_bridge.js --all"
+    "test": "node test/test_bridge.js --all",
+    "typecheck": "node scripts/typecheck.js"
   },
   "keywords": [
     "onebot",

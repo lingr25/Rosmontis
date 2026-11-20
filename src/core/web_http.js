@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const http = require("http");
@@ -59,6 +60,18 @@ const REQUEST_OPTION_KEYS = new Set([
   "headers",
 ]);
 
+/**
+ * Create an `Error` instance tagged with a machine-readable `code`.
+ * @param {string} message
+ * @param {string} code
+ * @returns {Error & { code: string }}
+ */
+function _createCodedError(message, code) {
+  const err = /** @type {Error & { code: string }} */ (new Error(message));
+  err.code = code;
+  return err;
+}
+
 function isWebCredentialApiEnabled(config) {
   return (
     config?.enableWebCredentialApi === true ||
@@ -69,12 +82,11 @@ function isWebCredentialApiEnabled(config) {
 function assertWebCredentialApiEnabled(config, actionName = "") {
   if (!isWebCredentialApiEnabled(config)) {
     const label = actionName ? `Action "${actionName}"` : "Web credential API";
-    const err = new Error(
+    throw _createCodedError(
       `${label} is disabled by default to protect account credentials (clientkey/skey/p_skey). ` +
-        `Set "enableWebCredentialApi": true in rosmontis.json or ROSMONTIS_ENABLE_WEB_CREDENTIAL_API=1 to enable.`
+        `Set "enableWebCredentialApi": true in rosmontis.json or ROSMONTIS_ENABLE_WEB_CREDENTIAL_API=1 to enable.`,
+      "ERR_WEB_CREDENTIAL_API_DISABLED"
     );
-    err.code = "ERR_WEB_CREDENTIAL_API_DISABLED";
-    throw err;
   }
   return true;
 }
@@ -127,18 +139,23 @@ function assertSafeTencentRedirect(nextUrl, allowedDomains = null) {
   const parsed = nextUrl instanceof URL ? nextUrl : new URL(String(nextUrl));
   const proto = parsed.protocol.toLowerCase();
   if (proto !== "https:" && proto !== "http:") {
-    const err = new Error(`Blocked redirect to unsupported protocol: ${parsed.protocol}`);
-    err.code = "ERR_UNSUPPORTED_PROTOCOL";
-    throw err;
+    throw _createCodedError(
+      `Blocked redirect to unsupported protocol: ${parsed.protocol}`,
+      "ERR_UNSUPPORTED_PROTOCOL"
+    );
   }
   if (!isAllowedRedirectHost(parsed.hostname, allowedDomains)) {
-    const err = new Error(`Blocked redirect to untrusted host: ${parsed.hostname}`);
-    err.code = "ERR_UNSAFE_REDIRECT";
-    throw err;
+    throw _createCodedError(
+      `Blocked redirect to untrusted host: ${parsed.hostname}`,
+      "ERR_UNSAFE_REDIRECT"
+    );
   }
   return parsed;
 }
 
+/**
+ * @param {Record<string, any>} [options]
+ */
 function _resolveAllowPrivateUrls(options = {}) {
   if (options && options.allowPrivateUrls !== undefined) {
     return Boolean(options.allowPrivateUrls);
@@ -152,7 +169,9 @@ function _stripBracketsAndDecodeHost(hostname) {
   let decodedHost = rawHost;
   try {
     decodedHost = decodeURIComponent(rawHost);
-  } catch (_) {}
+  } catch (_) {
+    // Malformed percent-encoding in hostname; safely fall back to rawHost for IP/SSRF validation.
+  }
   const bareHost = decodedHost.replace(/%.*$/, "");
   return { rawHost, decodedHost, bareHost };
 }
@@ -168,19 +187,21 @@ function _parseAndValidateOutboundUrl(urlStr, allowPrivateUrls) {
   const u = new URL(String(urlStr));
   const proto = u.protocol.toLowerCase();
   if (proto !== "http:" && proto !== "https:") {
-    const err = new Error(`Unsupported HTTP protocol: ${u.protocol}`);
-    err.code = "ERR_UNSUPPORTED_PROTOCOL";
-    throw err;
+    throw _createCodedError(`Unsupported HTTP protocol: ${u.protocol}`, "ERR_UNSUPPORTED_PROTOCOL");
   }
   const { rawHost, decodedHost, bareHost } = _stripBracketsAndDecodeHost(u.hostname);
   if (net.isIP(bareHost) !== 0 && !allowPrivateUrls && isPrivateOrReservedIp(decodedHost)) {
-    const err = new Error(`Blocked outbound request to private or reserved IP: ${rawHost}`);
-    err.code = "ERR_SSRF_BLOCKED";
-    throw err;
+    throw _createCodedError(
+      `Blocked outbound request to private or reserved IP: ${rawHost}`,
+      "ERR_SSRF_BLOCKED"
+    );
   }
   return { u, proto, connectHostname: rawHost };
 }
 
+/**
+ * @param {Record<string, any>} [options]
+ */
 function _resolveEffectiveAllowedDomains(options = {}) {
   if (options && options.allowedDomains) {
     return _normalizeDomainEntries(options.allowedDomains);
@@ -205,18 +226,18 @@ function _validateRedirectTarget(
   const currentProto = currentUrlObj.protocol.toLowerCase();
   const nextProto = nextParsed.protocol.toLowerCase();
   if (nextProto !== "https:" && nextProto !== "http:") {
-    const err = new Error(`Blocked redirect to unsupported protocol: ${nextParsed.protocol}`);
-    err.code = "ERR_UNSUPPORTED_PROTOCOL";
-    throw err;
+    throw _createCodedError(
+      `Blocked redirect to unsupported protocol: ${nextParsed.protocol}`,
+      "ERR_UNSUPPORTED_PROTOCOL"
+    );
   }
 
   const isDowngrade = currentProto === "https:" && nextProto === "http:";
   if (isDowngrade && forbidHttpsDowngrade) {
-    const err = new Error(
-      `Blocked insecure HTTPS-to-HTTP cookie redirect downgrade: ${nextParsed.origin}`
+    throw _createCodedError(
+      `Blocked insecure HTTPS-to-HTTP cookie redirect downgrade: ${nextParsed.origin}`,
+      "ERR_INSECURE_REDIRECT_DOWNGRADE"
     );
-    err.code = "ERR_INSECURE_REDIRECT_DOWNGRADE";
-    throw err;
   }
 
   const isCrossHost =
@@ -252,6 +273,7 @@ function _buildTransportSafetyOptions(options, allowPrivateUrls) {
           { dnsLookup: options?.dnsLookup, allowPrivateUrls },
           allowPrivateUrls
         );
+  /** @type {Record<string, any>} */
   const out = {
     lookup,
     agent: options && options.agent !== undefined ? options.agent : false,
@@ -312,8 +334,15 @@ function _stripBodyEntityHeaders(headersObj) {
   return copy;
 }
 
+/**
+ * @param {string} urlStr
+ * @param {number | Record<string, any>} [depthOrOptions]
+ * @param {Record<string, any>} [maybeOptions]
+ * @returns {Promise<Record<string, string>>}
+ */
 function httpsGetCookies(urlStr, depthOrOptions = 0, maybeOptions = {}) {
   let depth = 0;
+  /** @type {Record<string, any>} */
   let options = maybeOptions && typeof maybeOptions === "object" ? maybeOptions : {};
   if (depthOrOptions && typeof depthOrOptions === "object") {
     options = depthOrOptions;
@@ -389,7 +418,9 @@ function httpsGetCookies(urlStr, depthOrOptions = 0, maybeOptions = {}) {
           if (drainedBytes > 1024 * 1024) {
             try {
               res.destroy();
-            } catch (_) {}
+            } catch (_) {
+              // Response stream may already be destroyed after capping body drain.
+            }
           }
         });
 
@@ -449,9 +480,7 @@ function httpsGetCookies(urlStr, depthOrOptions = 0, maybeOptions = {}) {
     );
 
     req.on("timeout", () => {
-      const err = new Error(`HTTPS cookie timeout: ${urlStr}`);
-      err.code = "ETIMEDOUT";
-      req.destroy(err);
+      req.destroy(_createCodedError(`HTTPS cookie timeout: ${urlStr}`, "ETIMEDOUT"));
     });
     req.on("error", settleReject);
     req.end();
@@ -459,13 +488,21 @@ function httpsGetCookies(urlStr, depthOrOptions = 0, maybeOptions = {}) {
 }
 
 function _createResponseTooLargeError(limit, urlStr) {
-  const err = new Error(
-    `HTTP response body exceeded maximum limit (${limit} bytes) for ${urlStr}`
+  return _createCodedError(
+    `HTTP response body exceeded maximum limit (${limit} bytes) for ${urlStr}`,
+    "ERR_HTTP_RESPONSE_TOO_LARGE"
   );
-  err.code = "ERR_HTTP_RESPONSE_TOO_LARGE";
-  return err;
 }
 
+/**
+ * @param {string} urlStr
+ * @param {string} [method]
+ * @param {string | Buffer | Record<string, any>} [body]
+ * @param {Record<string, any>} [headers]
+ * @param {number | Record<string, any>} [redirectsLeft]
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<string>}
+ */
 function httpRequestText(
   urlStr,
   method = "GET",
@@ -475,6 +512,7 @@ function httpRequestText(
   options = {}
 ) {
   let remainingRedirects = 4;
+  /** @type {Record<string, any>} */
   let opts = options && typeof options === "object" ? options : {};
   if (redirectsLeft && typeof redirectsLeft === "object") {
     opts = redirectsLeft;
@@ -628,7 +666,9 @@ function httpRequestText(
             try {
               res.destroy();
               req.destroy();
-            } catch (_) {}
+            } catch (_) {
+              // Best-effort abort of oversized HTTP response streams.
+            }
             return settleReject(err);
           }
         }
@@ -645,7 +685,9 @@ function httpRequestText(
             try {
               res.destroy();
               req.destroy();
-            } catch (_) {}
+            } catch (_) {
+              // Best-effort abort of oversized chunked HTTP response streams.
+            }
             settleReject(err);
             return;
           }
@@ -660,9 +702,7 @@ function httpRequestText(
     );
 
     req.on("timeout", () => {
-      const err = new Error(`HTTP timeout: ${urlStr}`);
-      err.code = "ETIMEDOUT";
-      req.destroy(err);
+      req.destroy(_createCodedError(`HTTP timeout: ${urlStr}`, "ETIMEDOUT"));
     });
     req.on("error", settleReject);
     if (bodyBuf) req.write(bodyBuf);
@@ -670,6 +710,10 @@ function httpRequestText(
   });
 }
 
+/**
+ * @param {Record<string, any>} [headersOrOptions]
+ * @param {Record<string, any>} [maybeOptions]
+ */
 function _splitHeadersAndOptions(headersOrOptions = {}, maybeOptions = undefined) {
   if (maybeOptions !== undefined) {
     return {
@@ -710,6 +754,7 @@ async function httpPostFormJson(
   maybeOptions = undefined
 ) {
   const { headers, options } = _splitHeadersAndOptions(headersOrOptions, maybeOptions);
+  /** @type {string | Buffer} */
   let encodedBody = "";
   if (Buffer.isBuffer(formParams) || typeof formParams === "string") {
     encodedBody = formParams;
@@ -741,14 +786,18 @@ function parseJsonpOrJson(raw) {
 
   try {
     return JSON.parse(trimmed);
-  } catch (_) {}
+  } catch (_) {
+    // Not raw JSON; fall through to semicolon/JSONP unwrapping stages.
+  }
 
   const noSemi = trimmed.replace(/;+\s*$/, "").trim();
   if (!noSemi) return {};
   if (noSemi !== trimmed) {
     try {
       return JSON.parse(noSemi);
-    } catch (_) {}
+    } catch (_) {
+      // Trailing-semicolon stripped payload is not plain JSON; try JSONP wrapper patterns.
+    }
   }
 
   const jsonpMatch = /^(?:[$_\w.[\]]+\s*)?\(([\s\S]*)\)$/.exec(noSemi);
@@ -757,7 +806,9 @@ function parseJsonpOrJson(raw) {
     if (inner) {
       try {
         return JSON.parse(inner);
-      } catch (_) {}
+      } catch (_) {
+        // Outer JSONP wrapper did not contain valid JSON; try embedded callback pattern.
+      }
     }
   }
 
@@ -766,7 +817,9 @@ function parseJsonpOrJson(raw) {
   if (embeddedCallMatch) {
     try {
       return JSON.parse(embeddedCallMatch[1]);
-    } catch (_) {}
+    } catch (_) {
+      // Embedded callback match did not yield valid JSON; try parenthesis slice fallback.
+    }
   }
 
   const firstParen = noSemi.indexOf("(");
@@ -776,7 +829,9 @@ function parseJsonpOrJson(raw) {
     if (innerParen) {
       try {
         return JSON.parse(innerParen);
-      } catch (_) {}
+      } catch (_) {
+        // Parenthesized substring is not valid JSON; try outermost brace slice fallback.
+      }
     }
   }
 
@@ -785,7 +840,9 @@ function parseJsonpOrJson(raw) {
   if (firstBrace !== -1 && lastBrace > firstBrace) {
     try {
       return JSON.parse(noSemi.slice(firstBrace, lastBrace + 1));
-    } catch (_) {}
+    } catch (_) {
+      // Outermost brace slice is not valid JSON; return empty object fallback below.
+    }
   }
 
   return {};

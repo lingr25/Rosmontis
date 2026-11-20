@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const crypto = require("crypto");
@@ -85,10 +86,15 @@ function encodeWsCloseFrame(code = 1000, reason = "", mask = false) {
 }
 
 class Rfc6455Connection extends EventEmitter {
+  /**
+   * @param {any} socket
+   * @param {Record<string, any>} [options]
+   */
   constructor(socket, options = {}) {
     super();
     const opts = options && typeof options === "object" ? options : {};
     this.socket = socket;
+    this.logger = opts.logger || null;
     this.isClient = Boolean(opts.isClient);
     this.allowUnmaskedClientFrames = Boolean(opts.allowUnmaskedClientFrames);
     const parsedMax = Number(opts.maxPayloadBytes);
@@ -178,7 +184,10 @@ class Rfc6455Connection extends EventEmitter {
         if (typeof sock.pause === "function") {
           sock.pause();
         }
-      } catch (_) {}
+      } catch (err) {
+        // Socket may already be closed or torn down during protocol error cleanup.
+        this.logger?.debug?.("ws_rfc6455", err);
+      }
 
       try {
         if (!sock.destroyed) {
@@ -190,14 +199,20 @@ class Rfc6455Connection extends EventEmitter {
                 if (!sock.destroyed && typeof sock.destroy === "function") {
                   sock.destroy();
                 }
-              } catch (_) {}
+              } catch (err) {
+                // Best-effort socket destroy after flushing close frame.
+                this.logger?.debug?.("ws_rfc6455", err);
+              }
             });
             const killTimer = setTimeout(() => {
               try {
                 if (!sock.destroyed && typeof sock.destroy === "function") {
                   sock.destroy();
                 }
-              } catch (_) {}
+              } catch (err) {
+                // Best-effort fallback destroy if close frame flush stalls.
+                this.logger?.debug?.("ws_rfc6455", err);
+              }
             }, 200);
             if (typeof killTimer.unref === "function") killTimer.unref();
           } else {
@@ -206,15 +221,20 @@ class Rfc6455Connection extends EventEmitter {
             if (typeof sock.destroy === "function") sock.destroy();
           }
         }
-      } catch (_) {
+      } catch (err) {
+        this.logger?.debug?.("ws_rfc6455", err);
         try {
           if (sock && !sock.destroyed && typeof sock.destroy === "function") {
             sock.destroy();
           }
-        } catch (_2) {}
+        } catch (destroyErr) {
+          // Socket already destroyed or unwritable during abort teardown.
+          this.logger?.debug?.("ws_rfc6455", destroyErr);
+        }
       }
     }
 
+    /** @type {Error & { wsCloseCode?: number, code?: string }} */
     const err = new Error(reason);
     err.wsCloseCode = code;
     err.code = code === 1009 ? "ERR_WS_PAYLOAD_TOO_LARGE" : "ERR_WS_PROTOCOL_ERROR";
@@ -399,7 +419,10 @@ class Rfc6455Connection extends EventEmitter {
               if (typeof this.socket.write === "function") this.socket.write(replyFrame);
               if (typeof this.socket.end === "function") this.socket.end();
             }
-          } catch (_) {}
+          } catch (err) {
+            // Peer may have half-closed or reset the TCP stream before our close ack.
+            this.logger?.debug?.("ws_rfc6455", err);
+          }
           this._emitCloseOnce(closeCode, closeReason);
         }
         return;
@@ -507,14 +530,20 @@ class Rfc6455Connection extends EventEmitter {
       if (typeof this.socket?.removeListener === "function" && this._boundOnData) {
         this.socket.removeListener("data", this._boundOnData);
       }
-    } catch (_) {}
+    } catch (err) {
+      // Ignore listener detachment errors on already-torn-down sockets.
+      this.logger?.debug?.("ws_rfc6455", err);
+    }
     try {
       if (typeof this.socket?.destroy === "function") {
         this.socket.destroy();
       } else if (typeof this.socket?.end === "function") {
         this.socket.end();
       }
-    } catch (_) {}
+    } catch (err) {
+      // Best-effort socket destruction during forced termination.
+      this.logger?.debug?.("ws_rfc6455", err);
+    }
     this._emitCloseOnce(1006, String(reason || ""));
   }
 
@@ -535,11 +564,22 @@ class Rfc6455Connection extends EventEmitter {
         if (typeof this.socket.write === "function") this.socket.write(frame);
         if (typeof this.socket.end === "function") this.socket.end();
       }
-    } catch (_) {}
+    } catch (err) {
+      // Socket may already be closed when sending the graceful close frame.
+      this.logger?.debug?.("ws_rfc6455", err);
+    }
     this._emitCloseOnce(code ?? 1005, String(reason || ""));
   }
 }
 
+/**
+ * @param {string} urlStr
+ * @param {Record<string, any>} [headers]
+ * @param {(conn: Rfc6455Connection) => void} [onOpen]
+ * @param {(msg: string, conn: Rfc6455Connection) => void} [onMessage]
+ * @param {(err: Error | null) => void} [onClose]
+ * @param {Record<string, any>} [options]
+ */
 function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClose, options = {}) {
   let parsed;
   try {
@@ -561,6 +601,7 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
     for (const [k, v] of Object.entries(headers)) {
       if (v === undefined || v === null || v === "") continue;
       if (!isValidHttpHeaderName(k)) {
+        /** @type {Error & { code?: string }} */
         const hdrErr = new Error(`Invalid HTTP header name in WebSocket upgrade: ${JSON.stringify(k)}`);
         hdrErr.code = "ERR_INVALID_HTTP_HEADER";
         if (onClose) onClose(hdrErr);
@@ -713,7 +754,10 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
       } else {
         try {
           if (typeof socket?.destroy === "function") socket.destroy();
-        } catch (_) {}
+        } catch (err) {
+          // Best-effort socket cleanup when aborting an incomplete handshake.
+          opts.logger?.debug?.("ws_rfc6455", err);
+        }
         notifyCloseOnce(new Error(String(reason || "terminated")));
       }
     },

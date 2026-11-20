@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const {
@@ -190,6 +191,7 @@ async function updateGroupEssence(bridge, p, isAdd) {
   return {};
 }
 
+/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
 const ACTION_HANDLERS = {
   async get_group_list(p) {
     const waitGroupEvent = waitForEventOnce(
@@ -243,7 +245,9 @@ const ACTION_HANDLERS = {
       if (probe && (probe.groupName || probe.memberCount || probe.maxMemberCount)) {
         return formatOneBotGroupRecord(res, groupId);
       }
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
     const list = await this._dispatchAction("get_group_list", { no_cache: p.no_cache });
     return list.find((g) => g.group_id === groupId) || formatOneBotGroupRecord(null, groupId);
   },
@@ -271,12 +275,15 @@ const ACTION_HANDLERS = {
           if (typeof jumpUrl === "string" && /^https?:\/\//i.test(jumpUrl)) {
             return { url: jumpUrl };
           }
-        } catch (_) {
+        } catch (parseErr) {
+          this.logger?.debug?.("group_actions", parseErr);
           const m = /https?:\/\/(?:qm\.qq\.com|qun\.qq\.com)\/[^\s"'\\]+/i.exec(rawArk);
           if (m) return { url: m[0] };
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
     return { url: `https://qun.qq.com/join.html?group_id=${encodeURIComponent(groupCode)}` };
   },
 
@@ -299,7 +306,8 @@ const ACTION_HANDLERS = {
           info.RemainAtAllCountForUin ?? info.remainAtAllCountForUin ?? 10
         ),
       };
-    } catch (_) {
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
       return {
         can_at_all: true,
         remain_at_all_count_for_group: 10,
@@ -320,7 +328,9 @@ const ACTION_HANDLERS = {
         [groupCode, true]
       );
       rawMembers = extractMemberArray(allRes?.result?.infos || allRes?.infos || allRes);
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
     this.uinUidStore.rememberFromGroupMemberList(groupCode, rawMembers);
     const shutList = [];
     for (const m of rawMembers) {
@@ -440,14 +450,17 @@ const ACTION_HANDLERS = {
           infos = mergedMap;
         }
       }
-    } catch (_) {
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
     } finally {
       if (sceneId) {
         this.invokeNt(
           "nodeIKernelGroupService/destroyMemberListScene",
           { sceneId },
           [sceneId]
-        ).catch(() => {});
+        ).catch((err) => {
+          this.logger?.debug?.("group_actions", err);
+        });
       }
     }
     if (!hasMemberEntries(infos) || forceFetch) {
@@ -461,7 +474,9 @@ const ACTION_HANDLERS = {
         if (hasMemberEntries(allInfos)) {
           infos = allInfos;
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("group_actions", err);
+      }
     }
     this.uinUidStore.rememberFromGroupMemberList(groupCode, infos);
     const rawMembers = extractMemberArray(infos);
@@ -482,7 +497,9 @@ const ACTION_HANDLERS = {
             this.uinUidStore.remember(String(uin), String(uid));
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("group_actions", err);
+      }
     }
     for (const m of rawMembers) {
       if (m && !pickPositiveUin(m.uin, m.user_id) && m.uid) {
@@ -540,7 +557,9 @@ const ACTION_HANDLERS = {
           }
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
 
     const members = await this._dispatchAction("get_group_member_list", {
       group_id: groupId,
@@ -636,6 +655,7 @@ const ACTION_HANDLERS = {
       ? "setMemberSpecialTitle"
       : "";
     if (!methodName) {
+      /** @type {Error & { retcode?: number }} */
       const err = new Error(
         "set_group_special_title is unsupported by Linux QQNT 3.2.32 kernel (no modifyMemberSpecialTitle RPC)"
       );
@@ -735,7 +755,9 @@ const ACTION_HANDLERS = {
         if (Array.isArray(parsed?.data?.msg_list)) {
           return parsed.data.msg_list;
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("group_actions", err);
+      }
     }
     const pageStart = Math.max(0, Number(p.page_start ?? 0));
     const pageLimit = Math.max(1, Number(p.page_limit ?? 50));
@@ -750,7 +772,9 @@ const ACTION_HANDLERS = {
         return res.msgList || res.list;
       }
       if (res !== undefined) return res?.msgList || [];
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
 
     const latestReq = {
       groupCode: groupId,
@@ -771,7 +795,9 @@ const ACTION_HANDLERS = {
         return res.msgList || res.list;
       }
       if (res !== undefined) return res?.msgList || [];
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
     return [];
   },
 
@@ -812,7 +838,9 @@ const ACTION_HANDLERS = {
           const json = parseJsonpOrJson(text);
           if (json && json.ec === 0) return {};
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("group_actions", err);
+      }
     }
 
     let psKey = "";
@@ -835,7 +863,9 @@ const ACTION_HANDLERS = {
             ? map["qun.qq.com"]
             : "";
         if (candidate) psKey = String(candidate);
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("group_actions", err);
+      }
     }
 
     const req = {
@@ -864,7 +894,9 @@ const ACTION_HANDLERS = {
       if (Array.isArray(res?.feeds)) {
         return res.feeds;
       }
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("group_actions", err);
+    }
     if (isWebCredentialApiEnabled(this.config) && this.config.allowExternalHttp !== false) {
       try {
         const cookies = await this._getCookiesObject("qun.qq.com");
@@ -903,7 +935,9 @@ const ACTION_HANDLERS = {
             }));
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("group_actions", err);
+      }
     }
     return [];
   },

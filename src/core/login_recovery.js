@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -110,6 +111,7 @@ function buildBotOfflineNoticePayload(selfUin, firstArg) {
 }
 
 const loginRecoveryMixin = {
+  /** @this {any} */
   _syncSelfIdentityFromLogin(rawIdentity, { markOnline = true } = {}) {
     const identity = normalizeLoginIdentity(rawIdentity);
     if (typeof this._updateSelfIdentity === "function") {
@@ -134,6 +136,7 @@ const loginRecoveryMixin = {
     return identity;
   },
 
+  /** @this {any} */
   _handleQrCodeEvent(firstArg) {
     const pngBase64 = extractQrCodeBase64(firstArg);
     if (pngBase64) {
@@ -142,7 +145,9 @@ const loginRecoveryMixin = {
         for (const resolveWaiter of Array.from(this._qrCodeWaiters)) {
           try {
             resolveWaiter(pngBase64);
-          } catch (_) {}
+          } catch (err) {
+            this.logger?.debug?.("login_recovery", err);
+          }
         }
         this._qrCodeWaiters.clear();
       }
@@ -164,16 +169,19 @@ const loginRecoveryMixin = {
     }
   },
 
+  /** @this {any} */
   _handleUserLoggedInEvent(firstArg) {
     this._syncSelfIdentityFromLogin(firstArg, { markOnline: true });
   },
 
+  /** @this {any} */
   _handleSessionInitCompleteEvent(firstArg) {
     if (isSessionInitSuccess(firstArg)) {
       this.online = true;
     }
   },
 
+  /** @this {any} */
   _handleKickedOffLineEvent(firstArg) {
     this.online = false;
     this._resetHumanSessionState?.({ resetRenderer: true });
@@ -186,6 +194,7 @@ const loginRecoveryMixin = {
     );
   },
 
+  /** @this {any} */
   _handleLoginKernelEvent(eventName, args) {
     const firstArg = args && args.length > 0 ? args[0] : undefined;
     if (eventName === "onQRCodeGetPicture" || eventName === "onQRCodeSessionQuickLoginFailed") {
@@ -207,7 +216,12 @@ const loginRecoveryMixin = {
     return false;
   },
 
-  async _tryAutoQuickLogin({ uin: explicitUin = "", force = false, webContents = null } = {}) {
+  /**
+   * @this {any}
+   */
+  async _tryAutoQuickLogin(
+    { uin: explicitUin = "", force = false, webContents = null } = /** @type {Record<string, any>} */ ({})
+  ) {
     if (this.online && !force) {
       return { skipped: true, reason: "already_online", online: true };
     }
@@ -225,12 +239,16 @@ const loginRecoveryMixin = {
 
     try {
       await this.invokeNt("nodeIKernelLoginService/setAutoLogin", { shouldAutoLogin: true }, [true]);
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("login_recovery", err);
+    }
 
     let loginRes = null;
     try {
       loginRes = await this.invokeNt("nodeIKernelLoginService/getLoginList", {}, []);
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("login_recovery", err);
+    }
     const list = Array.isArray(loginRes?.LocalLoginInfoList) ? loginRes.LocalLoginInfoList : [];
     const targetUin = String(explicitUin || this.selfUin || "").trim();
     const acc = selectQuickLoginAccount(list, targetUin);
@@ -264,7 +282,9 @@ const loginRecoveryMixin = {
 
     try {
       await this.invokeNt("nodeIKernelSettingService/setAutoLoginSwitch", { state: true }, [true]);
-    } catch (_) {}
+    } catch (err) {
+      this.logger?.debug?.("login_recovery", err);
+    }
 
     let quickRes = null;
     let methodUsed = "";
@@ -279,7 +299,9 @@ const loginRecoveryMixin = {
           methodUsed = cmd;
           break;
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("login_recovery", err);
+      }
     }
 
     const wc = webContents || this.activeWebContents;
@@ -312,7 +334,9 @@ const loginRecoveryMixin = {
           true
         );
         if (clicked) methodUsed = "dom_button_click";
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("login_recovery", err);
+      }
     }
 
     return {

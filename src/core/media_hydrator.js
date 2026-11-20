@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -25,7 +26,9 @@ async function statPositiveFile(filePath) {
     if (st.isFile() && st.size > 0) {
       return st;
     }
-  } catch (_) {}
+  } catch (_) {
+    // Expected when rich media file is not downloaded yet or path is not readable.
+  }
   return null;
 }
 
@@ -38,7 +41,9 @@ function defineLocalFileUrl(target, localPath) {
       configurable: true,
       writable: true,
     });
-  } catch (_) {}
+  } catch (_) {
+    // Target NTQQ element object may be frozen or non-extensible; skip non-enumerable attachment.
+  }
 }
 
 function defineBase64Uri(target, buf) {
@@ -55,7 +60,9 @@ function stripTransientMedia(ntMsg) {
   if (typeof bridgeOnebot.stripTransientNtMedia === "function") {
     try {
       bridgeOnebot.stripTransientNtMedia(ntMsg);
-    } catch (_) {}
+    } catch (_) {
+      // Fallback to direct element cleanup below if facade strip helper fails.
+    }
   }
   if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
   for (const el of ntMsg.elements) {
@@ -76,6 +83,7 @@ function stripTransientMedia(ntMsg) {
 }
 
 const mediaHydratorMixin = {
+  /** @this {any} */
   _handleRichMediaDownloadComplete(firstArg) {
     const info = firstArg?.notifyInfo || firstArg || {};
     const msgId = String(info.msgId || "");
@@ -123,19 +131,24 @@ const mediaHydratorMixin = {
     }
   },
 
-  async _downloadRichMediaElement({
-    msgId,
-    chatType,
-    peerUid,
-    elementId,
-    downloadType = 1,
-    downSourceType = 0,
-    downloadScene = 0,
-    fileModelId = "0",
-    thumbSize = 0,
-    filePath = "",
-    timeoutMs = 8000,
-  } = {}) {
+  /**
+   * @this {any}
+   */
+  async _downloadRichMediaElement(
+    {
+      msgId,
+      chatType,
+      peerUid,
+      elementId,
+      downloadType = 1,
+      downSourceType = 0,
+      downloadScene = 0,
+      fileModelId = "0",
+      thumbSize = 0,
+      filePath = "",
+      timeoutMs = 8000,
+    } = /** @type {Record<string, any>} */ ({})
+  ) {
     const targetPath = filePath ? String(filePath).trim() : "";
     if (targetPath) {
       const existingStat = await statPositiveFile(targetPath);
@@ -265,6 +278,7 @@ const mediaHydratorMixin = {
     return "";
   },
 
+  /** @this {any} */
   async _hydratePicElement(ntMsg, el, ctx) {
     const pe = el.picElement;
     if (!pe || pe.__base64Uri) return;
@@ -385,6 +399,7 @@ const mediaHydratorMixin = {
     }
   },
 
+  /** @this {any} */
   async _hydratePttElement(ntMsg, el, ctx) {
     const ptt = el.pttElement;
     if (!ptt || ptt.__base64Uri) return;
@@ -461,6 +476,7 @@ const mediaHydratorMixin = {
     }
   },
 
+  /** @this {any} */
   async _hydrateVideoElement(el) {
     const ve = el.videoElement;
     if (!ve || ve.__localFileUrl) return;
@@ -472,6 +488,11 @@ const mediaHydratorMixin = {
     }
   },
 
+  /**
+   * @this {any}
+   * @param {any} ntMsg
+   * @param {Record<string, any>} [options]
+   */
   async _hydrateNtMsgMedia(ntMsg, options = {}) {
     if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
     const skipRemoteDownload = Boolean(options?.skipRemoteDownload);

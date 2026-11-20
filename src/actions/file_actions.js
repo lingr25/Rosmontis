@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -39,7 +40,9 @@ async function statNonEmptyFile(candidatePath) {
   try {
     const st = await fs.promises.stat(candidatePath);
     if (st.isFile() && st.size > 0) return st;
-  } catch (_) {}
+  } catch (_) {
+    // Candidate file does not exist yet or is not readable; treat as absent.
+  }
   return null;
 }
 
@@ -231,7 +234,9 @@ async function resolveGroupFileMeta(bridge, groupId, fileId, rawBusId) {
         (infoRes && typeof infoRes === "object" && (infoRes.fileId || infoRes.busId)
           ? infoRes
           : null);
-    } catch (_) {}
+    } catch (err) {
+      bridge?.logger?.debug?.("file_actions", err);
+    }
   }
   const busId =
     explicitBus ||
@@ -317,6 +322,12 @@ async function waitRichMediaTargetFile(bridge, targetPath, extraKeys = [], timeo
   };
 }
 
+/**
+ * @param {any} bridge
+ * @param {string | number} groupId
+ * @param {string} fileId
+ * @param {Record<string, any>} [options]
+ */
 async function downloadGroupFileToLocal(bridge, groupId, fileId, options = {}) {
   const groupCode = String(groupId || "").trim();
   const targetFileId = String(fileId || "").trim();
@@ -395,6 +406,12 @@ async function downloadGroupFileToLocal(bridge, groupId, fileId, options = {}) {
   return { localPath: "", url: "" };
 }
 
+/**
+ * @param {any} bridge
+ * @param {string | number} groupId
+ * @param {string} folderId
+ * @param {Record<string, any>} [options]
+ */
 async function listGroupFiles(bridge, groupId, folderId, options = {}) {
   const groupIdStr = String(groupId);
   const fileListForm = {
@@ -555,6 +572,7 @@ async function extractUploadedFileUuid(bridge, peer, sent) {
 // Declarative File Action Handlers & Aliases
 // ============================================================================
 
+/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
 const ACTION_HANDLERS = {
   async get_group_root_files(p) {
     return await listGroupFiles(this, Number(p.group_id || 0), "/", {
@@ -640,7 +658,9 @@ const ACTION_HANDLERS = {
           }
           return { url: pathToFileURL(candidate).href };
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("file_actions", err);
+      }
     }
 
     const dl = await downloadGroupFileToLocal(this, groupId, fileId, {
@@ -706,7 +726,9 @@ const ACTION_HANDLERS = {
             }
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("file_actions", err);
+      }
     }
 
     if (!mediaDesc) return { url: "" };
@@ -748,7 +770,9 @@ const ACTION_HANDLERS = {
           filePath: targetPath,
           timeoutMs,
         });
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("file_actions", err);
+      }
     } else {
       try {
         const getReq = {
@@ -771,7 +795,9 @@ const ACTION_HANDLERS = {
           [getReq]
         );
         candidatePath = String(res?.filePath || targetPath || "");
-      } catch (_) {}
+      } catch (err) {
+        this.logger?.debug?.("file_actions", err);
+      }
     }
 
     const resolved = String(candidatePath || targetPath || "");

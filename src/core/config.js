@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 const fs = require("fs");
@@ -114,7 +115,9 @@ function _normalizeDelaySpec(candidate) {
       const parsed = JSON.parse(trimmed);
       const norm = _normalizeDelaySpec(parsed);
       if (norm !== undefined) return norm;
-    } catch (_) {}
+    } catch (_) {
+      // Non-JSON delay spec (e.g. "500-1800" or plain number); fall through to range/numeric parser.
+    }
     const rangeMatch = /^(\d+(?:\.\d+)?)\s*[,-]\s*(\d+(?:\.\d+)?)$/.exec(trimmed);
     if (rangeMatch) {
       const a = Number(rangeMatch[1]);
@@ -175,11 +178,16 @@ function _applyOptionalNumberOverride(target, key, rawObj, suffix, extraKeys = [
   }
 }
 
+/**
+ * @param {string} [customConfigDir]
+ * @returns {import("../types").BridgeConfig & Record<string, any>}
+ */
 function loadBridgeConfig(customConfigDir) {
   const envSelfUin = pickPrefixedEnv("SELF_ID");
   const envHeartbeatRaw = pickPrefixedEnv("HEARTBEAT_MS");
   const envMessageFormatRaw = pickPrefixedEnv("MESSAGE_FORMAT").toLowerCase();
 
+  /** @type {Record<string, any>} */
   const defaultConfig = {
     selfUin: envSelfUin,
     selfNickname: pickPrefixedEnv("SELF_NICKNAME") || "Rosmontis",
@@ -205,6 +213,7 @@ function loadBridgeConfig(customConfigDir) {
   let loadedFromFile = false;
   let hasExplicitHttpServersKey = false;
   let hasExplicitWsServersKey = false;
+  /** @type {Record<string, any>} */
   let loadedRaw = {};
 
   for (const dir of searchDirs) {
@@ -240,7 +249,9 @@ function loadBridgeConfig(customConfigDir) {
             hasWsClients,
             mtimeMs: Number(stat?.mtimeMs || 0),
           });
-        } catch (_) {}
+        } catch (_) {
+          // Skip unreadable or malformed candidate config JSON and continue scanning.
+        }
       }
       if (parsedEntries.length === 0) continue;
 
@@ -313,7 +324,9 @@ function loadBridgeConfig(customConfigDir) {
         loadedFromFile = true;
       }
       if (loadedFromFile) break;
-    } catch (_) {}
+    } catch (_) {
+      // Candidate config directory may not exist or lack read permissions; try next searchDir.
+    }
   }
 
   // Logging, diagnostics & runtime flags (JSON + env overrides)
@@ -783,9 +796,13 @@ function loadBridgeConfig(customConfigDir) {
     for (const c of defaultConfig.httpClients) c.secret = envHttpSecret;
   }
 
-  return defaultConfig;
+  return /** @type {import("../types").BridgeConfig & Record<string, any>} */ (defaultConfig);
 }
 
+/**
+ * @param {Record<string, any>} [config]
+ * @param {Record<string, any>} [context]
+ */
 function resolveCompatVersionInfo(config = {}, context = {}) {
   const appNameOverride = String(
     context?.compatAppName ?? config?.compatAppName ?? ""

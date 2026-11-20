@@ -1,3 +1,4 @@
+// @ts-check
 "use strict";
 
 /**
@@ -26,6 +27,13 @@ for (const mod of SUB_MODULES) {
   }
 }
 
+/**
+ * @this {any}
+ * @param {string} action
+ * @param {Record<string, any>} p
+ * @param {import("../types").ActionContext} [context]
+ * @returns {Promise<any>}
+ */
 async function dispatch(action, p, context = {}) {
   const handler = ACTION_DISPATCH_MAP.get(action);
   if (!handler) {
