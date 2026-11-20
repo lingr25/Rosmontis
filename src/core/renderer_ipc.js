@@ -1114,7 +1114,7 @@ const rendererIpcMixin = {
     const preferMainDirect =
       !sideEffect &&
       Boolean(invokeOptions && invokeOptions.preferMainProcess) &&
-      this.config?.preferMainProcessForBulkReads !== false &&
+      this.config?.preferMainProcessForBulkReads === true &&
       typeof this.rendererExecute !== "function" &&
       Boolean(this.capturedServices?.ntApi);
 

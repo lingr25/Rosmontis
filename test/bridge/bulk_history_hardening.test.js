@@ -96,7 +96,7 @@ test("get_group_msg_history with skipRemoteDownload fires zero getRichMediaFileP
   await bridge.stopServers();
 });
 
-test("get_group_msg_history uses main-process ntApi fast-path without degraded count, respects opt-out & keeps send_group_msg on Tier 1", async () => {
+test("get_group_msg_history defaults to Tier 1 renderer IPC, supports opt-in main-process fast-path with empty fallback & keeps send_group_msg on Tier 1", async () => {
   const rendererCalls = [];
   const mainCalls = [];
 
@@ -130,11 +130,37 @@ test("get_group_msg_history uses main-process ntApi fast-path without degraded c
     },
   });
 
-  // 1. Default: preferMainProcessForBulkReads === true -> direct Tier 2 fast-path, degraded === 0
-  const bridge = new NtqqOneBotBridge({
+  // 1. Default: preferMainProcessForBulkReads is false -> routes history safely via Tier 1 renderer IPC
+  const bridgeDefault = new NtqqOneBotBridge({
     selfUin: "10001",
     selfUid: "u_self",
-    config: makeSilentConfig({ sendEchoTimeoutMs: 50 }),
+    config: makeSilentConfig(),
+    ntApi: {
+      "nodeIKernelMsgService/sendMsg": async () => ({ result: 0 }),
+      "nodeIKernelMsgService/getMsgsIncludeSelf": async () => {
+        mainCalls.push("nodeIKernelMsgService/getMsgsIncludeSelf");
+        return { msgList: [] };
+      },
+    },
+  });
+  bridgeDefault.activeWebContents = makeMockWebContents();
+  const defaultRes = await bridgeDefault.handleOneBotAction("get_group_msg_history", {
+    group_id: 776655,
+    count: 20,
+  });
+  assert.strictEqual(defaultRes.status, "ok");
+  assert.strictEqual(defaultRes.data.messages[0].raw_message, "from-renderer");
+  assert.deepStrictEqual(rendererCalls, ["nodeIKernelMsgService/getMsgsIncludeSelf"]);
+  assert.deepStrictEqual(mainCalls, []);
+  await bridgeDefault.stopServers();
+
+  // 2. Opt-in: preferMainProcessForBulkReads === true -> direct Tier 2 fast-path (non-empty), degraded === 0
+  rendererCalls.length = 0;
+  mainCalls.length = 0;
+  const bridgeOptIn = new NtqqOneBotBridge({
+    selfUin: "10001",
+    selfUid: "u_self",
+    config: makeSilentConfig({ preferMainProcessForBulkReads: true, sendEchoTimeoutMs: 50 }),
     ntApi: {
       "nodeIKernelMsgService/sendMsg": async () => {
         mainCalls.push("nodeIKernelMsgService/sendMsg");
@@ -158,21 +184,21 @@ test("get_group_msg_history uses main-process ntApi fast-path without degraded c
       },
     },
   });
-  bridge.activeWebContents = makeMockWebContents();
+  bridgeOptIn.activeWebContents = makeMockWebContents();
 
-  const histRes = await bridge.handleOneBotAction("get_group_msg_history", {
+  const histRes = await bridgeOptIn.handleOneBotAction("get_group_msg_history", {
     group_id: 776655,
     count: 60,
   });
   assert.strictEqual(histRes.status, "ok");
   assert.strictEqual(histRes.data.messages[0].raw_message, "from-main-fastpath");
   assert.deepStrictEqual(mainCalls, ["nodeIKernelMsgService/getMsgsIncludeSelf"]);
-  assert.deepStrictEqual(rendererCalls, [], "Renderer IPC must be bypassed for bulk history read");
-  assert.strictEqual(bridge.invokeStats.directMain, 1);
-  assert.strictEqual(bridge.invokeStats.degraded, 0, "Intentional directMain fast-path must not count as degraded");
+  assert.deepStrictEqual(rendererCalls, [], "Renderer IPC must be bypassed when opt-in fast-path returns messages");
+  assert.strictEqual(bridgeOptIn.invokeStats.directMain, 1);
+  assert.strictEqual(bridgeOptIn.invokeStats.degraded, 0, "Intentional directMain fast-path must not count as degraded");
 
   // Side-effect send_group_msg must still go through Tier 1 renderer IPC
-  await bridge.handleOneBotAction("send_group_msg", {
+  await bridgeOptIn.handleOneBotAction("send_group_msg", {
     group_id: 776655,
     message: "hello-tier1",
   });
@@ -185,15 +211,15 @@ test("get_group_msg_history uses main-process ntApi fast-path without degraded c
     false,
     "sendMsg must not bypass Tier 1"
   );
-  await bridge.stopServers();
+  await bridgeOptIn.stopServers();
 
-  // 2. Opt-out: preferMainProcessForBulkReads === false -> routes history via Tier 1 renderer IPC
+  // 3. Opt-in empty fallback: if Tier 2 returns silent [] (QQ 3.2.35 behavior), transparently fall back to Tier 1
   rendererCalls.length = 0;
   mainCalls.length = 0;
-  const bridgeOptOut = new NtqqOneBotBridge({
+  const bridgeFallback = new NtqqOneBotBridge({
     selfUin: "10001",
     selfUid: "u_self",
-    config: makeSilentConfig({ preferMainProcessForBulkReads: false }),
+    config: makeSilentConfig({ preferMainProcessForBulkReads: true }),
     ntApi: {
       "nodeIKernelMsgService/sendMsg": async () => ({ result: 0 }),
       "nodeIKernelMsgService/getMsgsIncludeSelf": async () => {
@@ -202,24 +228,28 @@ test("get_group_msg_history uses main-process ntApi fast-path without degraded c
       },
     },
   });
-  bridgeOptOut.activeWebContents = makeMockWebContents();
-  const optOutRes = await bridgeOptOut.handleOneBotAction("get_group_msg_history", {
+  bridgeFallback.activeWebContents = makeMockWebContents();
+  const fallbackRes = await bridgeFallback.handleOneBotAction("get_group_msg_history", {
     group_id: 776655,
     count: 20,
   });
-  assert.strictEqual(optOutRes.status, "ok");
-  assert.strictEqual(optOutRes.data.messages[0].raw_message, "from-renderer");
-  assert.deepStrictEqual(rendererCalls, ["nodeIKernelMsgService/getMsgsIncludeSelf"]);
-  assert.deepStrictEqual(mainCalls, []);
-  await bridgeOptOut.stopServers();
+  assert.strictEqual(fallbackRes.status, "ok");
+  assert.strictEqual(fallbackRes.data.messages[0].raw_message, "from-renderer");
+  assert.ok(mainCalls.length >= 1, "Expected Tier 2 fast-path attempt first");
+  assert.deepStrictEqual(
+    rendererCalls,
+    ["nodeIKernelMsgService/getMsgsIncludeSelf"],
+    "Expected automatic Tier 1 renderer fallback when Tier 2 returned empty msgList"
+  );
+  await bridgeFallback.stopServers();
 
-  // 3. Env var parsing check
+  // 4. Env var parsing check (default false, opt-in with "1")
   const prevEnv = process.env.ROSMONTIS_PREFER_MAIN_PROCESS_FOR_BULK_READS;
   try {
     delete process.env.ROSMONTIS_PREFER_MAIN_PROCESS_FOR_BULK_READS;
-    assert.strictEqual(loadBridgeConfig("/nonexistent-dir-xyz").preferMainProcessForBulkReads, true);
-    process.env.ROSMONTIS_PREFER_MAIN_PROCESS_FOR_BULK_READS = "0";
     assert.strictEqual(loadBridgeConfig("/nonexistent-dir-xyz").preferMainProcessForBulkReads, false);
+    process.env.ROSMONTIS_PREFER_MAIN_PROCESS_FOR_BULK_READS = "1";
+    assert.strictEqual(loadBridgeConfig("/nonexistent-dir-xyz").preferMainProcessForBulkReads, true);
   } finally {
     if (prevEnv === undefined) delete process.env.ROSMONTIS_PREFER_MAIN_PROCESS_FOR_BULK_READS;
     else process.env.ROSMONTIS_PREFER_MAIN_PROCESS_FOR_BULK_READS = prevEnv;

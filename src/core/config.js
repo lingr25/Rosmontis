@@ -664,7 +664,7 @@ function loadBridgeConfig(customConfigDir) {
 
   defaultConfig.preferMainProcessForBulkReads = _resolveBoolWithDefault(
     loadedRaw.preferMainProcessForBulkReads ?? loadedRaw.prefer_main_process_for_bulk_reads,
-    true,
+    false,
     "PREFER_MAIN_PROCESS_FOR_BULK_READS"
   );
 

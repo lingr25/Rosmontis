@@ -465,32 +465,32 @@ async function getMessageHistory(bridge, p, context, isGroup) {
     }
   }
   const queryOrder = startMsgId === "0";
-  const bulkReadOpts = { preferMainProcess: true };
-  let res = await bridge.invokeNt(
-    "nodeIKernelMsgService/getMsgsIncludeSelf",
-    {
-      peer,
-      msgId: startMsgId,
-      cnt: count,
-      queryOrder,
-    },
-    [peer, startMsgId, count, queryOrder],
-    bulkReadOpts
-  );
-  let rawList = Array.isArray(res?.msgList) ? res.msgList : [];
-  if (rawList.length === 0 && queryOrder) {
-    res = await bridge.invokeNt(
+  const tryMainDirect = bridge.config?.preferMainProcessForBulkReads === true;
+  const fetchHistory = async (order, preferMain) => {
+    const r = await bridge.invokeNt(
       "nodeIKernelMsgService/getMsgsIncludeSelf",
       {
         peer,
         msgId: startMsgId,
         cnt: count,
-        queryOrder: false,
+        queryOrder: order,
       },
-      [peer, startMsgId, count, false],
-      bulkReadOpts
+      [peer, startMsgId, count, order],
+      { preferMainProcess: Boolean(preferMain) }
     );
-    rawList = Array.isArray(res?.msgList) ? res.msgList : [];
+    return Array.isArray(r?.msgList) ? r.msgList : [];
+  };
+  let rawList = await fetchHistory(queryOrder, tryMainDirect);
+  if (rawList.length === 0 && queryOrder) {
+    rawList = await fetchHistory(false, tryMainDirect);
+  }
+  // If opt-in main-process direct read returned empty (e.g. QQ 3.2.35 Tier 2 silent []),
+  // transparently fall back to Tier 1 renderer IPC.
+  if (rawList.length === 0 && tryMainDirect) {
+    rawList = await fetchHistory(queryOrder, false);
+    if (rawList.length === 0 && queryOrder) {
+      rawList = await fetchHistory(false, false);
+    }
   }
   const reqMsgFormat =
     context?.messageFormat || p?.message_format || bridge.config.messageFormat || "array";
