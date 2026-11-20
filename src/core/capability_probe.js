@@ -33,9 +33,13 @@ function countNtApiMethods(ntApiTarget) {
         if (typeof ntApiTarget[key] === "function") {
           count += 1;
         }
-      } catch (_) {}
+      } catch (_err) {
+        // Ignore inaccessible proxy/getter properties while counting callable ntApi routes
+      }
     }
-  } catch (_) {}
+  } catch (_err) {
+    // Ignore proxy/object reflection errors when enumerating ntApi keys
+  }
   return count;
 }
 
@@ -59,7 +63,9 @@ function resolveNtApiTarget(bridge) {
     if (typeof raw["nodeIKernelMsgService/sendMsg"] === "function") {
       return raw;
     }
-  } catch (_) {}
+  } catch (_err) {
+    // Property probe threw on host proxy; fall through to ntApi.invoke check
+  }
   try {
     const inv = raw.invoke;
     if (inv && (typeof inv === "object" || typeof inv === "function")) {
@@ -70,7 +76,9 @@ function resolveNtApiTarget(bridge) {
         return inv;
       }
     }
-  } catch (_) {}
+  } catch (_err) {
+    // Ignore errors probing raw.invoke; fall back to raw ntApi target
+  }
   return raw;
 }
 
@@ -111,7 +119,9 @@ function listWrapperServices(session) {
       if (typeof session[getterName] === "function") {
         found.add(getterName);
       }
-    } catch (_) {}
+    } catch (_err) {
+      // Ignore throwing getter descriptors during read-only service discovery
+    }
   }
 
   // Also scan own and prototype method descriptors (skipping accessors) for additional get*Service getters
@@ -127,9 +137,13 @@ function listWrapperServices(session) {
           if (desc && "value" in desc && typeof desc.value === "function") {
             found.add(name);
           }
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore non-inspectable descriptors on native wrapper prototypes
+        }
       }
-    } catch (_) {}
+    } catch (_err) {
+      // Ignore prototype levels whose own property names cannot be enumerated
+    }
     try {
       cursor = Object.getPrototypeOf(cursor);
     } catch (_) {
@@ -182,7 +196,9 @@ function hasKernelMethodOnResolved(
           if (typeof svc[methodName] === "function") {
             return true;
           }
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore property probe failure on native service object; fall back to ntApi
+        }
       }
     }
   }
@@ -194,7 +210,9 @@ function hasKernelMethodOnResolved(
       if (typeof ntApiTarget[cmd] === "function") {
         return true;
       }
-    } catch (_) {}
+    } catch (_err) {
+      // Ignore route probe failure on ntApi object
+    }
   }
 
   return false;

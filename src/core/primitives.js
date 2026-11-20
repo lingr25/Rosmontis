@@ -205,7 +205,9 @@ class TempCleanupQueue {
       for (const fn of callbacks) {
         try {
           if (typeof fn === "function") fn();
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore benign temp-file cleanup failures during immediate drain
+        }
       }
       return;
     }
@@ -230,7 +232,9 @@ class TempCleanupQueue {
         }
         try {
           fn();
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore benign temp-file cleanup failures on scheduled eviction
+        }
       };
       timer = setTimeout(runOnce, delayMs);
       if (timer && typeof timer.unref === "function") {
@@ -262,7 +266,9 @@ class TempCleanupQueue {
           if (fs.existsSync(tempPath)) {
             fs.unlinkSync(tempPath);
           }
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore benign unlink errors when temp media was already removed
+        }
       });
     }
   }
@@ -276,7 +282,9 @@ class TempCleanupQueue {
       if (typeof fn === "function") {
         try {
           fn();
-        } catch (_) {}
+        } catch (_err) {
+          // Ignore benign cleanup callback errors while flushing queue
+        }
       }
     }
   }

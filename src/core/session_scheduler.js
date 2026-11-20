@@ -18,6 +18,7 @@ class CausalSessionScheduler {
   constructor(options = {}) {
     this._customGetActivePeerKey =
       typeof options.getActivePeerKey === "function" ? options.getActivePeerKey : null;
+    this._logger = options.logger || null;
 
     const rawMaxStreak = Number(options.maxAffinityStreak);
     this.maxAffinityStreak =
@@ -302,7 +303,10 @@ class CausalSessionScheduler {
       }
       Promise.resolve()
         .then(() => callback(key))
-        .catch(() => {});
+        .catch((err) => {
+          // Swallow unhandled reaction callback errors to prevent timer rejection crashes
+          this._logger?.debug?.("session_scheduler.privateRecvReaction", err);
+        });
     }, delayMs);
     if (typeof timer.unref === "function") timer.unref();
 

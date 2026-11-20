@@ -430,6 +430,19 @@ function wrapPcmS16leToWavBuffer(pcmBuf, sampleRate = 24000, channels = 1) {
 
 const _missingCliCache = new Set();
 
+/**
+ * Best-effort removal of transient audio scratch files.
+ * @param {string} filePath
+ */
+async function _unlinkTempSilent(filePath) {
+  if (!filePath) return;
+  try {
+    await fs.promises.unlink(filePath);
+  } catch (_err) {
+    // Ignore benign temp-file cleanup errors (e.g., ENOENT if never created)
+  }
+}
+
 async function _decodeSilkViaExternalCli(inputPath, silkFormat, options = {}) {
   const configuredBin = resolveSilkDecoderPathFromEnv(options.silkDecoderPath);
   const candidates = configuredBin ? [configuredBin] : ["silk_v3_decoder"];
@@ -470,10 +483,12 @@ async function _decodeSilkViaExternalCli(inputPath, silkFormat, options = {}) {
       if (pcmBuf.length > 0) {
         return wrapPcmS16leToWavBuffer(pcmBuf, sampleRate, 1);
       }
-    } catch (_) {
+    } catch (err) {
+      // Decoder CLI unavailable or failed; try next candidate or fall back to null
+      options?.logger?.debug?.("audio_codec.decodeSilkCli", err);
     } finally {
-      await fs.promises.unlink(tmpPcm).catch(() => {});
-      if (tmpRawSilk) await fs.promises.unlink(tmpRawSilk).catch(() => {});
+      await _unlinkTempSilent(tmpPcm);
+      if (tmpRawSilk) await _unlinkTempSilent(tmpRawSilk);
     }
   }
   return null;
@@ -566,8 +581,8 @@ async function _encodeSilkViaExternalCli(inputPath, options = {}) {
     if (err && err.code === "ERR_MEDIA_TOO_LARGE") throw err;
     return null;
   } finally {
-    await fs.promises.unlink(tmpPcm).catch(() => {});
-    await fs.promises.unlink(tmpSilk).catch(() => {});
+    await _unlinkTempSilent(tmpPcm);
+    await _unlinkTempSilent(tmpSilk);
   }
 }
 
@@ -611,7 +626,7 @@ async function transcodeAudioToAmrNb(inputPath, options = {}) {
     );
 
     const outBuf = await fs.promises.readFile(tmpOut);
-    await fs.promises.unlink(tmpOut).catch(() => {});
+    await _unlinkTempSilent(tmpOut);
 
     if (outBuf.length === 0) {
       throw new Error("ffmpeg produced an empty AMR output file");
@@ -645,7 +660,7 @@ async function transcodeAudioToAmrNb(inputPath, options = {}) {
       isTempFile: true,
     };
   } catch (err) {
-    await fs.promises.unlink(tmpOut).catch(() => {});
+    await _unlinkTempSilent(tmpOut);
     if (err && err.code === "ERR_MEDIA_TOO_LARGE") {
       throw err;
     }
@@ -829,7 +844,7 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
       timeoutMs
     );
     const outBuf = await fs.promises.readFile(tmpOut);
-    await fs.promises.unlink(tmpOut).catch(() => {});
+    await _unlinkTempSilent(tmpOut);
     if (outBuf.length === 0 || outBuf.length > maxMediaBytes) {
       return null;
     }
@@ -845,12 +860,12 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
       md5HexStr,
       isTempFile: true,
     };
-  } catch (_) {
-    await fs.promises.unlink(tmpOut).catch(() => {});
+  } catch (_err) {
+    await _unlinkTempSilent(tmpOut);
     return null;
   } finally {
     if (decodedSilkWavTempPath) {
-      await fs.promises.unlink(decodedSilkWavTempPath).catch(() => {});
+      await _unlinkTempSilent(decodedSilkWavTempPath);
     }
   }
 }

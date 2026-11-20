@@ -61,7 +61,9 @@ function extractAccessTokenFromRequest(req, parsedUrl, { allowQueryToken = true 
     if (!urlObj && req && typeof req.url === "string") {
       try {
         urlObj = new URL(req.url || "/", "http://127.0.0.1");
-      } catch (_) {}
+      } catch (_err) {
+        // Ignore malformed request URL; treat as having no query access_token
+      }
     }
     const queryToken = urlObj?.searchParams?.get("access_token");
     if (typeof queryToken === "string" && queryToken.length > 0) {
@@ -217,11 +219,15 @@ function readHttpJsonBody(req, { maxBodyBytes = DEFAULT_MAX_HTTP_BODY_BYTES } = 
               if (!req.complete && typeof req.destroy === "function") {
                 req.destroy();
               }
-            } catch (_) {}
+            } catch (_err) {
+              // Ignore benign socket/stream destroy error after rejecting oversized body
+            }
           }, 1000);
           if (typeof destroyTimer.unref === "function") destroyTimer.unref();
         }
-      } catch (_) {}
+      } catch (_err) {
+        // Ignore benign stream pause/teardown errors while aborting oversized body
+      }
       reject(_createBodyTooLargeError(limit));
     };
 
