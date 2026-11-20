@@ -597,28 +597,54 @@ const ACTION_HANDLERS = {
         p.wait_ms !== undefined && p.wait_ms !== null && Number.isFinite(Number(p.wait_ms))
           ? Math.max(0, Math.min(Number(p.wait_ms), 10000))
           : 2000;
+      const rpcTimeoutMs = Math.max(1500, Math.min(waitMs > 0 ? waitMs + 1000 : 3000, 5000));
+      let qrEventArrived = false;
       const waitQrEvent =
         waitMs > 0 && this._qrCodeWaiters
-          ? waitForEventOnce(this._qrCodeWaiters, waitMs)
+          ? waitForEventOnce(this._qrCodeWaiters, waitMs).then((val) => {
+              if (val) qrEventArrived = true;
+              return val;
+            })
           : null;
       let directQr = "";
-      try {
-        const qrRes = await this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {}, []);
-        directQr = extractQrCodeBase64(qrRes);
-        if (directQr) {
-          this.lastQrCodeBase64 = directQr;
-        } else {
-          const shape =
-            qrRes && typeof qrRes === "object"
-              ? Object.keys(qrRes).slice(0, 16).join(",")
-              : typeof qrRes;
-          this.logger?.debug?.("login", `getQRCodePicture returned without direct QR (shape=${shape})`);
+      const invokePromise = Promise.resolve()
+        .then(() =>
+          this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {}, [], {
+            timeoutMs: rpcTimeoutMs,
+          })
+        )
+        .then((qrRes) => {
+          const extracted = extractQrCodeBase64(qrRes);
+          if (extracted) {
+            directQr = extracted;
+            this.lastQrCodeBase64 = extracted;
+          } else {
+            const shape =
+              qrRes && typeof qrRes === "object"
+                ? Object.keys(qrRes).slice(0, 16).join(",")
+                : typeof qrRes;
+            this.logger?.debug?.(
+              "login",
+              `getQRCodePicture returned without direct QR (shape=${shape})`
+            );
+          }
+        })
+        .catch((err) => {
+          this.logger?.debug?.("login", err);
+        });
+      if (waitQrEvent) {
+        await Promise.race([
+          invokePromise,
+          waitQrEvent.then((val) => {
+            if (!val) return invokePromise;
+            return val;
+          }),
+        ]);
+        if (!directQr && !qrEventArrived) {
+          await waitQrEvent;
         }
-      } catch (err) {
-        this.logger?.debug?.("login", err);
-      }
-      if (!directQr && waitQrEvent && (!this.lastQrCodeBase64 || Boolean(p.refresh))) {
-        await waitQrEvent;
+      } else {
+        await invokePromise;
       }
     }
     return {

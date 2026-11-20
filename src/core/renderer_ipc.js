@@ -1150,10 +1150,18 @@ const rendererIpcMixin = {
     } else if (this._canInvokeRenderer(this.activeWebContents)) {
       try {
         const argsSerialized = this._serializeBridgeArgs([payload, null]);
-        const res = await this._invokeRendererCommand("invokeNt", {
-          cmd,
-          argsSerialized,
-        });
+        const cmdTimeoutMs =
+          Number.isFinite(Number(invokeOptions?.timeoutMs)) && Number(invokeOptions.timeoutMs) > 0
+            ? Number(invokeOptions.timeoutMs)
+            : 15000;
+        const res = await this._invokeRendererCommand(
+          "invokeNt",
+          {
+            cmd,
+            argsSerialized,
+          },
+          cmdTimeoutMs
+        );
         this._recordInvokeTier(cmd, 1, errors);
         return res;
       } catch (e) {

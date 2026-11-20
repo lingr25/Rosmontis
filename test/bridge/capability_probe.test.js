@@ -537,4 +537,32 @@ test("get_login_qrcode waits for async onQRCodeGetPicture and Tier 1 void RPC do
   assert.strictEqual(qrResp.data.qrcode_base64, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==");
   assert.strictEqual(bridge.invokeStats.tier1, 2);
   assert.strictEqual(bridge.invokeStats.degraded, 0);
+
+  // QQ 3.2.34+ nests QR data inside qrcodeInfo (and get_login_qrcode must resolve fast even if RPC callback stalls)
+  bridge.lastQrCodeBase64 = "";
+  bridge._invokeRendererCommand = async () =>
+    new Promise((resolve) => {
+      setTimeout(() => {
+        bridge._handleKernelEvent("nodeIKernelLoginListener", "onQRCodeGetPicture", [
+          {
+            qrcodeInfo: {
+              pngBase64QrcodeData: "data:image/png;base64,QQ3235NESTEDQR==",
+              qrcodeUrl: "https://xui.ptlogin2.qq.com/test",
+            },
+          },
+        ]);
+      }, 15);
+      // Intentionally slow callback to confirm event-race returns early
+      const t = setTimeout(() => resolve(undefined), 3000);
+      if (typeof t.unref === "function") t.unref();
+    });
+  const t0 = Date.now();
+  const nestedQrResp = await bridge.handleOneBotAction("get_login_qrcode", {
+    refresh: true,
+    wait_ms: 1000,
+  });
+  const elapsedMs = Date.now() - t0;
+  assert.strictEqual(nestedQrResp.status, "ok");
+  assert.strictEqual(nestedQrResp.data.qrcode_base64, "data:image/png;base64,QQ3235NESTEDQR==");
+  assert.ok(elapsedMs < 1000, `Expected early return on onQRCodeGetPicture, got ${elapsedMs}ms`);
 });

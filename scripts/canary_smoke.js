@@ -55,7 +55,7 @@ function requestJson(method, reqPath, body = undefined) {
         path: reqPath,
         method,
         headers,
-        timeout: 10000,
+        timeout: 20000,
       },
       (res) => {
         const chunks = [];
@@ -127,7 +127,7 @@ function requestJson(method, reqPath, body = undefined) {
         'if [ -n "${LD_PRELOAD:-}" ]; then echo "LD_PRELOAD set in container env: ${LD_PRELOAD}" >&2; exit 1; fi',
         'qq_pid="$(pgrep -f "/opt/QQ/qq" | head -n 1 || true)"',
         'if [ -z "${qq_pid}" ]; then echo "QQ process (/opt/QQ/qq) not found" >&2; exit 1; fi',
-        'proc_preload="$(tr "\\0" "\\n" < "/proc/${qq_pid}/environ" 2>/dev/null | grep "^LD_PRELOAD=" || true)"',
+        'proc_preload=""; if [ -r "/proc/${qq_pid}/environ" ]; then proc_preload="$(tr "\\0" "\\n" < "/proc/${qq_pid}/environ" 2>/dev/null | grep "^LD_PRELOAD=" || true)"; fi',
         'if [ -n "${proc_preload#LD_PRELOAD=}" ]; then echo "LD_PRELOAD active on QQ PID ${qq_pid}: ${proc_preload}" >&2; exit 1; fi',
         "test -f /opt/QQ/resources/app/app_launcher/bridge_main.js",
         'grep -q "bridge_main.js" /opt/QQ/resources/app/app_launcher/index.js',
@@ -177,18 +177,22 @@ function requestJson(method, reqPath, body = undefined) {
   while (Date.now() < qrDeadline) {
     qrAttempts += 1;
     assertContainerRunning();
-    const qrRes = await requestJson("POST", "/get_login_qrcode", { refresh: true });
-    if (qrRes.status !== 200 || !qrRes.json || qrRes.json.retcode !== 0) {
-      lastQrSummary = `HTTP ${qrRes.status} retcode=${qrRes.json?.retcode} msg=${sanitize(qrRes.json?.message || qrRes.text)}`;
-    } else {
-      const qrB64 = String(qrRes.json.data?.qrcode_base64 || "");
-      const online = Boolean(qrRes.json.data?.online);
-      lastQrSummary = `retcode=0 online=${online} qrcode_base64_populated=${qrB64.length > 0} length=${qrB64.length}`;
-      if (qrB64.length > 0) {
-        console.log(`[canary] /get_login_qrcode succeeded on attempt #${qrAttempts}: ${lastQrSummary}`);
-        qrFetched = true;
-        break;
+    try {
+      const qrRes = await requestJson("POST", "/get_login_qrcode", { refresh: true });
+      if (qrRes.status !== 200 || !qrRes.json || qrRes.json.retcode !== 0) {
+        lastQrSummary = `HTTP ${qrRes.status} retcode=${qrRes.json?.retcode} msg=${sanitize(qrRes.json?.message || qrRes.text)}`;
+      } else {
+        const qrB64 = String(qrRes.json.data?.qrcode_base64 || "");
+        const online = Boolean(qrRes.json.data?.online);
+        lastQrSummary = `retcode=0 online=${online} qrcode_base64_populated=${qrB64.length > 0} length=${qrB64.length}`;
+        if (qrB64.length > 0) {
+          console.log(`[canary] /get_login_qrcode succeeded on attempt #${qrAttempts}: ${lastQrSummary}`);
+          qrFetched = true;
+          break;
+        }
       }
+    } catch (qrErr) {
+      lastQrSummary = `error=${sanitize(qrErr?.message || String(qrErr))}`;
     }
     console.log(`[canary] Waiting for login QR (attempt #${qrAttempts}: ${lastQrSummary})...`);
     await sleep(3000);
