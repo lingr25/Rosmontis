@@ -671,6 +671,48 @@ function loadBridgeConfig(customConfigDir) {
     defaultConfig.stateDir = resolvedStateDir;
   }
 
+  const envNtCacheDir = pickPrefixedEnv("NT_CACHE_DIR");
+  const rawNtCacheDir = String(
+    envNtCacheDir || loadedRaw.ntCacheDir || loadedRaw.nt_cache_dir || ""
+  ).trim();
+  if (rawNtCacheDir) {
+    defaultConfig.ntCacheDir = rawNtCacheDir;
+  }
+
+  _applyOptionalBoolOverride(
+    defaultConfig,
+    "cleanCachePrunesNtData",
+    loadedRaw,
+    "CLEAN_CACHE_PRUNES_NT_DATA"
+  );
+  _applyOptionalNumberOverride(defaultConfig, "ntCacheMaxAgeMs", loadedRaw, "NT_CACHE_MAX_AGE_MS");
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "ntCacheAutoPruneIntervalMs",
+    loadedRaw,
+    "NT_CACHE_AUTO_PRUNE_INTERVAL_MS"
+  );
+  _applyOptionalBoolOverride(defaultConfig, "recordAnomalies", loadedRaw, "RECORD_ANOMALIES");
+  _applyOptionalBoolOverride(defaultConfig, "persistAnomalies", loadedRaw, "PERSIST_ANOMALIES");
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "livenessCheckIntervalMs",
+    loadedRaw,
+    "LIVENESS_CHECK_INTERVAL_MS"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "livenessIdleThresholdMs",
+    loadedRaw,
+    "LIVENESS_IDLE_THRESHOLD_MS"
+  );
+  _applyOptionalNumberOverride(
+    defaultConfig,
+    "livenessMaxFailures",
+    loadedRaw,
+    "LIVENESS_MAX_FAILURES"
+  );
+
   _applyOptionalBoolOverride(defaultConfig, "persistStores", loadedRaw, "PERSIST_STORES");
   _applyOptionalNumberOverride(
     defaultConfig,

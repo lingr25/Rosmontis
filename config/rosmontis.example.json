@@ -24,6 +24,12 @@
   "rendererMaxReloadsPerMinute": 3,
   "rendererReloadBackoffMs": 1500,
   "preferMainProcessForBulkReads": false,
+  "cleanCachePrunesNtData": true,
+  "ntCacheMaxAgeMs": 604800000,
+  "ntCacheAutoPruneIntervalMs": 0,
+  "recordAnomalies": true,
+  "livenessCheckIntervalMs": 300000,
+  "livenessIdleThresholdMs": 600000,
   "rateLimit": {
     "enabled": false,
     "globalPerSec": 10,

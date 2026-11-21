@@ -54,6 +54,8 @@ const CORE_RELOAD_SEQUENCE = Object.freeze([
   "core/echo_correlator.js",
   "core/rate_limiter.js",
   "core/capability_probe.js",
+  "core/nt_cache_pruner.js",
+  "core/anomaly_recorder.js",
   "core/session_scheduler.js",
   "core/session_controller.js",
   "core/nt_capture.js",
@@ -77,6 +79,8 @@ const OPTIONAL_CORE_MODULES = new Set([
   "core/login_recovery.js",
   "core/rate_limiter.js",
   "core/capability_probe.js",
+  "core/nt_cache_pruner.js",
+  "core/anomaly_recorder.js",
 ]);
 
 /**
@@ -449,6 +453,7 @@ class HotReloadController {
       const freshRendererIpc = loadedByRel.get("core/renderer_ipc.js");
       const freshMediaHydrator = loadedByRel.get("core/media_hydrator.js");
       const freshLoginRecovery = loadedByRel.get("core/login_recovery.js");
+      const freshAnomalyRecorder = loadedByRel.get("core/anomaly_recorder.js");
       const freshInbound = loadedByRel.get("core/inbound_pipeline.js");
       const freshOutbound = loadedByRel.get("core/outbound_pipeline.js");
       const freshServerRuntime = loadedByRel.get("core/server_runtime.js");
@@ -527,6 +532,15 @@ class HotReloadController {
         Object.setPrototypeOf(
           bridge.inboundPipeline.loginRecovery,
           freshLoginRecovery.LoginRecovery.prototype
+        );
+      }
+      if (
+        bridge.inboundPipeline?.anomalyRecorder &&
+        typeof freshAnomalyRecorder?.AnomalyRecorder === "function"
+      ) {
+        Object.setPrototypeOf(
+          bridge.inboundPipeline.anomalyRecorder,
+          freshAnomalyRecorder.AnomalyRecorder.prototype
         );
       }
       if (bridge.outboundPipeline && typeof freshOutbound?.OutboundPipeline === "function") {

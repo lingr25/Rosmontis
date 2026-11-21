@@ -36,6 +36,7 @@ const {
 } = require("./transport_security");
 
 const { isQuietLogsEnabled } = require("./env");
+const { pruneNtCache } = require("./nt_cache_pruner");
 
 /** @typedef {import("../types").BridgeHost} BridgeHost */
 /** @typedef {import("../types").BridgeConfig} BridgeConfig */
@@ -242,6 +243,10 @@ class ServerRuntime {
     this._heartbeatTimer = null;
     /** @type {ReturnType<typeof setInterval> | null} */
     this._wsPingTimer = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._livenessTimer = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._ntCachePruneTimer = null;
     /** @type {boolean} */
     this._stopped = false;
     /** @type {AsyncLocalStorage<any> | null} */
@@ -402,12 +407,16 @@ class ServerRuntime {
     const online = Boolean(b.online);
     const ntReady = b.inboundPipeline ? Boolean(b.inboundPipeline._isNtReady()) : true;
     const rendererUnresponsive = Boolean(b.rendererHealthStats?.unresponsiveActive);
-    const ready = online && ntReady && !rendererUnresponsive;
+    const livenessState = b.inboundPipeline?._ensureLivenessState?.() || null;
+    const livenessOk = livenessState ? Boolean(livenessState.healthy) : true;
+    const ready = online && ntReady && !rendererUnresponsive && livenessOk;
     return {
       ready,
       online,
       nt_ready: ntReady,
       renderer_unresponsive: rendererUnresponsive,
+      ...(!livenessOk ? { liveness_ok: false } : {}),
+      ...(livenessState?.degradedReason ? { degraded_reason: livenessState.degradedReason } : {}),
       self_id: Number(b.selfUin || 0),
     };
   }
@@ -452,6 +461,11 @@ class ServerRuntime {
       aborted: 0,
     };
     const rendererCrashes = Number(b.rendererHealthStats?.crashes || 0);
+    const livenessState = b.inboundPipeline?._ensureLivenessState?.() || null;
+    const sessionRebinds = Number(livenessState?.sessionRebinds || 0);
+    const anomaliesTotal = Number(
+      b.inboundPipeline?._ensureAnomalyRecorder?.()?.totalRecorded || 0
+    );
     const msgStoreSize = Number(b.messageIdStore?.byShortId?.size ?? b.messageIdStore?.size ?? 0);
     const uinUidStoreSize = Number(b.uinUidStore?.uinToUid?.size ?? 0);
 
@@ -465,6 +479,15 @@ class ServerRuntime {
       "# HELP rosmontis_ready Whether the bridge is ready to serve requests.",
       "# TYPE rosmontis_ready gauge",
       `rosmontis_ready ${readiness.ready ? 1 : 0}`,
+      "# HELP rosmontis_liveness_ok Whether silent kernel liveness checks report healthy.",
+      "# TYPE rosmontis_liveness_ok gauge",
+      `rosmontis_liveness_ok ${readiness.liveness_ok === false ? 0 : 1}`,
+      "# HELP rosmontis_session_rebinds_total Total silent wrapperSession drift rebinds performed.",
+      "# TYPE rosmontis_session_rebinds_total counter",
+      `rosmontis_session_rebinds_total ${sessionRebinds}`,
+      "# HELP rosmontis_anomalies_total Total sanitized inbound payload anomalies recorded.",
+      "# TYPE rosmontis_anomalies_total counter",
+      `rosmontis_anomalies_total ${anomaliesTotal}`,
       "# HELP rosmontis_uptime_seconds Bridge uptime in seconds.",
       "# TYPE rosmontis_uptime_seconds gauge",
       `rosmontis_uptime_seconds ${uptimeSec}`,
@@ -1004,6 +1027,44 @@ class ServerRuntime {
       this._wsPingTimer.unref?.();
     }
 
+    // 6. Start Silent Kernel Liveness & Session-Drift Self-Heal Timer
+    const rawLivenessInterval = this.config?.livenessCheckIntervalMs ?? 300000;
+    const livenessIntervalMs = Number.isFinite(Number(rawLivenessInterval))
+      ? Math.floor(Number(rawLivenessInterval))
+      : 300000;
+    if (!this._livenessTimer && livenessIntervalMs > 0) {
+      this._livenessTimer = setInterval(() => {
+        if (typeof this.bridge.inboundPipeline?.checkLiveness === "function") {
+          this.bridge.inboundPipeline.checkLiveness().catch((/** @type {any} */ err) => {
+            this._debugSafe(err);
+          });
+        }
+      }, livenessIntervalMs);
+      this._livenessTimer.unref?.();
+    }
+
+    // 7. Start Optional Periodic NTQQ `nt_data` Cache Auto-Pruner
+    const rawCachePruneInterval = Number(this.config?.ntCacheAutoPruneIntervalMs ?? 0);
+    if (
+      !this._ntCachePruneTimer &&
+      Number.isFinite(rawCachePruneInterval) &&
+      rawCachePruneInterval > 0
+    ) {
+      const pruneIntervalMs = Math.max(60000, Math.floor(rawCachePruneInterval));
+      this._ntCachePruneTimer = setInterval(() => {
+        const allowSystemDiscovery = Boolean(process.versions?.electron);
+        if (!this.config?.ntCacheDir && !allowSystemDiscovery) return;
+        pruneNtCache({
+          ntCacheDir: this.config?.ntCacheDir,
+          allowSystemDiscovery,
+          maxAgeMs: this.config?.ntCacheMaxAgeMs,
+        }).catch((/** @type {any} */ err) => {
+          this._debugSafe(err);
+        });
+      }, pruneIntervalMs);
+      this._ntCachePruneTimer.unref?.();
+    }
+
     // 6. Install SIGHUP hot-reload handler (POSIX only)
     this._installSighupHandler();
   }
@@ -1481,6 +1542,14 @@ class ServerRuntime {
     if (this._wsPingTimer) {
       clearInterval(this._wsPingTimer);
       this._wsPingTimer = null;
+    }
+    if (this._livenessTimer) {
+      clearInterval(this._livenessTimer);
+      this._livenessTimer = null;
+    }
+    if (this._ntCachePruneTimer) {
+      clearInterval(this._ntCachePruneTimer);
+      this._ntCachePruneTimer = null;
     }
     for (const rev of this._reverseWsClients || []) {
       rev.stopped = true;

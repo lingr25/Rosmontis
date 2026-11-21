@@ -18,13 +18,13 @@
 - `src/plugin_loader.js` & `manifest.json`：跨平台纯 JS 外部插件框架（LiteLoaderQQNT v4 / QwQNT / 自定义主进程引导）轻量接入入口（仓库不内置任何原生 `.dll` / `.exe` 注入器）
 - `src/bridge_main.js`：Electron 主进程精简协调器，以纯组合方式装配 6 个核心运行时控制器类（`NtCaptureController`、`RendererIpcController`、`InboundPipeline`、`OutboundPipeline`、`ServerRuntime`、`HotReloadController`，无任何 `Object.assign` `*Mixin` 混入或私有 `_xxx` 状态透传门面），并整合通用基础组件与 OneBot v11 动作分发路由
 - `src/bridge_renderer.js`：注入 `BrowserWindow` 渲染层的受信任 IPC 桥接与客户端会话状态机（由 `wire_codec.js` 内联注入跨进程编解码实现，零 `require` 独立运行，并内置通道多路复用器防止热重载重复监听）
-- `src/types.js`、`jsconfig.json` & `scripts/typecheck.js`：零编译开销的 JSDoc 协议与内部运行时类型契约（含具象 `BridgeHost` / `BridgeActionHandler` 接口契约）及静态检查工具（全部 44 个 `src/**/*.js` 模块 100% 启用 `// @ts-check` 且开启 `strictNullChecks: true`，0 处 `@ts-ignore`，本地执行 `npm run typecheck`、CI 执行 `node scripts/typecheck.js --install`，均在隔离临时环境运行，仓库保持 0 运行时 npm 依赖）
+- `src/types.js`、`jsconfig.json` & `scripts/typecheck.js`：零编译开销的 JSDoc 协议与内部运行时类型契约（含具象 `BridgeHost` / `BridgeActionHandler` 接口契约）及静态检查工具（全部 46 个 `src/**/*.js` 模块 100% 启用 `// @ts-check` 且开启 `strictNullChecks: true`，0 处 `@ts-ignore`，本地执行 `npm run typecheck`、CI 执行 `node scripts/typecheck.js --install`，均在隔离临时环境运行，仓库保持 0 运行时 npm 依赖）
 - `src/bridge_onebot.js`：OneBot v11 协议与富媒体转换统一门面导出，底层拆分为 `src/onebot/`（4 个高内聚子模块）：
   - `stores.js`：纯存储域模块，提供有界 LRU 31-bit 消息 ID 映射（`MessageIdStore`）与 UIN/UID 双向索引缓存（`UinUidStore`），支持防抖原子快照持久化与重启恢复
   - `cq_codec.js`：CQ 码转义/反转义与 OneBot v11 消息段/字符串双向归一化编解码
   - `segment_converter.js`：NTQQ 内核 `elements` 与 OneBot v11 消息段双向转换、非阻塞 `file://` 富媒体 URL 构建、`buildNtMarketFaceUrl` / `stripTransientNtMedia` 富媒体规范化及短视频缩略图合成
   - `event_formatter.js`：NTQQ 消息、灰条通知（撤回/戳一戳/精华/专属头衔/运气王）、群名片变更、消息表情回应、群文件上传、好友/加群请求与元事件格式化器
-- `src/core/`：零依赖核心子模块（28 个）：
+- `src/core/`：零依赖核心子模块（30 个）：
   - `env.js`：`ROSMONTIS_*` / `ONEBOT_*` / `XIAO_BRIDGE_*` 多前缀环境变量统一解析器（仓库内唯一允许读取 `process.env` 的源码模块）
   - `wire_codec.js`：跨进程 `Map` / `Uint8Array` / `BigInt` / `void` 无损序列化与反序列化唯一真源（支持向渲染层脚本内联拼接独立源码 `injectWireCodecIntoRendererSource`）
   - `primitives.js`：有界 LRU `BoundedMap`、TTL 去重集（`TtlDedupeSet`）、临时文件清理环（`TempCleanupQueue`）、一次性事件等待器、限流与 JSON 结构化日志（`BridgeLogger`，支持 `ROSMONTIS_LOG_FORMAT=json`）、`wire_codec` 门面重导出与声明式动作路由器（`createActionRouter`）
@@ -40,6 +40,8 @@
   - `outbound_pipeline.js`：出站发送管线控制器（`OutboundPipeline`），负责两阶段发送（锁外图片/语音/短视频富媒体暂存 + 频控校验 + 会话激活、`sendMsg` 派发与回显关联）
   - `rate_limiter.js`：全局 + 单会话有界 LRU 令牌桶限流与连续拒绝熔断器（`OutboundRateLimiter`，拒绝返回 `retcode: 1429`）
   - `capability_probe.js`：只读运行时内核 RPC 能力与媒体工具探测器（驱动 `get_capabilities`、`get_status.bridge.capabilities` 与动态动作门控）
+  - `nt_cache_pruner.js`：NTQQ 原生 `nt_data` 瞬态媒体/日志缓存安全水位扫描与白名单超期清理器（驱动 `clean_cache`、`get_nt_cache_info` 与可选后台定时瘦身）
+  - `anomaly_recorder.js`：异常入站载荷与未知 `elementType` 全自动结构化脱敏黑匣子（环形缓存 + 可选 `stateDir/anomalies` 持久化，驱动 `get_bridge_anomalies`）
   - `server_runtime.js`：网络服务运行时控制器（`ServerRuntime`），负责内置 HTTP API（含 `/health`、`/ready` 就绪探针、Prometheus `/metrics`）、正向 WS 分离路径（`/` `/api` `/event`）、反向 WS 重连、HTTP POST Webhook（HMAC-SHA1 `X-Signature` + Quick Operation + 有界并发队列与指数退避重试）、`reload_config` / `SIGHUP` 热重载与心跳/事件广播
   - `ws_rfc6455.js`：RFC 6455 WebSocket 编解码、掩码校验、负载上限与反向 WS 客户端
   - `transport_security.js`：恒定时间鉴权、`Origin` 校验、非回环地址受保护模式（Protected Mode）自动鉴权与 HTTP 请求体上限
@@ -61,7 +63,7 @@
   - `media_profile_actions.js`：图片/语音/文件解析、OCR/语音转文字、个人资料状态与 Ark 卡片分享动作
   - `file_media_actions.js`：组合 `file_actions.js` 与 `media_profile_actions.js` 的向后兼容门面路由
 - `scripts/`、`docker/` & `.github/workflows/`：无头 Linux QQ 容器构建（官方 `.deb` 拉取、默认 `ROSMONTIS_STATE_DIR=/app/data/state`、可选 `INSTALL_VNC=0` 精简模式）、`Xvfb` 启动、桥接安装脚本、零依赖类型检查脚本（`scripts/typecheck.js`）、CI 测试/类型检查与每周官方 `.deb` 金丝雀冒烟工作流（`.github/workflows/canary.yml`）
-- `test/`：零依赖契约、安全与端到端模拟测试套件（含基于 `node --test` 并行运行的 25 个 `test/bridge/*.test.js` 领域文件——含 `composition_architecture.test.js`、`wire_codec_parity.test.js`、`rkey_invisit_media.test.js`、`silk_worker_ptt.test.js`、`stateful_hot_reload.test.js`、`ntqq_3232_corpus.test.js` 与 `session_queue_resilience.test.js`——加上 `test/test_core_modules.js` 与 `test/test_media_security.js`，共 87 项测试），直接运行 `npm test` 与 `npm run typecheck` 验证
+- `test/`：零依赖契约、安全与端到端模拟测试套件（含基于 `node --test` 并行运行的 26 个 `test/bridge/*.test.js` 领域文件——含 `composition_architecture.test.js`、`wire_codec_parity.test.js`、`rkey_invisit_media.test.js`、`silk_worker_ptt.test.js`、`stateful_hot_reload.test.js`、`ntqq_3232_corpus.test.js`、`session_queue_resilience.test.js` 与 `runtime_resilience_observability.test.js`——加上 `test/test_core_modules.js` 与 `test/test_media_security.js`，共 90 项测试），直接运行 `npm test` 与 `npm run typecheck` 验证
 
 ## 本地联调说明
 

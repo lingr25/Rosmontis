@@ -22,10 +22,14 @@ const { BoundedMap, setBoundedMap } = require("./primitives");
 const { pickPositiveUin } = require("./nt_normalizer");
 const { MediaHydrator, stripTransientMedia } = require("./media_hydrator");
 const { LoginRecovery } = require("./login_recovery");
+const { AnomalyRecorder } = require("./anomaly_recorder");
+
+const KNOWN_HANDLED_ELEMENT_TYPES = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16]);
 
 /** @typedef {import("../types").BridgeHost} BridgeHost */
 /** @typedef {import("../types").BridgeConfig} BridgeConfig */
 /** @typedef {import("../types").InvokeNtOptions} InvokeNtOptions */
+/** @typedef {import("../types").LivenessStats} LivenessStats */
 
 /**
  * @param {any} v
@@ -160,6 +164,150 @@ class InboundPipeline {
 
     this.mediaHydrator = new MediaHydrator(this);
     this.loginRecovery = new LoginRecovery(this);
+    this.anomalyRecorder = new AnomalyRecorder({
+      getConfig: () => this.config,
+      logger: this.logger,
+    });
+    /** @type {LivenessStats} */
+    this.livenessStats = {
+      healthy: true,
+      degradedReason: "",
+      lastKernelEventAt: Date.now(),
+      lastProbeAt: 0,
+      probeCount: 0,
+      consecutiveFailures: 0,
+      sessionRebinds: 0,
+    };
+  }
+
+  _ensureAnomalyRecorder() {
+    if (!this.anomalyRecorder || typeof this.anomalyRecorder.record !== "function") {
+      this.anomalyRecorder = new AnomalyRecorder({
+        getConfig: () => this.config,
+        logger: this.logger,
+      });
+    }
+    return this.anomalyRecorder;
+  }
+
+  /** @returns {LivenessStats} */
+  _ensureLivenessState() {
+    if (!this.livenessStats || typeof this.livenessStats !== "object") {
+      this.livenessStats = {
+        healthy: true,
+        degradedReason: "",
+        lastKernelEventAt: Date.now(),
+        lastProbeAt: 0,
+        probeCount: 0,
+        consecutiveFailures: 0,
+        sessionRebinds: 0,
+      };
+    }
+    return this.livenessStats;
+  }
+
+  /**
+   * Checks for silent `wrapperSession` drift on `ntStore` (self-healing detached emitters)
+   * and optionally performs a read-only kernel login probe after prolonged kernel silence.
+   *
+   * @param {{ forceProbe?: boolean, now?: number }} [options={}]
+   */
+  async checkLiveness(options = {}) {
+    const state = this._ensureLivenessState();
+    const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+    const cs = this.bridge.capturedServices;
+
+    // 1. Self-heal silent wrapperSession replacement on ntStore / ntSessionManager
+    const liveNtStore = cs?.ntStore || cs?.ntSessionManager?.ntStore || null;
+    const storeSession = liveNtStore?.wrapperSession || liveNtStore?.session || null;
+    if (storeSession && typeof storeSession === "object" && cs && storeSession !== cs.wrapperSession) {
+      cs.wrapperSession = storeSession;
+      try {
+        this.bridge.ntCapture?._inspectNtStore?.(liveNtStore);
+      } catch (rebindErr) {
+        this.logger?.debug?.("inbound.liveness", rebindErr);
+      }
+      state.sessionRebinds += 1;
+    }
+
+    if (!this.online) {
+      return {
+        ...state,
+        online: false,
+        skipped: "offline",
+      };
+    }
+
+    const rawIdleMs = Number(this.config?.livenessIdleThresholdMs);
+    const idleThresholdMs =
+      Number.isFinite(rawIdleMs) && rawIdleMs >= 0 ? Math.floor(rawIdleMs) : 600000;
+    const idleElapsedMs = Math.max(0, now - (state.lastKernelEventAt || 0));
+    if (!options.forceProbe && idleElapsedMs < idleThresholdMs) {
+      return {
+        ...state,
+        online: true,
+        skipped: "recent_activity",
+        idleElapsedMs,
+      };
+    }
+
+    // Skip active RPC probing in synthetic unit-test hosts with no real/mocked kernel transport
+    const hasKernelTransport =
+      typeof this.bridge.rendererExecute === "function" ||
+      Boolean(
+        this.bridge.rendererIpc &&
+          this.bridge.rendererIpc._canInvokeRenderer(this.bridge.activeWebContents)
+      ) ||
+      Boolean(cs?.ntApi) ||
+      Boolean(cs?.wrapperSession);
+    if (!hasKernelTransport || typeof this.bridge.invokeNt !== "function") {
+      return {
+        ...state,
+        online: true,
+        skipped: "no_transport",
+        idleElapsedMs,
+      };
+    }
+
+    state.lastProbeAt = now;
+    state.probeCount += 1;
+    const rawMaxFailures = Number(this.config?.livenessMaxFailures);
+    const maxFailures =
+      Number.isFinite(rawMaxFailures) && rawMaxFailures >= 1 ? Math.floor(rawMaxFailures) : 3;
+
+    try {
+      const loginRes = await this.bridge.invokeNt(
+        "nodeIKernelLoginService/getLoginList",
+        {},
+        [],
+        { timeoutMs: 5000 }
+      );
+      const list = Array.isArray(loginRes?.LocalLoginInfoList)
+        ? loginRes.LocalLoginInfoList
+        : null;
+      if (list && this.selfUin) {
+        const selfAcc = list.find(
+          (/** @type {any} */ item) => String(item?.uin || "") === String(this.selfUin)
+        );
+        if (selfAcc && selfAcc.isUserLogin === false) {
+          state.consecutiveFailures += 1;
+          state.healthy = false;
+          state.degradedReason = "self_account_logged_out";
+          return { ...state, online: this.online, probed: true, idleElapsedMs };
+        }
+      }
+      state.consecutiveFailures = 0;
+      state.healthy = true;
+      state.degradedReason = "";
+      return { ...state, online: this.online, probed: true, idleElapsedMs };
+    } catch (/** @type {any} */ probeErr) {
+      state.consecutiveFailures += 1;
+      if (state.consecutiveFailures >= maxFailures) {
+        state.healthy = false;
+        state.degradedReason = String(probeErr?.message || probeErr).slice(0, 160);
+      }
+      return { ...state, online: this.online, probed: true, idleElapsedMs };
+    }
   }
 
   /** @returns {BridgeConfig | undefined} */
@@ -277,6 +425,13 @@ class InboundPipeline {
 
   /** @param {Record<string, any>} [identity] */
   _updateSelfIdentity(identity = {}) {
+    if (identity.markOnline) {
+      const liveness = this._ensureLivenessState();
+      liveness.healthy = true;
+      liveness.degradedReason = "";
+      liveness.consecutiveFailures = 0;
+      liveness.lastKernelEventAt = Date.now();
+    }
     if (this.bridge.ntCapture) {
       this.bridge.ntCapture._updateSelfIdentity(identity);
       return;
@@ -667,6 +822,12 @@ class InboundPipeline {
 
     chainEntry = taskPromise
       .catch((err) => {
+        this._ensureAnomalyRecorder().record({
+          kind: "inbound_message_error",
+          eventName: "onRecvMsg",
+          error: err,
+          payload: ntMsg,
+        });
         this.logger?.debug?.("inbound", err);
       })
       .finally(() => {
@@ -1283,6 +1444,17 @@ class InboundPipeline {
    * @param {any[]} args
    */
   async _handleKernelEvent(_listenerName, eventName, args) {
+    const liveness = this._ensureLivenessState();
+    liveness.lastKernelEventAt = Date.now();
+    if (
+      this.online &&
+      !liveness.healthy &&
+      liveness.degradedReason !== "self_account_logged_out"
+    ) {
+      liveness.consecutiveFailures = 0;
+      liveness.healthy = true;
+      liveness.degradedReason = "";
+    }
     const firstArg = args && args.length > 0 ? args[0] : undefined;
 
     // 1. Incoming messages: onRecvMsg / onRecvActiveMsg
@@ -1399,6 +1571,27 @@ class InboundPipeline {
         this.messageIdStore?.indexMsgMedia?.(ntMsg, ev.message_id);
       }
       if (ev) {
+        if (
+          Array.isArray(ev.message) &&
+          ev.message.length === 0 &&
+          Number(ntMsg.msgType) !== 5 &&
+          Array.isArray(ntMsg.elements)
+        ) {
+          const unknownEl = ntMsg.elements.find(
+            (/** @type {any} */ el) =>
+              el &&
+              typeof el === "object" &&
+              !KNOWN_HANDLED_ELEMENT_TYPES.has(Number(el.elementType || 0))
+          );
+          if (unknownEl) {
+            this._ensureAnomalyRecorder().record({
+              kind: "unhandled_element_type",
+              eventName: "onRecvMsg",
+              error: `Unhandled elementType=${unknownEl.elementType}`,
+              payload: ntMsg,
+            });
+          }
+        }
         this._dispatchInboundEvent(ev);
       }
 

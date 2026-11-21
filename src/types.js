@@ -147,6 +147,15 @@
  * @property {boolean} [enforceSwitchCooldownOnSend]
  * @property {number} [outboundQueueTimeoutMs]
  * @property {number} [outboundMaxQueueSize]
+ * @property {string} [ntCacheDir]
+ * @property {boolean} [cleanCachePrunesNtData]
+ * @property {number} [ntCacheMaxAgeMs]
+ * @property {number} [ntCacheAutoPruneIntervalMs]
+ * @property {boolean} [recordAnomalies]
+ * @property {boolean} [persistAnomalies]
+ * @property {number} [livenessCheckIntervalMs]
+ * @property {number} [livenessIdleThresholdMs]
+ * @property {number} [livenessMaxFailures]
  * @property {DelaySpec} [humanReadToTypingDelayMs]
  * @property {boolean} [cleanupTempImmediately]
  * @property {number} [maxTempCleanupRing]
@@ -252,6 +261,18 @@
  * @property {number} overflowRejected
  * @property {number} aborted
  * @property {number} evictedAdvisory
+ */
+
+/**
+ * Silent kernel liveness & wrapperSession drift self-healing telemetry.
+ * @typedef {object} LivenessStats
+ * @property {boolean} healthy
+ * @property {string} degradedReason
+ * @property {number} lastKernelEventAt
+ * @property {number} lastProbeAt
+ * @property {number} probeCount
+ * @property {number} consecutiveFailures
+ * @property {number} sessionRebinds
  */
 
 /**

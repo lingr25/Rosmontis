@@ -15,6 +15,7 @@ const { resolveCompatVersionInfo } = require("../core/config");
 const { createActionRouter, createEventWaiter } = require("../core/primitives");
 const { probeRuntimeCapabilities } = require("../core/capability_probe");
 const { extractQrCodeBase64 } = require("../core/login_recovery");
+const { inspectNtCacheUsage, pruneNtCache } = require("../core/nt_cache_pruner");
 
 const MAX_FORWARD_DEPTH = 3;
 const MAX_OVERFLOW_SUMMARY_LINES = 20;
@@ -604,6 +605,14 @@ const ACTION_HANDLERS = {
           typeof this.sessionController?.scheduler?.getStats === "function"
             ? this.sessionController.scheduler.getStats()
             : null,
+        liveness:
+          typeof this.inboundPipeline?._ensureLivenessState === "function"
+            ? { ...this.inboundPipeline._ensureLivenessState() }
+            : null,
+        anomalies:
+          typeof this.inboundPipeline?._ensureAnomalyRecorder === "function"
+            ? this.inboundPipeline._ensureAnomalyRecorder().getSummary({ includePayloads: false })
+            : null,
       },
     };
   },
@@ -751,9 +760,68 @@ const ACTION_HANDLERS = {
     throw err;
   },
 
-  clean_cache() {
+  async clean_cache(p) {
     this.flushTempCleanup();
-    return {};
+    const explicitPrune = p?.prune_nt_cache;
+    const allowSystemDiscovery = Boolean(process.versions?.electron) || explicitPrune === true;
+    const shouldPruneNtData =
+      explicitPrune === true ||
+      (explicitPrune !== false &&
+        this.config?.cleanCachePrunesNtData !== false &&
+        (Boolean(this.config?.ntCacheDir) || allowSystemDiscovery));
+    if (!shouldPruneNtData) {
+      return { temp_flushed: true, nt_cache_pruned: null };
+    }
+    const maxAgeMs =
+      p?.max_age_hours !== undefined && Number.isFinite(Number(p.max_age_hours))
+        ? Math.max(0, Math.floor(Number(p.max_age_hours) * 3600 * 1000))
+        : p?.max_age_ms !== undefined && Number.isFinite(Number(p.max_age_ms))
+        ? Math.max(0, Math.floor(Number(p.max_age_ms)))
+        : this.config?.ntCacheMaxAgeMs;
+    const report = await pruneNtCache({
+      ntCacheDir: p?.nt_cache_dir ? String(p.nt_cache_dir) : this.config?.ntCacheDir,
+      allowSystemDiscovery,
+      maxAgeMs,
+    });
+    return {
+      temp_flushed: true,
+      nt_cache_pruned: report,
+    };
+  },
+
+  async get_nt_cache_info(p) {
+    const allowSystemDiscovery = Boolean(process.versions?.electron) || p?.discover_system === true;
+    return await inspectNtCacheUsage({
+      ntCacheDir: p?.nt_cache_dir ? String(p.nt_cache_dir) : this.config?.ntCacheDir,
+      allowSystemDiscovery,
+    });
+  },
+
+  get_bridge_anomalies(p) {
+    const rec = this.inboundPipeline?._ensureAnomalyRecorder?.();
+    if (!rec) {
+      return {
+        enabled: false,
+        totalRecorded: 0,
+        persistedCount: 0,
+        deduplicatedCount: 0,
+        bufferSize: 0,
+        recent: [],
+      };
+    }
+    if (p?.clear === true) {
+      rec.clear();
+    }
+    return rec.getSummary({ includePayloads: p?.include_payloads !== false });
+  },
+
+  async check_liveness(p) {
+    if (typeof this.inboundPipeline?.checkLiveness === "function") {
+      return await this.inboundPipeline.checkLiveness({
+        forceProbe: p?.force !== false,
+      });
+    }
+    return { healthy: Boolean(this.online), online: Boolean(this.online) };
   },
 
   // ---- 2. Messaging ----
