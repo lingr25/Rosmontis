@@ -1130,10 +1130,23 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
           waveAmplitudes,
           playState: 0,
           autoConvertText: 0,
+          waveform: "",
+          translateStatus: 0,
+          transferStatus: 0,
+          progress: 0,
+          invalidState: 0,
+          pttFlag: 0,
+          fileSubId: "",
+          fileBizId: null,
+          import_rich_media_context: "",
           storeID: 0,
+          storeId: "0",
           otherBusinessInfo: {
             aiVoiceType: 0,
+            aiVoiceInfo: 0,
           },
+          isAIVoiceType: 0,
+          isInApplicationPath: null,
         },
       });
       continue;

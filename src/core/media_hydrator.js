@@ -1018,8 +1018,8 @@ class MediaHydrator {
             localPath = rkeyDl.localPath;
             st = rkeyStat;
             if (stats) stats.downloaded += 1;
-            if (rkeyDl.isTempFile && !this.host.config?.cleanupTempImmediately) {
-              this.host.bridge?.tempCleanupQueue?.scheduleMedia?.(rkeyDl);
+            if (rkeyDl.isTempFile && typeof this.host.bridge?.tempFileCleaner?.track === "function") {
+              this.host.bridge.tempFileCleaner.track(rkeyDl.localPath);
             }
           }
         }

@@ -7,3 +7,5 @@ config/rosmontis_*.json
 config/onebot.json
 config/onebot_*.json
 !config/*.example.json
+GEMINI.md
+*.local.md

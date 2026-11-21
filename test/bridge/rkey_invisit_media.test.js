@@ -385,3 +385,197 @@ test("get_forward_msg + get_image probes inVisit, fast-fails on -6101, and falls
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("get_private_file_url & get_file retain downloaded dl_* files across TempCleanupQueue flush, forward fileModelId, and stage internal cache files to shared tempDir", async () => {
+  const sharedTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rosmontis-shared-tmp-"));
+  const internalCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "rosmontis-qq-cache-"));
+  try {
+    /** @type {any[]} */
+    const downloadReqs = [];
+    const internalCachedTxt = path.join(internalCacheDir, "nt_data_File_note.txt");
+
+    const bridge = new mainMod.NtqqOneBotBridge({
+      config: {
+        selfUin: "100010001",
+        httpServers: [],
+        wsServers: [],
+        wsClients: [],
+        heartbeatIntervalMs: 0,
+        humanSimulation: false,
+        quietLogs: true,
+        tempDir: sharedTempDir,
+        cleanupTempImmediately: false,
+        tempCleanupDelayMs: 10,
+        richMediaDownloadTimeoutMs: 400,
+      },
+    });
+    bridge.online = true;
+
+    const peer = { chatType: 1, peerUid: "u_friend_file_1", guildId: "" };
+    // Msg 1: undownloaded C2C file -> downloadRichMedia writes directly to targetPath (dl_*)
+    bridge.messageIdStore.register("880001", peer, "21", {
+      senderUid: peer.peerUid,
+      rawMsg: {
+        msgId: "880001",
+        chatType: 1,
+        peerUid: peer.peerUid,
+        elements: [
+          {
+            elementType: 3,
+            elementId: "880001_el",
+            fileElement: {
+              fileName: "chatgpt.txt",
+              fileUuid: "uuid_priv_txt_1",
+              fileMd5: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              fileSize: "16",
+              filePath: "",
+              fileModelId: "9911223344",
+              subElementType: 0,
+            },
+          },
+        ],
+      },
+    });
+
+    // Msg 2: kernel ignores targetPath and writes into container-private nt_data/File, visible via getMsgsByMsgId
+    bridge.messageIdStore.register("880002", peer, "22", {
+      senderUid: peer.peerUid,
+      rawMsg: {
+        msgId: "880002",
+        chatType: 1,
+        peerUid: peer.peerUid,
+        elements: [
+          {
+            elementType: 3,
+            elementId: "880002_el",
+            fileElement: {
+              fileName: "note.txt",
+              fileUuid: "uuid_priv_txt_2",
+              fileMd5: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              fileSize: "12",
+              filePath: "",
+              fileModelId: "9911223355",
+            },
+          },
+        ],
+      },
+    });
+
+    // Msg 3: download fails completely -> must return { url: "" } instead of nonexistent dl_* path
+    bridge.messageIdStore.register("880003", peer, "23", {
+      senderUid: peer.peerUid,
+      rawMsg: {
+        msgId: "880003",
+        chatType: 1,
+        peerUid: peer.peerUid,
+        elements: [
+          {
+            elementType: 3,
+            elementId: "880003_el",
+            fileElement: {
+              fileName: "missing.txt",
+              fileUuid: "uuid_priv_txt_3",
+              fileMd5: "cccccccccccccccccccccccccccccccc",
+              fileSize: "99",
+              filePath: "",
+            },
+          },
+        ],
+      },
+    });
+
+    bridge.rendererExecute = async (/** @type {string} */ cmd, /** @type {any[]} */ args) => {
+      const p = args?.[0] || {};
+      if (cmd === "nodeIKernelMsgService/downloadRichMedia") {
+        const req = p.getReq || {};
+        downloadReqs.push(req);
+        if (req.msgId === "880001" && req.filePath) {
+          fs.writeFileSync(req.filePath, "hello from chatgpt", "utf8");
+          return { result: 0, filePath: req.filePath };
+        }
+        if (req.msgId === "880002") {
+          fs.writeFileSync(internalCachedTxt, "cached note!", "utf8");
+          setImmediate(() => {
+            bridge.inboundPipeline._handleKernelEvent(
+              "nodeIKernelMsgListener",
+              "onRichMediaDownloadComplete",
+              [{ msgId: "880002", msgElementId: "880002_el", filePath: "" }]
+            );
+          });
+          return undefined;
+        }
+        if (req.msgId === "880003") {
+          setImmediate(() => {
+            bridge.inboundPipeline._handleKernelEvent(
+              "nodeIKernelMsgListener",
+              "onRichMediaDownloadComplete",
+              [{ msgId: "880003", msgElementId: "880003_el", fileErrCode: 2006021, trasferStatus: 5 }]
+            );
+          });
+          return undefined;
+        }
+      }
+      if (cmd === "nodeIKernelMsgService/getMsgsByMsgId") {
+        if (Array.isArray(p.msgIds) && p.msgIds[0] === "880002") {
+          return {
+            msgList: [
+              {
+                msgId: "880002",
+                elements: [
+                  {
+                    elementType: 3,
+                    elementId: "880002_el",
+                    fileElement: {
+                      fileName: "note.txt",
+                      fileUuid: "uuid_priv_txt_2",
+                      filePath: internalCachedTxt,
+                    },
+                  },
+                ],
+              },
+            ],
+          };
+        }
+        return { msgList: [] };
+      }
+      return { result: 0 };
+    };
+
+    // Case 1: fileModelId forwarded & dl_* file MUST survive TempCleanupQueue flush + timer
+    const res1 = await bridge._dispatchAction("get_private_file_url", {
+      file_id: "uuid_priv_txt_1",
+    });
+    assert.ok(res1.url.startsWith("file://"));
+    assert.strictEqual(downloadReqs[0].fileModelId, "9911223344");
+    const localPath1 = new URL(res1.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+    assert.strictEqual(fs.existsSync(localPath1), true);
+    bridge.flushTempCleanup();
+    await new Promise((r) => setTimeout(r, 30));
+    assert.strictEqual(
+      fs.existsSync(localPath1),
+      true,
+      "Action-returned dl_* file must NOT be prematurely unlinked by 5s TempCleanupQueue"
+    );
+
+    // Case 2: internal QQ cache file discovered via getMsgsByMsgId and staged into sharedTempDir
+    const res2 = await bridge._dispatchAction("get_private_file_url", {
+      file_id: "uuid_priv_txt_2",
+    });
+    assert.ok(res2.url.startsWith("file://"));
+    const localPath2 = path.resolve(new URL(res2.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+    assert.ok(
+      localPath2.startsWith(path.resolve(sharedTempDir) + path.sep),
+      `Expected staged path inside sharedTempDir, got ${localPath2}`
+    );
+    assert.strictEqual(fs.readFileSync(localPath2, "utf8"), "cached note!");
+
+    // Case 3: failed download returns empty url cleanly, never a nonexistent dl_* path
+    const res3 = await bridge._dispatchAction("get_private_file_url", {
+      file_id: "uuid_priv_txt_3",
+    });
+    assert.strictEqual(res3.url, "");
+  } finally {
+    fs.rmSync(sharedTempDir, { recursive: true, force: true });
+    fs.rmSync(internalCacheDir, { recursive: true, force: true });
+  }
+});

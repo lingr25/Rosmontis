@@ -506,6 +506,8 @@ class MessageIdStore {
       let fileName = "";
       let sourcePath = "";
       let url = "";
+      let fileModelId = "0";
+      let subElementType = 0;
 
       if (elementType === 2 && el.picElement) {
         const pe = el.picElement;
@@ -519,8 +521,10 @@ class MessageIdStore {
         md5 = fe.fileMd5 || "";
         fileUuid = fe.fileUuid || "";
         fileName = fe.fileName || "";
-        sourcePath = fe.filePath || "";
+        sourcePath = fe.filePath || fe.sourcePath || "";
         url = "";
+        fileModelId = String(fe.fileModelId || "0");
+        subElementType = Number(fe.subElementType || 0);
       } else if (elementType === 4 && el.pttElement) {
         const ptt = el.pttElement;
         md5 = ptt.md5HexStr || "";
@@ -641,6 +645,7 @@ class MessageIdStore {
         fileName: String(fileName || ""),
         sourcePath: String(sourcePath || ""),
         url: String(url || ""),
+        ...(elementType === 3 ? { fileModelId, subElementType } : {}),
         ...(inVisit
           ? {
               inVisit: true,

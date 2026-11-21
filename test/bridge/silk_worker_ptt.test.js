@@ -75,8 +75,23 @@ test("oneBotSegmentsToNtElements populates NTQQ 3.2.32 pttElement.otherBusinessI
     assert.strictEqual(ptt.canConvert2Text, true);
     assert.strictEqual(ptt.playState, 0);
     assert.strictEqual(ptt.autoConvertText, 0);
+    assert.strictEqual(ptt.waveform, "");
+    assert.strictEqual(ptt.translateStatus, 0);
+    assert.strictEqual(ptt.transferStatus, 0);
+    assert.strictEqual(ptt.progress, 0);
+    assert.strictEqual(ptt.invalidState, 0);
+    assert.strictEqual(ptt.pttFlag, 0);
+    assert.strictEqual(ptt.fileSubId, "");
+    assert.strictEqual(ptt.fileBizId, null);
+    assert.strictEqual(ptt.import_rich_media_context, "");
     assert.strictEqual(ptt.storeID, 0);
-    assert.deepStrictEqual(ptt.otherBusinessInfo, { aiVoiceType: 0 });
+    assert.strictEqual(ptt.storeId, "0");
+    assert.deepStrictEqual(ptt.otherBusinessInfo, { aiVoiceType: 0, aiVoiceInfo: 0 });
+    assert.strictEqual(ptt.isAIVoiceType, 0);
+    assert.strictEqual(ptt.isInApplicationPath, null);
+    for (const [k, v] of Object.entries(ptt)) {
+      assert.notStrictEqual(v, undefined, `pttElement.${k} must never be undefined`);
+    }
     assert.strictEqual(ptt.duration, 3);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

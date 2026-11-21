@@ -51,6 +51,14 @@ async function statNonEmptyFile(candidatePath) {
 }
 
 /**
+ * Tracks temporary files returned by OneBot file/media lookup actions (`get_private_file_url`,
+ * `get_group_file_url`, `get_file`, `get_image`, `get_record`).
+ *
+ * Unlike outbound `sendMsg` staging files (which can be unlinked 5s after IPC completion),
+ * action-returned `file://` URLs are consumed asynchronously by downstream OneBot clients
+ * and LLM agent pipelines, so they must NOT be scheduled on the 5-second `TempCleanupQueue`.
+ * Instead, disk usage in `tempDir` is strictly bounded via LRU count pruning (`maxTempFiles`).
+ *
  * @param {import("../types").BridgeHost} bridge
  * @param {any} media
  */
@@ -58,12 +66,13 @@ function trackActionTempMedia(bridge, media) {
   if (!media || !media.isTempFile || !media.localPath) return;
   if (typeof bridge.tempFileCleaner?.track === "function") {
     bridge.tempFileCleaner.track(media.localPath);
-  } else if (
-    !bridge.config?.cleanupTempImmediately &&
-    typeof bridge.tempCleanupQueue?.scheduleMedia === "function"
-  ) {
-    bridge.tempCleanupQueue.scheduleMedia(media);
+    return;
   }
+  const tempDir = resolveTempDirFromEnv(bridge?.config?.tempDir);
+  const maxTempFiles = Math.max(16, Number(bridge?.config?.maxTempFiles) || 128);
+  pruneTempDirAsync(tempDir, maxTempFiles).catch((err) => {
+    bridge?.logger?.debug?.("file_actions.pruneTempDir", err);
+  });
 }
 
 function elementToMediaDesc(el, ntMsgId, chatType, peerUid) {
@@ -110,6 +119,8 @@ function elementToMediaDesc(el, ntMsgId, chatType, peerUid) {
       sourcePath: String(fe.filePath || fe.sourcePath || ""),
       url: "",
       fileSize: Number(fe.fileSize || 0),
+      fileModelId: String(fe.fileModelId || "0"),
+      subElementType: Number(fe.subElementType || 0),
     };
   }
   if (t === 4 && el.pttElement) {
@@ -310,6 +321,102 @@ async function allocateTempDownloadPath(bridge, preferredName = "file") {
     `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safeName}`
   );
   return { tempDir, filePath };
+}
+
+/**
+ * When `config.tempDir` (`ROSMONTIS_TEMP_DIR`) is explicitly configured (e.g., as a
+ * cross-container shared volume between Rosmontis and AstrBot/NoneBot), copies files
+ * located outside `tempDir` (such as container-private `~/.config/QQ/.../nt_data/File/`)
+ * into `tempDir` atomically so downstream containers can read the returned `file://` URL.
+ *
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string} localPath
+ * @param {string} [preferredName="file"]
+ * @returns {Promise<string>}
+ */
+async function stageToSharedTempDirIfConfigured(bridge, localPath, preferredName = "file") {
+  if (!localPath) return "";
+  const explicitTempDir =
+    typeof bridge?.config?.tempDir === "string" ? bridge.config.tempDir.trim() : "";
+  if (!explicitTempDir) return localPath;
+  const resolvedTempRoot = path.resolve(explicitTempDir);
+  const resolvedSrc = path.resolve(localPath);
+  if (resolvedSrc === resolvedTempRoot || resolvedSrc.startsWith(resolvedTempRoot + path.sep)) {
+    return localPath;
+  }
+  try {
+    const { filePath: destPath } = await allocateTempDownloadPath(
+      bridge,
+      preferredName || path.basename(localPath) || "file"
+    );
+    const partPath = `${destPath}.part`;
+    await fs.promises.copyFile(resolvedSrc, partPath);
+    await fs.promises.rename(partPath, destPath);
+    trackActionTempMedia(bridge, { isTempFile: true, localPath: destPath });
+    return destPath;
+  } catch (err) {
+    bridge?.logger?.debug?.("file_actions.stageToSharedTempDir", err);
+    return localPath;
+  }
+}
+
+/**
+ * Re-queries `getMsgsByMsgId` to inspect whether NTQQ populated `fileElement.filePath`
+ * inside its internal `nt_data/File` cache after `downloadRichMedia`.
+ *
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string} ntMsgId
+ * @param {number} chatType
+ * @param {string} peerUid
+ * @param {string} elementId
+ * @param {string} [fileUuid=""]
+ * @param {string} [md5=""]
+ * @returns {Promise<string>}
+ */
+async function probeRefreshedMsgFilePath(
+  bridge,
+  ntMsgId,
+  chatType,
+  peerUid,
+  elementId,
+  fileUuid = "",
+  md5 = ""
+) {
+  if (
+    !ntMsgId ||
+    /^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) ||
+    !peerUid ||
+    typeof bridge?.invokeNt !== "function"
+  ) {
+    return "";
+  }
+  try {
+    const peer = { chatType: Number(chatType || 1), peerUid: String(peerUid), guildId: "" };
+    const res = await bridge.invokeNt(
+      "nodeIKernelMsgService/getMsgsByMsgId",
+      { peer, msgIds: [String(ntMsgId)] },
+      [peer, [String(ntMsgId)]]
+    );
+    const refreshedMsg = res?.msgList?.[0];
+    if (!refreshedMsg || !Array.isArray(refreshedMsg.elements)) return "";
+    const md5Lower = String(md5 || "").toLowerCase();
+    for (const el of refreshedMsg.elements) {
+      const fe = el?.fileElement;
+      if (!fe) continue;
+      const matches =
+        (elementId && String(el.elementId || "") === String(elementId)) ||
+        (fileUuid && String(fe.fileUuid || "") === String(fileUuid)) ||
+        (md5Lower && String(fe.fileMd5 || "").toLowerCase() === md5Lower);
+      if (!matches) continue;
+      const candidate = String(fe.filePath || fe.sourcePath || "").trim();
+      if (candidate && (await statNonEmptyFile(candidate))) {
+        return candidate;
+      }
+    }
+  } catch (err) {
+    bridge?.logger?.debug?.("file_actions.probeRefreshedMsgFilePath", err);
+  }
+  return "";
 }
 
 /**
@@ -746,7 +853,12 @@ const ACTION_HANDLERS = {
     if (mediaDesc?.sourcePath) {
       const existing = await statNonEmptyFile(String(mediaDesc.sourcePath));
       if (existing) {
-        return { url: pathToFileURL(String(mediaDesc.sourcePath)).href };
+        const exposed = await stageToSharedTempDirIfConfigured(
+          this,
+          String(mediaDesc.sourcePath),
+          mediaDesc.fileName || fileId
+        );
+        return { url: pathToFileURL(exposed).href };
       }
     }
     if (
@@ -780,11 +892,15 @@ const ACTION_HANDLERS = {
         const candidate = String(dlPath || targetPath || "");
         const st = await statNonEmptyFile(candidate);
         if (st) {
-          if (path.resolve(candidate).startsWith(path.resolve(tempDir))) {
-            trackActionTempMedia(this, { isTempFile: true, localPath: candidate });
-            await pruneTempDirAsync(tempDir, 128);
+          const exposed = await stageToSharedTempDirIfConfigured(
+            this,
+            candidate,
+            mediaDesc.fileName || fileId
+          );
+          if (path.resolve(exposed).startsWith(path.resolve(tempDir))) {
+            trackActionTempMedia(this, { isTempFile: true, localPath: exposed });
           }
-          return { url: pathToFileURL(candidate).href };
+          return { url: pathToFileURL(exposed).href };
         }
       } catch (err) {
         this.logger?.debug?.("file_actions", err);
@@ -862,14 +978,21 @@ const ACTION_HANDLERS = {
 
     if (!mediaDesc) return { url: "" };
 
+    const preferredName = String(mediaDesc.fileName || fileId || "private_file");
     if (mediaDesc.sourcePath) {
       const existing = await statNonEmptyFile(String(mediaDesc.sourcePath));
       if (existing) {
-        return { url: pathToFileURL(String(mediaDesc.sourcePath)).href };
+        const exposed = await stageToSharedTempDirIfConfigured(
+          this,
+          String(mediaDesc.sourcePath),
+          preferredName
+        );
+        return { url: pathToFileURL(exposed).href };
       }
     }
 
     const ntMsgId = String(mediaDesc.ntMsgId || "");
+    const chatType = Number(mediaDesc.chatType || 1);
     const peerUid = String(mediaDesc.peerUid || "");
     const elementId = String(mediaDesc.elementId || "");
     if (!ntMsgId || /^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) || !peerUid || !elementId) {
@@ -878,25 +1001,27 @@ const ACTION_HANDLERS = {
 
     const { tempDir, filePath: fallbackSavePath } = await allocateTempDownloadPath(
       this,
-      mediaDesc.fileName || fileId || "private_file"
+      preferredName
     );
     const targetPath = mediaDesc.sourcePath ? String(mediaDesc.sourcePath) : fallbackSavePath;
     const timeoutMs = Number(this.config?.richMediaDownloadTimeoutMs) || 8000;
+    const modelId = String(p.model_id || mediaDesc.fileModelId || "0");
 
     let candidatePath = "";
     if (typeof this.inboundPipeline?._downloadRichMediaElement === "function") {
       try {
         candidatePath = await this.inboundPipeline._downloadRichMediaElement({
           msgId: ntMsgId,
-          chatType: Number(mediaDesc.chatType || 1),
+          chatType,
           peerUid,
           elementId,
           downloadType: 1,
           downSourceType: 0,
           downloadScene: 0,
-          fileModelId: String(mediaDesc.fileModelId || "0"),
+          fileModelId: modelId,
           thumbSize: 0,
           filePath: targetPath,
+          md5: mediaDesc.md5 || fileHash || "",
           timeoutMs,
         });
       } catch (err) {
@@ -908,10 +1033,10 @@ const ACTION_HANDLERS = {
           downSourceType: 0,
           downloadSourceType: 0,
           downloadScene: 0,
-          fileModelId: String(mediaDesc.fileModelId || "0"),
+          fileModelId: modelId,
           triggerType: 1,
           msgId: ntMsgId,
-          chatType: Number(mediaDesc.chatType || 1),
+          chatType,
           peerUid,
           elementId,
           thumbSize: 0,
@@ -929,14 +1054,54 @@ const ACTION_HANDLERS = {
       }
     }
 
-    const resolved = String(candidatePath || targetPath || "");
-    const st = await statNonEmptyFile(resolved);
-    if (st) {
-      if (path.resolve(resolved).startsWith(path.resolve(tempDir))) {
-        trackActionTempMedia(this, { isTempFile: true, localPath: resolved });
-        await pruneTempDirAsync(tempDir, 128);
+    let resolved = String(candidatePath || targetPath || "");
+    let st = await statNonEmptyFile(resolved);
+    if (!st) {
+      const refreshed = await probeRefreshedMsgFilePath(
+        this,
+        ntMsgId,
+        chatType,
+        peerUid,
+        elementId,
+        mediaDesc.fileUuid || fileId,
+        mediaDesc.md5 || fileHash
+      );
+      if (refreshed) {
+        resolved = refreshed;
+        st = await statNonEmptyFile(resolved);
       }
-      return { url: pathToFileURL(resolved).href };
+    }
+    if (!st && modelId && modelId !== "0") {
+      try {
+        const peer = { chatType, peerUid, guildId: "" };
+        const modelRes = await this.invokeNt(
+          "nodeIKernelRichMediaService/downloadFileForModelId",
+          {
+            peer,
+            fileModelIdList: [modelId],
+            modelIdList: [modelId],
+            savePath: fallbackSavePath,
+            save_path: fallbackSavePath,
+          },
+          [peer, [modelId], fallbackSavePath]
+        );
+        const modelCandidate = String(modelRes?.filePath || fallbackSavePath || "");
+        const modelStat = await statNonEmptyFile(modelCandidate);
+        if (modelStat) {
+          resolved = modelCandidate;
+          st = modelStat;
+        }
+      } catch (err) {
+        this.logger?.debug?.("file_actions.downloadFileForModelId", err);
+      }
+    }
+
+    if (st) {
+      const exposed = await stageToSharedTempDirIfConfigured(this, resolved, preferredName);
+      if (path.resolve(exposed).startsWith(path.resolve(tempDir))) {
+        trackActionTempMedia(this, { isTempFile: true, localPath: exposed });
+      }
+      return { url: pathToFileURL(exposed).href };
     }
     return { url: "" };
   },
@@ -1190,6 +1355,8 @@ module.exports = {
   selectMediaDescFromRawMsg,
   sanitizeDownloadFileName,
   allocateTempDownloadPath,
+  stageToSharedTempDirIfConfigured,
+  probeRefreshedMsgFilePath,
   resolveGroupFileMeta,
   waitRichMediaTargetFile,
   downloadGroupFileToLocal,

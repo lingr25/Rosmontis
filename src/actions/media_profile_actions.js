@@ -37,6 +37,9 @@ const {
   resolveMessageEntry,
   statNonEmptyFile,
   selectMediaDescFromRawMsg,
+  allocateTempDownloadPath,
+  stageToSharedTempDirIfConfigured,
+  probeRefreshedMsgFilePath,
   downloadGroupFileToLocal,
   trackActionTempMedia,
 } = require("./file_actions");
@@ -217,6 +220,12 @@ async function resolveOneBotMediaAction(p, _context, action) {
     const peerUid = String(desc.peerUid || "");
     const elementId = String(desc.elementId || "");
     let safeTargetPath = desc.sourcePath ? String(desc.sourcePath) : "";
+    let allocatedTempPath = "";
+    if (!safeTargetPath && Number(desc.elementType) === 3) {
+      const alloc = await allocateTempDownloadPath(this, desc.fileName || rawFile || "file");
+      safeTargetPath = alloc.filePath;
+      allocatedTempPath = alloc.filePath;
+    }
     /** @type {string[]} */
     const altFilePaths = [];
     if (
@@ -497,6 +506,29 @@ async function resolveOneBotMediaAction(p, _context, action) {
         }
       }
     }
+
+    if (!kernelStat && Number(desc.elementType) === 3 && ntMsgId && peerUid) {
+      const refreshed = await probeRefreshedMsgFilePath(
+        this,
+        ntMsgId,
+        chatType,
+        peerUid,
+        elementId,
+        desc.fileUuid || rawFileId,
+        desc.md5 || ""
+      );
+      if (refreshed) {
+        const refreshedStat = await statNonEmptyFile(refreshed);
+        if (refreshedStat) {
+          kernelLocalPath = refreshed;
+          kernelStat = refreshedStat;
+        }
+      }
+    }
+
+    if (kernelStat && allocatedTempPath && kernelLocalPath === allocatedTempPath) {
+      trackActionTempMedia(this, { isTempFile: true, localPath: allocatedTempPath });
+    }
   }
 
   if (action === "get_file" && !kernelStat) {
@@ -535,6 +567,20 @@ async function resolveOneBotMediaAction(p, _context, action) {
   }
 
   if (kernelStat) {
+    if (action === "get_file") {
+      const stagedPath = await stageToSharedTempDirIfConfigured(
+        this,
+        kernelLocalPath,
+        mediaDesc?.fileName || path.basename(kernelLocalPath)
+      );
+      if (stagedPath && stagedPath !== kernelLocalPath) {
+        const stagedStat = await statNonEmptyFile(stagedPath);
+        if (stagedStat) {
+          kernelLocalPath = stagedPath;
+          kernelStat = stagedStat;
+        }
+      }
+    }
     const converted = await maybeTranscodeGetRecordOutput(
       this,
       action,
