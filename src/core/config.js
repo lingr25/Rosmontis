@@ -554,6 +554,20 @@ function loadBridgeConfig(customConfigDir) {
     "AIO_SWITCH_COOLDOWN_MS"
   );
 
+  defaultConfig.outboundQueueTimeoutMs = _resolveNonNegativeNumberWithDefault(
+    loadedRaw.outboundQueueTimeoutMs ?? loadedRaw.outbound_queue_timeout_ms,
+    25000,
+    "OUTBOUND_QUEUE_TIMEOUT_MS"
+  );
+
+  defaultConfig.outboundMaxQueueSize = Math.floor(
+    _resolveNonNegativeNumberWithDefault(
+      loadedRaw.outboundMaxQueueSize ?? loadedRaw.outbound_max_queue_size,
+      128,
+      "OUTBOUND_MAX_QUEUE_SIZE"
+    )
+  );
+
   defaultConfig.humanReadToTypingDelayMs = _resolveDelaySpecWithDefault(
     loadedRaw.humanReadToTypingDelayMs,
     0,

@@ -69,7 +69,7 @@ const NETWORK_RELOAD_KEYS = Object.freeze([
  * @returns {boolean}
  */
 function writeHttpJson(res, statusCode, payload, extraHeaders = null) {
-  if (!res || res.writableEnded) return false;
+  if (!res || res.writableEnded || res.destroyed) return false;
   const headers =
     extraHeaders && typeof extraHeaders === "object"
       ? { ...JSON_CONTENT_TYPE_HEADERS, ...extraHeaders }
@@ -445,6 +445,12 @@ class ServerRuntime {
     }
 
     const rateLimitRejected = Number(b.rateLimiter?.getStats?.()?.rejected || 0);
+    const sq = b.sessionController?.scheduler?.getStats?.() || {
+      queueLength: 0,
+      timedOut: 0,
+      overflowRejected: 0,
+      aborted: 0,
+    };
     const rendererCrashes = Number(b.rendererHealthStats?.crashes || 0);
     const msgStoreSize = Number(b.messageIdStore?.byShortId?.size ?? b.messageIdStore?.size ?? 0);
     const uinUidStoreSize = Number(b.uinUidStore?.uinToUid?.size ?? 0);
@@ -501,6 +507,14 @@ class ServerRuntime {
       "# HELP rosmontis_rate_limit_rejected_total Total outbound sends rejected by rate limiter.",
       "# TYPE rosmontis_rate_limit_rejected_total counter",
       `rosmontis_rate_limit_rejected_total ${rateLimitRejected}`,
+      "# HELP rosmontis_session_queue_length Currently queued outbound session mutex tasks.",
+      "# TYPE rosmontis_session_queue_length gauge",
+      `rosmontis_session_queue_length ${Number(sq.queueLength || 0)}`,
+      "# HELP rosmontis_session_queue_dropped_total Total outbound session tasks dropped before sendMsg.",
+      "# TYPE rosmontis_session_queue_dropped_total counter",
+      `rosmontis_session_queue_dropped_total{reason="timed_out"} ${Number(sq.timedOut || 0)}`,
+      `rosmontis_session_queue_dropped_total{reason="overflow"} ${Number(sq.overflowRejected || 0)}`,
+      `rosmontis_session_queue_dropped_total{reason="aborted"} ${Number(sq.aborted || 0)}`,
       "# HELP rosmontis_renderer_crashes_total Total renderer process crashes observed.",
       "# TYPE rosmontis_renderer_crashes_total counter",
       `rosmontis_renderer_crashes_total ${rendererCrashes}`,
@@ -715,9 +729,31 @@ class ServerRuntime {
               : params;
           /** @type {{ kind: string, res: http.ServerResponse, deferredTask: (() => void) | null, _ran: boolean }} */
           const transportCtx = { kind: "http", res, deferredTask: null, _ran: false };
-          const reply = await this._getTransportAls().run(transportCtx, () =>
-            this.bridge.handleOneBotAction(act, actParams, params.echo, actionContext)
-          );
+          const reqAbortController = new AbortController();
+          const onPrematureClose = () => {
+            if (!res.writableEnded) {
+              reqAbortController.abort();
+            }
+          };
+          if (res.destroyed && !res.writableEnded) {
+            reqAbortController.abort();
+          } else {
+            res.once("close", onPrematureClose);
+          }
+          /** @type {import("../types").ActionContext} */
+          const httpActionContext = {
+            ...actionContext,
+            transport: "http",
+            signal: reqAbortController.signal,
+          };
+          let reply;
+          try {
+            reply = await this._getTransportAls().run(transportCtx, () =>
+              this.bridge.handleOneBotAction(act, actParams, params.echo, httpActionContext)
+            );
+          } finally {
+            res.removeListener("close", onPrematureClose);
+          }
           if (typeof transportCtx.deferredTask === "function") {
             writeHttpJson(res, 200, reply, { Connection: "close" });
             const triggerDeferred = () => {

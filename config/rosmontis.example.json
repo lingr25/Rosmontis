@@ -3,6 +3,8 @@
   "autoReadAndTypeOnPrivateRecv": false,
   "autoReadReactionDelayMs": [500, 1800],
   "aioSwitchCooldownMs": 800,
+  "outboundQueueTimeoutMs": 25000,
+  "outboundMaxQueueSize": 128,
   "humanReadToTypingDelayMs": 0,
   "aioIdleExitMs": 45000,
   "focusIdleBlurMs": 300000,

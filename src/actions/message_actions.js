@@ -148,7 +148,7 @@ function resolveMessageEntry(bridge, rawMsgId) {
  * @param {() => Promise<any>} getSelfPeer
  * @param {string} [defaultSource=""]
  * @param {number} [depth=1]
- * @param {{ customCount: number, overflowSent: boolean }} [state]
+ * @param {{ customCount: number, overflowSent: boolean, signal?: AbortSignal }} [state]
  */
 async function stageForwardNodes(
   bridge,
@@ -182,7 +182,7 @@ async function stageForwardNodes(
       payload,
       false,
       undefined,
-      { skipHumanSimulation: true }
+      { skipHumanSimulation: true, ...(state.signal ? { signal: state.signal } : {}) }
     );
   };
 
@@ -329,18 +329,22 @@ async function stageForwardNodes(
             state
           );
           if (inner.msgInfos.length > 0) {
-            const innerFwd = await bridge.outboundPipeline._invokeForwardWithEcho(selfPeer, () =>
-              bridge.invokeNt(
-                "nodeIKernelMsgService/multiForwardMsgWithComment",
-                {
-                  msgInfos: inner.msgInfos,
-                  srcContact: inner.srcContact,
-                  dstContact: selfPeer,
-                  commentElements: [],
-                  msgAttributeInfos: new Map(),
-                },
-                [inner.msgInfos, inner.srcContact, selfPeer, [], new Map()]
-              )
+            const innerFwd = await bridge.outboundPipeline._invokeForwardWithEcho(
+              selfPeer,
+              () =>
+                bridge.invokeNt(
+                  "nodeIKernelMsgService/multiForwardMsgWithComment",
+                  {
+                    msgInfos: inner.msgInfos,
+                    srcContact: inner.srcContact,
+                    dstContact: selfPeer,
+                    commentElements: [],
+                    msgAttributeInfos: new Map(),
+                  },
+                  [inner.msgInfos, inner.srcContact, selfPeer, [], new Map()]
+                ),
+              "",
+              state.signal ? { signal: state.signal } : {}
             );
             if (innerFwd?.real_id) {
               msgInfos.push({ msgId: String(innerFwd.real_id), senderShowName: nodeShowName });
@@ -596,6 +600,10 @@ const ACTION_HANDLERS = {
           typeof this.rateLimiter?.getStats === "function"
             ? this.rateLimiter.getStats()
             : null,
+        session_queue:
+          typeof this.sessionController?.scheduler?.getStats === "function"
+            ? this.sessionController.scheduler.getStats()
+            : null,
       },
     };
   },
@@ -761,7 +769,13 @@ const ACTION_HANDLERS = {
       );
     }
     const peer = await this.outboundPipeline._resolvePeerForUser(userId, p.group_id);
-    return await this.outboundPipeline._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), p.group_id);
+    return await this.outboundPipeline._sendMessageToPeer(
+      peer,
+      p.message,
+      Boolean(p.auto_escape),
+      p.group_id,
+      context?.signal ? { signal: context.signal } : {}
+    );
   },
 
   async send_group_msg(p, context) {
@@ -776,7 +790,13 @@ const ACTION_HANDLERS = {
       );
     }
     const peer = { chatType: 2, peerUid: String(groupId), guildId: "" };
-    return await this.outboundPipeline._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), groupId);
+    return await this.outboundPipeline._sendMessageToPeer(
+      peer,
+      p.message,
+      Boolean(p.auto_escape),
+      groupId,
+      context?.signal ? { signal: context.signal } : {}
+    );
   },
 
   async send_msg(p, context) {
@@ -1096,7 +1116,7 @@ const ACTION_HANDLERS = {
     return { messages };
   },
 
-  async send_forward_msg(p, _context, action) {
+  async send_forward_msg(p, context, action) {
     const isGroup =
       action === "send_group_forward_msg" ||
       (p.group_id && action !== "send_private_forward_msg");
@@ -1122,36 +1142,50 @@ const ACTION_HANDLERS = {
       return cachedSelfPeer;
     };
 
+    const reqSignal = context?.signal;
     const { msgInfos, srcContact } = await stageForwardNodes(
       this,
       nodes,
       peer,
       getSelfPeer,
       p.source ? String(p.source) : "",
-      1
+      1,
+      { customCount: 0, overflowSent: false, ...(reqSignal ? { signal: reqSignal } : {}) }
     );
 
     if (msgInfos.length > 0) {
       try {
-        const sent = await this.outboundPipeline._invokeForwardWithEcho(peer, () =>
-          this.invokeNt(
-            "nodeIKernelMsgService/multiForwardMsgWithComment",
-            {
-              msgInfos,
-              srcContact,
-              dstContact: peer,
-              commentElements: [],
-              msgAttributeInfos: new Map(),
-            },
-            [msgInfos, srcContact, peer, [], new Map()]
-          )
+        const sent = await this.outboundPipeline._invokeForwardWithEcho(
+          peer,
+          () =>
+            this.invokeNt(
+              "nodeIKernelMsgService/multiForwardMsgWithComment",
+              {
+                msgInfos,
+                srcContact,
+                dstContact: peer,
+                commentElements: [],
+                msgAttributeInfos: new Map(),
+              },
+              [msgInfos, srcContact, peer, [], new Map()]
+            ),
+          "",
+          reqSignal ? { signal: reqSignal } : {}
         );
         return {
           message_id: sent.message_id,
           res_id: sent.real_id,
           forward_id: sent.real_id,
         };
-      } catch (_) {
+      } catch (/** @type {any} */ fwdErr) {
+        if (
+          fwdErr &&
+          (fwdErr.retcode === 1429 ||
+            fwdErr.retcode === 1499 ||
+            String(fwdErr.code || "").startsWith("ERR_SESSION_QUEUE_"))
+        ) {
+          throw fwdErr;
+        }
         // Fallback: send combined text ONLY if staging did not already send directly to `peer`
         if (srcContact.peerUid !== peer.peerUid || srcContact.chatType !== peer.chatType) {
           const combined = nodes
@@ -1163,7 +1197,13 @@ const ACTION_HANDLERS = {
             .filter(Boolean)
             .join("\n\n");
           if (combined) {
-            const fallbackRes = await this.outboundPipeline._sendMessageToPeer(peer, combined);
+            const fallbackRes = await this.outboundPipeline._sendMessageToPeer(
+              peer,
+              combined,
+              false,
+              undefined,
+              reqSignal ? { signal: reqSignal } : {}
+            );
             const fbRealId = String(fallbackRes.real_id || `fwd_${Date.now()}`);
             return {
               message_id: fallbackRes.message_id,

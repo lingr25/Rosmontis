@@ -144,6 +144,9 @@
  * @property {boolean} [autoReadAndTypeOnPrivateRecv]
  * @property {DelaySpec} [autoReadReactionDelayMs]
  * @property {number} [aioSwitchCooldownMs]
+ * @property {boolean} [enforceSwitchCooldownOnSend]
+ * @property {number} [outboundQueueTimeoutMs]
+ * @property {number} [outboundMaxQueueSize]
  * @property {DelaySpec} [humanReadToTypingDelayMs]
  * @property {boolean} [cleanupTempImmediately]
  * @property {number} [maxTempCleanupRing]
@@ -235,6 +238,20 @@
  * @property {number} circuitOpens
  * @property {"closed" | "open" | "half_open"} circuitState
  * @property {number} activePeers
+ */
+
+/**
+ * Cumulative telemetry snapshot returned by `CausalSessionScheduler.getStats()`.
+ * @typedef {object} SessionQueueStats
+ * @property {boolean} locked
+ * @property {number} queueLength
+ * @property {number} maxQueueSize
+ * @property {number} defaultQueueTimeoutMs
+ * @property {number} enqueued
+ * @property {number} timedOut
+ * @property {number} overflowRejected
+ * @property {number} aborted
+ * @property {number} evictedAdvisory
  */
 
 /**
@@ -373,6 +390,7 @@
  * @property {string} [compatAppName]
  * @property {string} [compatAppVersion]
  * @property {string} [remoteAddress]
+ * @property {AbortSignal} [signal]
  */
 
 /**

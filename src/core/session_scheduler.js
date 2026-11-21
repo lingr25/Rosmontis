@@ -3,18 +3,51 @@
 
 const crypto = require("crypto");
 
+/** @typedef {import("../types").SessionQueueStats} SessionQueueStats */
+
+/**
+ * @typedef {object} QueueWaiter
+ * @property {string} peerKey
+ * @property {boolean} advisory
+ * @property {() => Promise<any> | any} taskFn
+ * @property {(val: any) => void} resolve
+ * @property {(err: any) => void} reject
+ * @property {NodeJS.Timeout | null} queueTimer
+ * @property {AbortSignal | null} signal
+ * @property {(() => void) | null} onAbort
+ * @property {boolean} settled
+ */
+
+/**
+ * @param {string} code
+ * @param {number} retcode
+ * @param {string} message
+ * @returns {Error & { code: string, retcode: number }}
+ */
+function makeSessionQueueError(code, retcode, message) {
+  const err = /** @type {Error & { code: string, retcode: number }} */ (new Error(message));
+  err.code = code;
+  err.retcode = retcode;
+  return err;
+}
+
 /**
  * CausalSessionScheduler (`src/core/session_scheduler.js`)
  *
  * Upgrades AIO mutex serialization and human session-switch scheduling:
- * - Peer-affinity exclusive mutex queue with starvation cap (`maxAffinityStreak`)
- *   and non-advisory priority over `advisory: true` background tasks.
+ * - Peer-affinity exclusive mutex queue with starvation cap (`maxAffinityStreak`),
+ *   bounded queue depth (`maxQueueSize`), queue wait deadline (`defaultQueueTimeoutMs` /
+ *   `timeoutMs`), `AbortSignal` disconnect cancellation, and non-advisory priority over
+ *   `advisory: true` background tasks.
  * - High-frequency session switch cooldown (`shouldAllowSwitch` / `recordSwitch`).
  * - Jittered human delay helper (`computeDelayMs` / `sleepUnref`) with full handle
  *   tracking so `dispose()` cancels all timers immediately without leaking handles.
  * - Coalesced private-message auto-read/typing reaction scheduler per `peerKey`.
  */
 class CausalSessionScheduler {
+  /**
+   * @param {Record<string, any>} [options={}]
+   */
   constructor(options = {}) {
     this._customGetActivePeerKey =
       typeof options.getActivePeerKey === "function" ? options.getActivePeerKey : null;
@@ -28,6 +61,14 @@ class CausalSessionScheduler {
     this.switchCooldownMs =
       Number.isFinite(rawCooldown) && rawCooldown >= 0 ? rawCooldown : 800;
 
+    const rawMaxQueue = Number(options.maxQueueSize);
+    this.maxQueueSize =
+      Number.isFinite(rawMaxQueue) && rawMaxQueue >= 0 ? Math.floor(rawMaxQueue) : 0;
+
+    const rawQueueTimeout = Number(options.defaultQueueTimeoutMs);
+    this.defaultQueueTimeoutMs =
+      Number.isFinite(rawQueueTimeout) && rawQueueTimeout >= 0 ? Math.floor(rawQueueTimeout) : 0;
+
     this.enforceHardCooldownOnExplicit = Boolean(options.enforceHardCooldownOnExplicit);
     this.defaultPrivateRecvDelay =
       options.defaultPrivateRecvDelay !== undefined
@@ -35,16 +76,60 @@ class CausalSessionScheduler {
         : [500, 1800];
 
     this._locked = false;
+    /** @type {QueueWaiter[]} */
     this._queue = [];
     this._affinityStreak = 0;
+    this.stats = {
+      enqueued: 0,
+      timedOut: 0,
+      overflowRejected: 0,
+      aborted: 0,
+      evictedAdvisory: 0,
+    };
 
     this.lastSwitchAt = 0;
     this.lastPeerKey = "";
     this._hasSwitched = false;
 
+    /** @type {Set<NodeJS.Timeout>} */
     this._activeTimers = new Set();
+    /** @type {Set<{ timer: NodeJS.Timeout | null, resolve: () => void }>} */
     this._activeSleeps = new Set();
+    /** @type {Map<string, { peerKey: string, timer: NodeJS.Timeout | null, delayMs: number }>} */
     this._peerReactions = new Map();
+  }
+
+  _ensureStats() {
+    if (!this.stats || typeof this.stats !== "object") {
+      this.stats = {
+        enqueued: 0,
+        timedOut: 0,
+        overflowRejected: 0,
+        aborted: 0,
+        evictedAdvisory: 0,
+      };
+    }
+    return this.stats;
+  }
+
+  /**
+   * @returns {SessionQueueStats}
+   */
+  getStats() {
+    const st = this._ensureStats();
+    return {
+      locked: Boolean(this._locked),
+      queueLength: Array.isArray(this._queue) ? this._queue.length : 0,
+      maxQueueSize: Number.isFinite(this.maxQueueSize) ? this.maxQueueSize : 0,
+      defaultQueueTimeoutMs: Number.isFinite(this.defaultQueueTimeoutMs)
+        ? this.defaultQueueTimeoutMs
+        : 0,
+      enqueued: st.enqueued,
+      timedOut: st.timedOut,
+      overflowRejected: st.overflowRejected,
+      aborted: st.aborted,
+      evictedAdvisory: st.evictedAdvisory,
+    };
   }
 
   getActivePeerKey() {
@@ -67,8 +152,48 @@ class CausalSessionScheduler {
   }
 
   /**
+   * @param {QueueWaiter} waiter
+   */
+  _cleanupWaiterHooks(waiter) {
+    if (!waiter) return;
+    if (waiter.queueTimer) {
+      clearTimeout(waiter.queueTimer);
+      this._activeTimers?.delete(waiter.queueTimer);
+      waiter.queueTimer = null;
+    }
+    if (waiter.signal && waiter.onAbort) {
+      try {
+        waiter.signal.removeEventListener("abort", waiter.onAbort);
+      } catch (_rmErr) {
+        // Benign: custom AbortSignal shim without removeEventListener.
+      }
+      waiter.onAbort = null;
+    }
+  }
+
+  /**
+   * @param {QueueWaiter} waiter
+   * @param {Error} err
+   */
+  _evictQueuedWaiter(waiter, err) {
+    if (!waiter || waiter.settled) return false;
+    const idx = this._queue.indexOf(waiter);
+    if (idx === -1) return false;
+    this._queue.splice(idx, 1);
+    waiter.settled = true;
+    this._cleanupWaiterHooks(waiter);
+    waiter.reject(err);
+    return true;
+  }
+
+  /**
    * Executes `taskFn` with strict mutual exclusion over AIO session operations.
    * Supports both `runExclusive(peerKey, taskFn, options)` and `runExclusive(taskFn, options)`.
+   *
+   * @param {string | (() => Promise<any> | any)} peerKey
+   * @param {((() => Promise<any> | any) | Record<string, any>)} [taskFn]
+   * @param {Record<string, any>} [options={}]
+   * @returns {Promise<any>}
    */
   runExclusive(peerKey, taskFn, options = {}) {
     if (typeof peerKey === "function") {
@@ -80,29 +205,144 @@ class CausalSessionScheduler {
       return Promise.reject(new TypeError("taskFn must be a function"));
     }
 
+    const opts = options && typeof options === "object" ? options : {};
     const normPeerKey = peerKey ? String(peerKey) : "";
-    const advisory = Boolean(options && options.advisory);
+    const advisory = Boolean(opts.advisory);
+    /** @type {AbortSignal | null} */
+    const signal =
+      opts.signal && typeof opts.signal === "object" && "aborted" in opts.signal
+        ? /** @type {AbortSignal} */ (opts.signal)
+        : null;
+    const st = this._ensureStats();
+
+    if (signal && signal.aborted) {
+      st.aborted += 1;
+      return Promise.reject(
+        makeSessionQueueError(
+          "ERR_SESSION_QUEUE_ABORTED",
+          1499,
+          "Outbound request was aborted before entering session lock"
+        )
+      );
+    }
+
+    const fnToRun = /** @type {() => Promise<any> | any} */ (taskFn);
 
     return new Promise((resolve, reject) => {
+      /** @type {QueueWaiter} */
       const waiter = {
         peerKey: normPeerKey,
         advisory,
-        taskFn,
+        taskFn: fnToRun,
         resolve,
         reject,
+        queueTimer: null,
+        signal,
+        onAbort: null,
+        settled: false,
       };
 
       if (!this._locked) {
         this._locked = true;
         this._affinityStreak = 0;
         this._executeWaiter(waiter);
-      } else {
-        this._queue.push(waiter);
+        return;
       }
+
+      const maxCap = Number.isFinite(this.maxQueueSize) ? Math.floor(this.maxQueueSize) : 0;
+      if (maxCap > 0 && this._queue.length >= maxCap) {
+        let madeRoom = false;
+        if (!advisory) {
+          const advIdx = this._queue.findIndex((w) => w.advisory && !w.settled);
+          if (advIdx !== -1) {
+            const [advWaiter] = this._queue.splice(advIdx, 1);
+            advWaiter.settled = true;
+            this._cleanupWaiterHooks(advWaiter);
+            st.evictedAdvisory += 1;
+            advWaiter.reject(
+              makeSessionQueueError(
+                "ERR_SESSION_QUEUE_EVICTED",
+                1429,
+                "Advisory session task evicted to admit explicit outbound action"
+              )
+            );
+            madeRoom = true;
+          }
+        }
+        if (!madeRoom) {
+          st.overflowRejected += 1;
+          reject(
+            makeSessionQueueError(
+              "ERR_SESSION_QUEUE_FULL",
+              1429,
+              `Outbound session queue is full (maxQueueSize=${maxCap})`
+            )
+          );
+          return;
+        }
+      }
+
+      const rawTimeout =
+        opts.timeoutMs !== undefined && opts.timeoutMs !== null
+          ? Number(opts.timeoutMs)
+          : !advisory && Number.isFinite(this.defaultQueueTimeoutMs)
+          ? this.defaultQueueTimeoutMs
+          : 0;
+      const effectiveTimeoutMs =
+        Number.isFinite(rawTimeout) && rawTimeout > 0 ? Math.floor(rawTimeout) : 0;
+
+      if (effectiveTimeoutMs > 0) {
+        const timer = setTimeout(() => {
+          this._activeTimers.delete(timer);
+          waiter.queueTimer = null;
+          if (
+            this._evictQueuedWaiter(
+              waiter,
+              makeSessionQueueError(
+                "ERR_SESSION_QUEUE_TIMEOUT",
+                1429,
+                `Timed out after ${effectiveTimeoutMs}ms waiting in outbound session queue`
+              )
+            )
+          ) {
+            st.timedOut += 1;
+          }
+        }, effectiveTimeoutMs);
+        waiter.queueTimer = timer;
+        this._activeTimers.add(timer);
+      }
+
+      if (signal && typeof signal.addEventListener === "function") {
+        const onAbort = () => {
+          waiter.onAbort = null;
+          if (
+            this._evictQueuedWaiter(
+              waiter,
+              makeSessionQueueError(
+                "ERR_SESSION_QUEUE_ABORTED",
+                1499,
+                "Caller disconnected while waiting in outbound session queue"
+              )
+            )
+          ) {
+            st.aborted += 1;
+          }
+        };
+        waiter.onAbort = onAbort;
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      st.enqueued += 1;
+      this._queue.push(waiter);
     });
   }
 
+  /**
+   * @param {QueueWaiter} waiter
+   */
   _executeWaiter(waiter) {
+    waiter.settled = true;
+    this._cleanupWaiterHooks(waiter);
     Promise.resolve()
       .then(() => waiter.taskFn())
       .then(
@@ -332,28 +572,37 @@ class CausalSessionScheduler {
     const key = peerKey ? String(peerKey) : "";
     const entry = this._peerReactions.get(key);
     if (!entry) return false;
-    clearTimeout(entry.timer);
-    this._activeTimers.delete(entry.timer);
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      this._activeTimers.delete(entry.timer);
+    }
     this._peerReactions.delete(key);
     return true;
   }
 
   cancelAllReactions() {
     for (const entry of this._peerReactions.values()) {
-      clearTimeout(entry.timer);
-      this._activeTimers.delete(entry.timer);
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+        this._activeTimers.delete(entry.timer);
+      }
     }
     this._peerReactions.clear();
   }
 
   /**
-   * Immediately cancels all pending reaction timers and sleep timers without leaking handles.
+   * Immediately cancels all pending reaction timers, sleep timers, and queued waiter hooks without leaking handles.
    */
   dispose() {
     this.cancelAllReactions();
+    for (const waiter of this._queue) {
+      this._cleanupWaiterHooks(waiter);
+    }
     for (const sleepRecord of this._activeSleeps) {
-      clearTimeout(sleepRecord.timer);
-      this._activeTimers.delete(sleepRecord.timer);
+      if (sleepRecord.timer) {
+        clearTimeout(sleepRecord.timer);
+        this._activeTimers.delete(sleepRecord.timer);
+      }
       sleepRecord.resolve();
     }
     this._activeSleeps.clear();
@@ -367,4 +616,5 @@ class CausalSessionScheduler {
 
 module.exports = {
   CausalSessionScheduler,
+  makeSessionQueueError,
 };

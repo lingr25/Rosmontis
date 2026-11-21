@@ -199,6 +199,7 @@ if [[ "${DO_HOT_RELOAD}" == "1" ]]; then
   if command -v node >/dev/null 2>&1; then
     set +e
     node -e '
+      const fs = require("fs");
       const http = require("http");
       const path = require("path");
 
@@ -206,12 +207,32 @@ if [[ "${DO_HOT_RELOAD}" == "1" ]]; then
       const cfg = cfgMod.loadBridgeConfig(process.env.ROSMONTIS_CONFIG_DIR || process.env.ONEBOT_CONFIG_DIR);
       const srv = (cfg.httpServers && cfg.httpServers[0]) || { port: 3000, accessToken: "" };
       const port = Number(process.env.ROSMONTIS_HTTP_PORT || srv.port || 3000);
-      const token = String(
+      let token = String(
         process.env.ROSMONTIS_ACCESS_TOKEN ||
+        process.env.ONEBOT_ACCESS_TOKEN ||
+        process.env.XIAO_BRIDGE_TOKEN ||
         process.env.XIAO_ONEBOT_HTTP_TOKEN ||
         srv.accessToken ||
         ""
       );
+      if (!token && fs.existsSync("/proc")) {
+        try {
+          for (const pid of fs.readdirSync("/proc")) {
+            if (!/^\d+$/.test(pid)) continue;
+            try {
+              const rawEnv = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
+              for (const entry of rawEnv.split("\0")) {
+                const m = entry.match(/^(?:ROSMONTIS_ACCESS_TOKEN|ONEBOT_ACCESS_TOKEN|XIAO_BRIDGE_TOKEN|XIAO_ONEBOT_HTTP_TOKEN|ONEBOT_TOKEN)=(.+)$/);
+                if (m && m[1]) {
+                  token = m[1];
+                  break;
+                }
+              }
+              if (token) break;
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }
 
       const body = JSON.stringify({ reload_config: true, reload_renderer: true });
       const req = http.request(

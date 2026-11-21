@@ -240,10 +240,14 @@ class HumanSessionController {
     const initCfg = this._getConfig() || {};
     this._lastCfgSwitchCooldown = initCfg.aioSwitchCooldownMs;
     this._lastCfgEnforceCooldown = initCfg.enforceSwitchCooldownOnSend;
+    this._lastCfgQueueTimeout = initCfg.outboundQueueTimeoutMs;
+    this._lastCfgMaxQueueSize = initCfg.outboundMaxQueueSize;
     this.scheduler = new CausalSessionScheduler({
       getActivePeerKey: () => this.activeAioPeerKey,
       switchCooldownMs: initCfg.aioSwitchCooldownMs ?? 800,
       enforceHardCooldownOnExplicit: Boolean(initCfg.enforceSwitchCooldownOnSend),
+      defaultQueueTimeoutMs: initCfg.outboundQueueTimeoutMs ?? 25000,
+      maxQueueSize: initCfg.outboundMaxQueueSize ?? 128,
       logger: this.logger,
     });
   }
@@ -261,6 +265,20 @@ class HumanSessionController {
       this._lastCfgEnforceCooldown = cfg.enforceSwitchCooldownOnSend;
       this.scheduler.enforceHardCooldownOnExplicit = Boolean(cfg.enforceSwitchCooldownOnSend);
     }
+    if (cfg.outboundQueueTimeoutMs !== this._lastCfgQueueTimeout) {
+      this._lastCfgQueueTimeout = cfg.outboundQueueTimeoutMs;
+      const rawTimeout = Number(cfg.outboundQueueTimeoutMs ?? 25000);
+      if (Number.isFinite(rawTimeout) && rawTimeout >= 0) {
+        this.scheduler.defaultQueueTimeoutMs = Math.floor(rawTimeout);
+      }
+    }
+    if (cfg.outboundMaxQueueSize !== this._lastCfgMaxQueueSize) {
+      this._lastCfgMaxQueueSize = cfg.outboundMaxQueueSize;
+      const rawCap = Number(cfg.outboundMaxQueueSize ?? 128);
+      if (Number.isFinite(rawCap) && rawCap >= 0) {
+        this.scheduler.maxQueueSize = Math.floor(rawCap);
+      }
+    }
   }
 
   /**
@@ -268,6 +286,7 @@ class HumanSessionController {
    * @param {Record<string, any>} [options]
    */
   withLock(fn, options = {}) {
+    this._syncSchedulerConfig(this._getConfig());
     const opts = options && typeof options === "object" ? options : {};
     return this.scheduler.runExclusive(opts.peerKey || "", fn, opts);
   }

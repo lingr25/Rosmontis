@@ -23,6 +23,7 @@ const {
   hasRichMediaElements,
 } = require("./echo_correlator");
 const { OutboundRateLimiter } = require("./rate_limiter");
+const { makeSessionQueueError } = require("./session_scheduler");
 
 /** @typedef {import("../types").BridgeHost} BridgeHost */
 /** @typedef {import("../types").BridgeConfig} BridgeConfig */
@@ -497,6 +498,22 @@ class OutboundPipeline {
    * @returns {Promise<{ message_id: number, real_id?: string }>}
    */
   async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
+    const opts = options && typeof options === "object" ? options : {};
+    /** @type {AbortSignal | null} */
+    const signal =
+      opts.signal && typeof opts.signal === "object" && "aborted" in opts.signal
+        ? /** @type {AbortSignal} */ (opts.signal)
+        : null;
+    if (signal && signal.aborted) {
+      const qStats = this.bridge.sessionController?.scheduler?._ensureStats?.();
+      if (qStats) qStats.aborted += 1;
+      throw makeSessionQueueError(
+        "ERR_SESSION_QUEUE_ABORTED",
+        1499,
+        "Outbound send aborted before media staging"
+      );
+    }
+
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
     this._enforceOutboundRateLimit(peerKey);
     this.bridge.sessionController?.scheduler.cancelPeerReaction(peerKey);
@@ -519,16 +536,30 @@ class OutboundPipeline {
     });
 
     try {
+      if (signal && signal.aborted) {
+        const qStats = this.bridge.sessionController?.scheduler?._ensureStats?.();
+        if (qStats) qStats.aborted += 1;
+        throw makeSessionQueueError(
+          "ERR_SESSION_QUEUE_ABORTED",
+          1499,
+          "Caller disconnected during outbound media staging"
+        );
+      }
+
       // Phase 2 (AIO-mutex serialized): activate target AIO + dispatch sendMsg IPC, then release immediately
       const runWithLock = this.bridge.sessionController
         ? this.bridge.sessionController.withLock.bind(this.bridge.sessionController)
         : (/** @type {() => Promise<any>} */ fn) => fn();
+      /** @type {Record<string, any>} */
+      const lockOpts = { peerKey };
+      if (signal) lockOpts.signal = signal;
+      if (opts.queueTimeoutMs !== undefined) lockOpts.timeoutMs = opts.queueTimeoutMs;
       const { echoWaiter, sendRes } = await runWithLock(
         async () => {
           this.bridge.sessionController?.scheduler.cancelPeerReaction(peerKey);
           if (
             this.config?.humanSimulation !== false &&
-            !options.skipHumanSimulation &&
+            !opts.skipHumanSimulation &&
             this.bridge.sessionController
           ) {
             await this.bridge.sessionController.activateUnlocked({
@@ -566,7 +597,7 @@ class OutboundPipeline {
               },
               ["0", peer, elements, new Map()]
             );
-            if (this.config?.humanSimulation !== false && !options.skipHumanSimulation) {
+            if (this.config?.humanSimulation !== false && !opts.skipHumanSimulation) {
               this.bridge.sessionController?.touchActivity();
             }
             return { echoWaiter: waiter, sendRes: res };
@@ -575,7 +606,7 @@ class OutboundPipeline {
             throw err;
           }
         },
-        { peerKey }
+        lockOpts
       );
 
       if (!echoWaiter) {
@@ -643,9 +674,23 @@ class OutboundPipeline {
    * @param {any} peer
    * @param {() => Promise<any>} invokeFn
    * @param {string} [fallbackSeed=""]
+   * @param {Record<string, any>} [options={}]
    * @returns {Promise<{ message_id: number, real_id: string, msgId: string }>}
    */
-  async _invokeForwardWithEcho(peer, invokeFn, fallbackSeed = "") {
+  async _invokeForwardWithEcho(peer, invokeFn, fallbackSeed = "", options = {}) {
+    const signal =
+      options && options.signal && typeof options.signal === "object" && "aborted" in options.signal
+        ? /** @type {AbortSignal} */ (options.signal)
+        : null;
+    if (signal && signal.aborted) {
+      const qStats = this.bridge.sessionController?.scheduler?._ensureStats?.();
+      if (qStats) qStats.aborted += 1;
+      throw makeSessionQueueError(
+        "ERR_SESSION_QUEUE_ABORTED",
+        1499,
+        "Forward message aborted before kernel dispatch"
+      );
+    }
     const peerKey = `${peer?.chatType || 0}:${peer?.peerUid || ""}:${peer?.guildId || ""}`;
     this._enforceOutboundRateLimit(peerKey);
     const fwdTimeoutCfg = Number(this.config?.forwardEchoTimeoutMs);

@@ -61,7 +61,7 @@
   - `media_profile_actions.js`：图片/语音/文件解析、OCR/语音转文字、个人资料状态与 Ark 卡片分享动作
   - `file_media_actions.js`：组合 `file_actions.js` 与 `media_profile_actions.js` 的向后兼容门面路由
 - `scripts/`、`docker/` & `.github/workflows/`：无头 Linux QQ 容器构建（官方 `.deb` 拉取、默认 `ROSMONTIS_STATE_DIR=/app/data/state`、可选 `INSTALL_VNC=0` 精简模式）、`Xvfb` 启动、桥接安装脚本、零依赖类型检查脚本（`scripts/typecheck.js`）、CI 测试/类型检查与每周官方 `.deb` 金丝雀冒烟工作流（`.github/workflows/canary.yml`）
-- `test/`：零依赖契约、安全与端到端模拟测试套件（含基于 `node --test` 并行运行的 24 个 `test/bridge/*.test.js` 领域文件——含 `composition_architecture.test.js`、`wire_codec_parity.test.js`、`rkey_invisit_media.test.js`、`silk_worker_ptt.test.js`、`stateful_hot_reload.test.js` 与 `ntqq_3232_corpus.test.js`——加上 `test/test_core_modules.js` 与 `test/test_media_security.js`，共 85 项测试），直接运行 `npm test` 与 `npm run typecheck` 验证
+- `test/`：零依赖契约、安全与端到端模拟测试套件（含基于 `node --test` 并行运行的 25 个 `test/bridge/*.test.js` 领域文件——含 `composition_architecture.test.js`、`wire_codec_parity.test.js`、`rkey_invisit_media.test.js`、`silk_worker_ptt.test.js`、`stateful_hot_reload.test.js`、`ntqq_3232_corpus.test.js` 与 `session_queue_resilience.test.js`——加上 `test/test_core_modules.js` 与 `test/test_media_security.js`，共 87 项测试），直接运行 `npm test` 与 `npm run typecheck` 验证
 
 ## 本地联调说明
 
