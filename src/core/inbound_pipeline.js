@@ -1343,7 +1343,7 @@ class InboundPipeline {
       return;
     }
     if (eventName === "onRichMediaDownloadComplete") {
-      this._handleRichMediaDownloadComplete(firstArg);
+      await this._handleRichMediaDownloadComplete(firstArg);
       return;
     }
 

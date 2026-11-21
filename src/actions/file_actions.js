@@ -164,13 +164,102 @@ function elementToMediaDesc(el, ntMsgId, chatType, peerUid) {
   return null;
 }
 
+/**
+ * @param {any} val
+ * @returns {any}
+ */
+function _cloneVisitMediaElem(val) {
+  if (val === null || val === undefined || typeof val !== "object") return val;
+  if (val instanceof Map) {
+    const m = new Map();
+    for (const [k, v] of val.entries()) {
+      m.set(_cloneVisitMediaElem(k), _cloneVisitMediaElem(v));
+    }
+    return m;
+  }
+  if (val instanceof Uint8Array) {
+    return Uint8Array.from(val);
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => _cloneVisitMediaElem(item));
+  }
+  /** @type {Record<string, any>} */
+  const out = {};
+  for (const [k, v] of Object.entries(val)) {
+    if (k.startsWith("__")) continue;
+    out[k] = _cloneVisitMediaElem(v);
+  }
+  return out;
+}
+
 function selectMediaDescFromRawMsg(rawMsg, entry, action, rawFile, rawFileId, elementIdHint) {
   if (!rawMsg || !Array.isArray(rawMsg.elements)) return null;
   const ntMsgId = String(rawMsg.msgId || entry?.msgId || entry?.ntMsgId || "");
-  const chatType = Number(rawMsg.chatType || entry?.peer?.chatType || entry?.chatType || 1);
-  const peerUid = String(rawMsg.peerUid || entry?.peer?.peerUid || entry?.peerUid || "");
+  const inVisit = Boolean(entry?.inVisit);
+  const hasForwardPeer = Boolean(
+    inVisit && entry?.forwardPeer?.peerUid && String(entry.forwardPeer.peerUid) !== "0"
+  );
+  const hasMsgPeer = Boolean(rawMsg.peerUid && String(rawMsg.peerUid) !== "0");
+  const msgChatType = Number(
+    hasMsgPeer ? rawMsg.chatType || entry?.peer?.chatType || entry?.chatType || 0 : 0
+  );
+  const msgPeerUid = hasMsgPeer ? String(rawMsg.peerUid) : "";
+  const msgGuildId = hasMsgPeer ? String(rawMsg.guildId || entry?.peer?.guildId || "") : "";
+  const chatType = Number(
+    hasForwardPeer
+      ? entry.forwardPeer.chatType || msgChatType || entry?.chatType || 1
+      : hasMsgPeer
+      ? msgChatType || 1
+      : entry?.peer?.chatType || entry?.forwardPeer?.chatType || entry?.chatType || rawMsg.chatType || 1
+  );
+  const peerUid = String(
+    hasForwardPeer
+      ? entry.forwardPeer.peerUid
+      : hasMsgPeer
+      ? msgPeerUid
+      : entry?.peer?.peerUid || entry?.forwardPeer?.peerUid || entry?.peerUid || ""
+  );
+  const guildId = String(
+    hasForwardPeer
+      ? entry.forwardPeer.guildId || ""
+      : hasMsgPeer
+      ? msgGuildId
+      : entry?.peer?.guildId || entry?.forwardPeer?.guildId || rawMsg.guildId || ""
+  );
   const descs = rawMsg.elements
-    .map((el) => elementToMediaDesc(el, ntMsgId, chatType, peerUid))
+    .map((el) => {
+      const base = elementToMediaDesc(el, ntMsgId, chatType, peerUid);
+      if (!base || !inVisit) return base;
+      return {
+        ...base,
+        inVisit: true,
+        guildId,
+        forwardPeer: hasForwardPeer
+          ? {
+              chatType: Number(entry.forwardPeer.chatType || chatType || 1),
+              peerUid: String(entry.forwardPeer.peerUid),
+              guildId: String(entry.forwardPeer.guildId || ""),
+            }
+          : null,
+        msgChatType,
+        msgPeerUid,
+        msgGuildId,
+        rootMsgId: String(entry?.rootMsgId || ""),
+        parentMsgId: String(entry?.parentMsgId || entry?.rootMsgId || ""),
+        forwardSenderUid: String(
+          entry?.forwardSenderUid ||
+            (Number(entry?.forwardPeer?.chatType || chatType) === 1
+              ? entry?.forwardPeer?.peerUid || peerUid
+              : "") ||
+            ""
+        ),
+        senderUid: String(rawMsg.senderUid || entry?.senderUid || ""),
+        msgRandom: String(rawMsg.msgRandom || entry?.msgRandom || "0"),
+        msgSeq: String(rawMsg.msgSeq || entry?.msgSeq || "0"),
+        msgTime: String(rawMsg.msgTime || entry?.msgTime || "0"),
+        elem: _cloneVisitMediaElem(el),
+      };
+    })
     .filter(Boolean);
   if (descs.length === 0) return null;
 

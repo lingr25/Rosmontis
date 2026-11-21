@@ -61,6 +61,42 @@ const _cleanupByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
 const _bootstrapAuthByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
 /** @type {WeakMap<object, (fn: (scope: string, err: any) => void) => void> | null} */
 const _diagSetterByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
+const WINDOW_CHANNEL_MUX_SYMBOL =
+  typeof Symbol === "function" && typeof Symbol.for === "function"
+    ? Symbol.for("rosmontis.renderer.channelMux")
+    : "__rosmontisChannelMux__";
+
+/**
+ * @param {any} win
+ * @returns {Map<string, any>}
+ */
+function getWindowChannelMux(win) {
+  if (!win || (typeof win !== "object" && typeof win !== "function")) {
+    return new Map();
+  }
+  const existing = win[WINDOW_CHANNEL_MUX_SYMBOL];
+  if (
+    existing &&
+    typeof existing.get === "function" &&
+    typeof existing.set === "function" &&
+    typeof existing.delete === "function"
+  ) {
+    return existing;
+  }
+  const created = new Map();
+  try {
+    Object.defineProperty(win, WINDOW_CHANNEL_MUX_SYMBOL, {
+      value: created,
+      enumerable: false,
+      configurable: true,
+      writable: false,
+    });
+    return created;
+  } catch (_defErr) {
+    // Target window may be non-extensible; return isolated map without mutating window.
+    return created;
+  }
+}
 
 /** @type {typeof import("./core/wire_codec") | null} */
 let _wireCodecInlined = null;
@@ -183,13 +219,30 @@ function installRendererBridge(targetWindow, options = {}) {
     });
   }
 
-  if (options.forceReinstall && _cleanupByWindow && typeof win === "object" && win !== null) {
-    const prevCleanup = _cleanupByWindow.get(win);
-    if (typeof prevCleanup === "function") {
-      try {
-        prevCleanup();
-      } catch (err) {
-        reportDiag("cleanupPrevious", err);
+  /** @type {Record<string, any> | null} */
+  let preservedSessionState = null;
+  if (options.forceReinstall && typeof win === "object" && win !== null) {
+    const existingBridge = win.__ROSMONTIS_RENDERER_BRIDGE__;
+    if (existingBridge && typeof existingBridge === "object") {
+      if (options.preserveSessionState !== false && existingBridge.sessionState) {
+        preservedSessionState = existingBridge.sessionState;
+      }
+      if (typeof existingBridge._detachAllListeners === "function") {
+        try {
+          existingBridge._detachAllListeners();
+        } catch (err) {
+          reportDiag("detachPreviousBridge", err);
+        }
+      }
+    }
+    if (_cleanupByWindow) {
+      const prevCleanup = _cleanupByWindow.get(win);
+      if (typeof prevCleanup === "function") {
+        try {
+          prevCleanup();
+        } catch (err) {
+          reportDiag("cleanupPrevious", err);
+        }
       }
     }
   }
@@ -274,6 +327,7 @@ function installRendererBridge(targetWindow, options = {}) {
 
   const ipcRenderer = resolveIpcRenderer();
   let windowId = discoverWindowId(ipcRenderer);
+  let isDetached = false;
   const pendingCallbacks = new Map();
   const observedChannels = new Set();
   const attachedIpcByChannel = new Map();
@@ -290,11 +344,17 @@ function installRendererBridge(targetWindow, options = {}) {
    * }}
    */
   const sessionState = {
-    activeAioPeer: null,
-    activeAioPeerKey: "",
-    focused: false,
-    lastReadAtByPeer: new Map(),
-    lastTypingAtByPeer: new Map(),
+    activeAioPeer: preservedSessionState?.activeAioPeer || null,
+    activeAioPeerKey: String(preservedSessionState?.activeAioPeerKey || ""),
+    focused: Boolean(preservedSessionState?.focused),
+    lastReadAtByPeer:
+      preservedSessionState?.lastReadAtByPeer instanceof Map
+        ? new Map(preservedSessionState.lastReadAtByPeer)
+        : new Map(),
+    lastTypingAtByPeer:
+      preservedSessionState?.lastTypingAtByPeer instanceof Map
+        ? new Map(preservedSessionState.lastTypingAtByPeer)
+        : new Map(),
   };
 
   function resetSessionState() {
@@ -365,6 +425,7 @@ function installRendererBridge(targetWindow, options = {}) {
   }
 
   function handleIncomingMainIpc(_event, header, body) {
+    if (isDetached) return;
     try {
       if (header && typeof header === "object" && header.callbackId) {
         const pending = pendingCallbacks.get(header.callbackId);
@@ -434,6 +495,7 @@ function installRendererBridge(targetWindow, options = {}) {
   }
 
   async function handleBridgeCommand(_eventOrEnvelope, maybeEnvelope) {
+    if (isDetached) return;
     const cmdEnvelope =
       maybeEnvelope !== undefined
         ? maybeEnvelope
@@ -568,23 +630,59 @@ function installRendererBridge(targetWindow, options = {}) {
   }
 
   function attachChannelListener(channel, handler, force = false) {
+    if (isDetached) return;
     const ipc = resolveIpcRenderer() || ipcRenderer;
     if (!ipc || typeof ipc.on !== "function") return;
-    if (observedChannels.has(channel) && attachedIpcByChannel.get(channel) === ipc) {
-      if (!force) return;
-      const prevHandler = attachedHandlerByChannel.get(channel) || handler;
-      if (!removeChannelHandler(ipc, channel, prevHandler, "attachChannelListener.remove")) {
+
+    const mux = getWindowChannelMux(win);
+    let slot = mux.get(channel);
+    if (slot && slot.ipc && slot.ipc !== ipc) {
+      if (typeof slot.unsub === "function") {
+        try {
+          slot.unsub();
+        } catch (err) {
+          reportDiag("attachChannelListener.unsub", err);
+        }
+      }
+      removeChannelHandler(slot.ipc, channel, slot.wrapper, "attachChannelListener.replaceIpc");
+      slot = null;
+      mux.delete(channel);
+    }
+
+    if (!slot || !slot.installed) {
+      /** @type {{ ipc: any, currentHandler: any, installed: boolean, unsub: any, wrapper: any }} */
+      const nextSlot = {
+        ipc,
+        currentHandler: handler,
+        installed: false,
+        unsub: null,
+        wrapper: null,
+      };
+      nextSlot.wrapper = function rosmontisChannelMuxWrapper(/** @type {any[]} */ ...args) {
+        const activeFn = nextSlot.currentHandler;
+        if (typeof activeFn === "function") {
+          return activeFn(...args);
+        }
+      };
+      try {
+        const maybeUnsub = ipc.on(channel, nextSlot.wrapper);
+        if (typeof maybeUnsub === "function") {
+          nextSlot.unsub = maybeUnsub;
+        }
+        nextSlot.installed = true;
+        mux.set(channel, nextSlot);
+      } catch (err) {
+        reportDiag("attachChannelListener.on", err);
         return;
       }
+      slot = nextSlot;
+    } else if (force || slot.currentHandler !== handler || !observedChannels.has(channel)) {
+      slot.currentHandler = handler;
     }
+
     observedChannels.add(channel);
     attachedIpcByChannel.set(channel, ipc);
     attachedHandlerByChannel.set(channel, handler);
-    try {
-      ipc.on(channel, handler);
-    } catch (err) {
-      reportDiag("attachChannelListener.on", err);
-    }
   }
 
   function attachPassiveListener(wid, force = false) {
@@ -596,9 +694,16 @@ function installRendererBridge(targetWindow, options = {}) {
   }
 
   function detachAllListeners() {
+    isDetached = true;
+    const mux = getWindowChannelMux(win);
     for (const [channel, ipc] of attachedIpcByChannel.entries()) {
       const handler = attachedHandlerByChannel.get(channel);
-      removeChannelHandler(ipc, channel, handler, "detachAllListeners");
+      const slot = mux.get(channel);
+      if (slot && slot.currentHandler === handler) {
+        slot.currentHandler = null;
+      } else {
+        removeChannelHandler(ipc, channel, handler, "detachAllListeners");
+      }
     }
     observedChannels.clear();
     attachedIpcByChannel.clear();
@@ -1068,6 +1173,7 @@ function installRendererBridge(targetWindow, options = {}) {
     simulateHumanSessionFlow,
     leaveHumanSessionFlow,
     _handleIncomingMainIpc: handleIncomingMainIpc,
+    _detachAllListeners: detachAllListeners,
   };
 
   Object.defineProperty(bridgeApi, "setIpcAuthToken", {
@@ -1081,7 +1187,7 @@ function installRendererBridge(targetWindow, options = {}) {
   return bridgeApi;
 }
 
-if (typeof window !== "undefined") {
+if (typeof window !== "undefined" && /** @type {any} */ (window).__ROSMONTIS_SKIP_AUTO_INSTALL__ !== true) {
   try {
     installRendererBridge(window, { autoRegisterListeners: true });
   } catch (err) {

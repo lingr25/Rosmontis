@@ -1069,6 +1069,8 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
         maxMediaBytes: ctx.maxMediaBytes,
         ffmpegPath: ctx.ffmpegPath,
         silkEncoderPath: ctx.silkEncoderPath,
+        silkAddonPath: ctx.silkAddonPath,
+        nodeBinPath: ctx.nodeBinPath,
         transcodeTimeoutMs: ctx.transcodeTimeoutMs,
       });
       if (voiceMedia.extraTempMedia) {
@@ -1126,6 +1128,12 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
           fileUuid: "",
           text: "",
           waveAmplitudes,
+          playState: 0,
+          autoConvertText: 0,
+          storeID: 0,
+          otherBusinessInfo: {
+            aiVoiceType: 0,
+          },
         },
       });
       continue;

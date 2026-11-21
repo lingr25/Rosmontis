@@ -475,6 +475,108 @@ function normalizeLoginIdentity(firstArg) {
   };
 }
 
+/**
+ * @param {Buffer} buf
+ * @param {number} offset
+ * @returns {{ value: number, nextOffset: number } | null}
+ */
+function _readProtobufVarint(buf, offset) {
+  let val = 0;
+  let shift = 0;
+  let idx = offset;
+  while (idx < buf.length && idx - offset < 10) {
+    const b = buf[idx++];
+    val += (b & 0x7f) * Math.pow(2, shift);
+    if ((b & 0x80) === 0) {
+      return { value: val, nextOffset: idx };
+    }
+    shift += 7;
+  }
+  return null;
+}
+
+/**
+ * Extracts the NTv2 RichMedia storage `appid` (e.g. `1406` for C2C, `1407` for Group)
+ * from either an `originImageUrl` query string or a base64url-encoded `fileUuid` protobuf.
+ *
+ * @param {any} elemOrUrl
+ * @param {string} [fallbackFileUuid=""]
+ * @returns {number}
+ */
+function extractNtRichMediaAppId(elemOrUrl, fallbackFileUuid = "") {
+  let urlStr = "";
+  let uuidStr = String(fallbackFileUuid || "").trim();
+  if (typeof elemOrUrl === "string") {
+    urlStr = elemOrUrl.trim();
+  } else if (elemOrUrl && typeof elemOrUrl === "object") {
+    urlStr = String(
+      elemOrUrl.originImageUrl ||
+        elemOrUrl.url ||
+        elemOrUrl.picElement?.originImageUrl ||
+        elemOrUrl.picElement?.url ||
+        ""
+    ).trim();
+    if (!uuidStr) {
+      uuidStr = String(
+        elemOrUrl.fileUuid ||
+          elemOrUrl.picElement?.fileUuid ||
+          elemOrUrl.pttElement?.fileUuid ||
+          elemOrUrl.videoElement?.fileUuid ||
+          elemOrUrl.fileElement?.fileUuid ||
+          ""
+      ).trim();
+    }
+  }
+
+  if (urlStr) {
+    const m = /[?&]appid=(\d+)/i.exec(urlStr);
+    if (m && m[1]) {
+      const parsed = Number(m[1]);
+      if (Number.isFinite(parsed) && parsed > 0) return Math.trunc(parsed);
+    }
+  }
+
+  if (uuidStr && /^[A-Za-z0-9_-]{16,}={0,2}$/.test(uuidStr)) {
+    try {
+      const b64 = uuidStr.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+      const buf = Buffer.from(padded, "base64");
+      let offset = 0;
+      while (offset < buf.length) {
+        const tagRes = _readProtobufVarint(buf, offset);
+        if (!tagRes || tagRes.value <= 0) break;
+        offset = tagRes.nextOffset;
+        const fieldNo = Math.trunc(tagRes.value / 8);
+        const wireType = tagRes.value & 0x07;
+        if (wireType === 0) {
+          const vRes = _readProtobufVarint(buf, offset);
+          if (!vRes) break;
+          offset = vRes.nextOffset;
+          if (fieldNo === 4 && vRes.value >= 1000 && vRes.value <= 9999) {
+            return Math.trunc(vRes.value);
+          }
+        } else if (wireType === 1) {
+          offset += 8;
+        } else if (wireType === 2) {
+          const lenRes = _readProtobufVarint(buf, offset);
+          if (!lenRes || lenRes.value < 0 || lenRes.nextOffset + lenRes.value > buf.length) {
+            break;
+          }
+          offset = lenRes.nextOffset + lenRes.value;
+        } else if (wireType === 5) {
+          offset += 4;
+        } else {
+          break;
+        }
+      }
+    } catch (_decodeErr) {
+      // Malformed base64url/protobuf fileUuid; fall through and return 0.
+    }
+  }
+
+  return 0;
+}
+
 module.exports = {
   isPositiveUin,
   pickPositiveUin,
@@ -483,4 +585,5 @@ module.exports = {
   normalizeBuddyProfile,
   normalizeGroupMember,
   normalizeLoginIdentity,
+  extractNtRichMediaAppId,
 };

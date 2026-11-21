@@ -41,6 +41,7 @@ const { RendererIpcController } = require("./core/renderer_ipc");
 const { InboundPipeline } = require("./core/inbound_pipeline");
 const { OutboundPipeline } = require("./core/outbound_pipeline");
 const { ServerRuntime } = require("./core/server_runtime");
+const { HotReloadController, computeBridgeCodeDigest } = require("./core/hot_reload");
 
 const messageActions = require("./actions/message_actions");
 const contactActions = require("./actions/contact_actions");
@@ -83,6 +84,8 @@ class NtqqOneBotBridge extends EventEmitter {
   constructor(options = {}) {
     super();
     this._configDir = options.configDir;
+    this._explicitConfig = Boolean(options.config);
+    this._bridgeRootDir = __dirname;
     /** @type {BridgeConfig} */
     this.config = options.config || loadBridgeConfig(options.configDir);
     this.logger = new BridgeLogger({ getConfig: () => this.config });
@@ -155,6 +158,15 @@ class NtqqOneBotBridge extends EventEmitter {
     this.inboundPipeline = new InboundPipeline(hostRef);
     this.outboundPipeline = new OutboundPipeline(hostRef);
     this.serverRuntime = new ServerRuntime(hostRef);
+    this.hotReload = new HotReloadController(hostRef, (nextMap) => {
+      ACTION_DISPATCH_MAP.clear();
+      nextMap.forEach((fn, act) => ACTION_DISPATCH_MAP.set(act, fn));
+    });
+    this.richMediaStats = {
+      downloaded: 0, timedOut: 0, skippedByBudget: 0,
+      lastTimeout: null, lastError: null, recentErrors: [],
+    };
+    this._actionDispatchMap = ACTION_DISPATCH_MAP;
   }
 
   /**
@@ -188,14 +200,9 @@ class NtqqOneBotBridge extends EventEmitter {
     ]);
   }
 
-  flushTempCleanup() {
-    return this.tempCleanupQueue.flush();
-  }
+  flushTempCleanup() { return this.tempCleanupQueue.flush(); }
 
-  // --------------------------------------------------------------------------
   // Public Telemetry & Transport Accessors
-  // --------------------------------------------------------------------------
-
   get sendEchoStats() { return this.echoCorrelator.stats; }
   set sendEchoStats(v) { if (v && typeof v === "object") this.echoCorrelator.stats = v; }
   get mapHookRelease() { return this.ntCapture.mapHookRelease; }
@@ -212,13 +219,12 @@ class NtqqOneBotBridge extends EventEmitter {
   set webhookStats(v) { this.serverRuntime.webhookStats = v; }
   get listenErrors() { return this.serverRuntime.listenErrors; }
   set listenErrors(v) { this.serverRuntime.listenErrors = v; }
+  get reloadStats() { return this.hotReload.reloadStats; }
+  set reloadStats(v) { if (v && typeof v === "object") this.hotReload.reloadStats = v; }
   get wsClients() { return this.serverRuntime._wsServerClients; }
   get reverseWsClients() { return this.serverRuntime._reverseWsClients; }
 
-  // --------------------------------------------------------------------------
   // Public Lifecycle & Subsystem Entrypoints
-  // --------------------------------------------------------------------------
-
   /** @param {Record<string, any>} [opts] */
   simulateHumanSession(opts) { return this.sessionController.simulate(opts); }
   /** @param {Record<string, any>} [opts] */
@@ -247,11 +253,12 @@ class NtqqOneBotBridge extends EventEmitter {
   stopServers() { return this.serverRuntime.stopServers(); }
   /** @param {Record<string, any>} [options] */
   reloadConfig(options) { return this.serverRuntime.reloadConfig(options); }
+  /** @param {string | null} [customRootDir=null] */
+  getCodeDigestInfo(customRootDir = null) { return this.hotReload.getCodeDigestInfo(customRootDir); }
+  /** @param {Record<string, any>} [options={}] */
+  reloadBridge(options = {}) { return this.hotReload.reloadBridge(options); }
 
-  // --------------------------------------------------------------------------
   // Event Formatting & Broadcast
-  // --------------------------------------------------------------------------
-
   /**
    * @param {any} eventObj
    * @param {string} messageFormat
@@ -364,7 +371,9 @@ class NtqqOneBotBridge extends EventEmitter {
    * @param {ActionContext} [context={}]
    */
   async _dispatchAction(action, p, context = {}) {
-    const handler = ACTION_DISPATCH_MAP.get(action);
+    const dispatchMap =
+      this._actionDispatchMap instanceof Map ? this._actionDispatchMap : ACTION_DISPATCH_MAP;
+    const handler = dispatchMap.get(action);
     if (!handler) {
       if (action === "reload_config" && typeof this.reloadConfig === "function") {
         return await this.reloadConfig(p);
@@ -416,6 +425,7 @@ function installMainBridge(options = {}) {
     });
   }
   singletonBridge = bridge;
+  HotReloadController.installProcessSignalHandler(() => singletonBridge);
   return bridge;
 }
 
@@ -426,5 +436,5 @@ if (require.main !== module && !isAutoInstallDisabledFromEnv() && process.versio
 module.exports = {
   NtqqOneBotBridge, Rfc6455Connection, encodeWsFrame, connectReverseWebSocket,
   loadBridgeConfig, computeBkn, getNtqqVersionMetadata, buildNtqqUserAgent,
-  pruneTempDir, installMainBridge,
+  pruneTempDir, computeBridgeCodeDigest, installMainBridge,
 };

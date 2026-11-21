@@ -50,6 +50,37 @@ function _resolveMarketFaceUrl(marketFaceElement) {
 }
 
 /**
+ * Deep-clones an NTQQ element payload for `downloadRichMediaInVisit` while stripping
+ * internal transient (`__*`) bridge properties.
+ *
+ * @param {any} val
+ * @returns {any}
+ */
+function _cloneVisitMediaElem(val) {
+  if (val === null || val === undefined || typeof val !== "object") return val;
+  if (val instanceof Map) {
+    const m = new Map();
+    for (const [k, v] of val.entries()) {
+      m.set(_cloneVisitMediaElem(k), _cloneVisitMediaElem(v));
+    }
+    return m;
+  }
+  if (val instanceof Uint8Array) {
+    return Uint8Array.from(val);
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => _cloneVisitMediaElem(item));
+  }
+  /** @type {Record<string, any>} */
+  const out = {};
+  for (const [k, v] of Object.entries(val)) {
+    if (k.startsWith("__")) continue;
+    out[k] = _cloneVisitMediaElem(v);
+  }
+  return out;
+}
+
+/**
  * Returns the first positive integer UIN among `candidates`, or `0` if none match.
  *
  * @param {...any} candidates
@@ -521,11 +552,21 @@ class MessageIdStore {
           };
         const parentMsgId = String(ntMsg.msgId || entry?.msgId || "");
         const rootMsgId = String(entry?.rootMsgId || parentMsgId);
+        const fwdSenderUid = String(
+          entry?.forwardSenderUid ||
+            ntMsg.senderUid ||
+            entry?.senderUid ||
+            (Number(fwdPeer.chatType) === 1 && fwdPeer.peerUid && String(fwdPeer.peerUid) !== "0"
+              ? fwdPeer.peerUid
+              : "") ||
+            ""
+        );
         if (parentMsgId && fwdPeer.peerUid) {
           const fwdDesc = {
             oneBotId: resolvedOneBotId,
             shortId: resolvedOneBotId,
             peer: fwdPeer,
+            senderUid: fwdSenderUid,
             rootMsgId: rootMsgId || parentMsgId,
             parentMsgId,
             resId: String(fwd.resId || ""),
@@ -552,13 +593,47 @@ class MessageIdStore {
         continue;
       }
 
+      const inVisit = Boolean(entry?.inVisit);
+      const fwdPeerObj =
+        inVisit && entry?.forwardPeer?.peerUid && String(entry.forwardPeer.peerUid) !== "0"
+          ? entry.forwardPeer
+          : null;
+      const hasForwardPeer = Boolean(fwdPeerObj);
+      const hasMsgPeer = Boolean(ntMsg.peerUid && String(ntMsg.peerUid) !== "0");
+      const msgChatType = Number(
+        hasMsgPeer ? ntMsg.chatType || entry?.peer?.chatType || entry?.chatType || 0 : 0
+      );
+      const msgPeerUid = hasMsgPeer ? String(ntMsg.peerUid) : "";
+      const msgGuildId = hasMsgPeer ? String(ntMsg.guildId || entry?.peer?.guildId || "") : "";
+      const resolvedChatType = Number(
+        fwdPeerObj
+          ? fwdPeerObj.chatType || msgChatType || entry?.chatType || 0
+          : hasMsgPeer
+          ? msgChatType
+          : entry?.peer?.chatType || entry?.forwardPeer?.chatType || entry?.chatType || ntMsg.chatType || 0
+      );
+      const resolvedPeerUid = String(
+        fwdPeerObj
+          ? fwdPeerObj.peerUid
+          : hasMsgPeer
+          ? msgPeerUid
+          : entry?.peer?.peerUid || entry?.forwardPeer?.peerUid || entry?.peerUid || ""
+      );
+      const resolvedGuildId = String(
+        fwdPeerObj
+          ? fwdPeerObj.guildId || ""
+          : hasMsgPeer
+          ? msgGuildId
+          : entry?.peer?.guildId || entry?.forwardPeer?.guildId || ntMsg.guildId || ""
+      );
+
       const desc = {
         oneBotId: resolvedOneBotId,
         shortId: resolvedOneBotId,
         ntMsgId: String(ntMsg.msgId || ""),
         msgId: String(ntMsg.msgId || ""),
-        chatType: Number(ntMsg.chatType) || 0,
-        peerUid: String(ntMsg.peerUid || ""),
+        chatType: resolvedChatType,
+        peerUid: resolvedPeerUid,
         elementId: String(el.elementId || ""),
         elementType,
         md5: String(md5 || ""),
@@ -566,6 +641,36 @@ class MessageIdStore {
         fileName: String(fileName || ""),
         sourcePath: String(sourcePath || ""),
         url: String(url || ""),
+        ...(inVisit
+          ? {
+              inVisit: true,
+              guildId: resolvedGuildId,
+              forwardPeer: fwdPeerObj
+                ? {
+                    chatType: Number(fwdPeerObj.chatType || resolvedChatType || 1),
+                    peerUid: String(fwdPeerObj.peerUid),
+                    guildId: String(fwdPeerObj.guildId || ""),
+                  }
+                : null,
+              msgChatType,
+              msgPeerUid,
+              msgGuildId,
+              rootMsgId: String(entry?.rootMsgId || ""),
+              parentMsgId: String(entry?.parentMsgId || entry?.rootMsgId || ""),
+              forwardSenderUid: String(
+                entry?.forwardSenderUid ||
+                  (Number(entry?.forwardPeer?.chatType || resolvedChatType) === 1
+                    ? entry?.forwardPeer?.peerUid || resolvedPeerUid
+                    : "") ||
+                  ""
+              ),
+              senderUid: String(ntMsg.senderUid || entry?.senderUid || ""),
+              msgRandom: String(ntMsg.msgRandom || entry?.msgRandom || "0"),
+              msgSeq: String(ntMsg.msgSeq || entry?.msgSeq || "0"),
+              msgTime: String(ntMsg.msgTime || entry?.msgTime || "0"),
+              elem: _cloneVisitMediaElem(el),
+            }
+          : {}),
       };
 
       if (desc.fileUuid) {
@@ -586,7 +691,7 @@ class MessageIdStore {
       }
       if (desc.md5) {
         const md5Lower = desc.md5.toLowerCase();
-        for (const ext of [".jpg", ".png", ".gif", ".amr", ".silk"]) {
+        for (const ext of [".jpg", ".jpeg", ".png", ".gif", ".webp", ".amr", ".silk"]) {
           setKey(`${md5Lower}${ext}`, desc, true);
         }
       }
@@ -773,9 +878,14 @@ class MessageIdStore {
       }
       if (msgRandom && !existing.msgRandom) existing.msgRandom = msgRandom;
       if (extra.rootMsgId) existing.rootMsgId = String(extra.rootMsgId);
+      if (extra.parentMsgId) existing.parentMsgId = String(extra.parentMsgId);
       if (extra.forwardPeer && extra.forwardPeer.peerUid) {
         existing.forwardPeer = extra.forwardPeer;
       }
+      if (extra.forwardSenderUid) {
+        existing.forwardSenderUid = String(extra.forwardSenderUid);
+      }
+      if (extra.inVisit) existing.inVisit = true;
       if (extra.emojiLikesSnapshot !== undefined) {
         existing.emojiLikesSnapshot = extra.emojiLikesSnapshot;
       }
@@ -801,8 +911,11 @@ class MessageIdStore {
       oneBotId: shortId,
       msgId: msgIdStr || String(shortId),
       rootMsgId: String(extra.rootMsgId || msgIdStr || ""),
+      parentMsgId: String(extra.parentMsgId || extra.rootMsgId || msgIdStr || ""),
       forwardPeer:
         extra.forwardPeer && extra.forwardPeer.peerUid ? extra.forwardPeer : null,
+      forwardSenderUid: String(extra.forwardSenderUid || ""),
+      inVisit: Boolean(extra.inVisit),
       peer: normPeer,
       chatType: normPeer.chatType,
       peerUid: normPeer.peerUid,

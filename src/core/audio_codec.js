@@ -11,6 +11,8 @@ const {
   resolveFfmpegPathFromEnv,
   resolveSilkDecoderPathFromEnv,
   resolveSilkEncoderPathFromEnv,
+  resolveSilkAddonPathFromEnv,
+  resolveNodeBinaryFromEnv,
 } = require("./env");
 const {
   resolveMaxMediaBytes,
@@ -377,6 +379,201 @@ async function inspectAudioFile(filePath) {
   return { buf, info: inspectAudioBuffer(buf) };
 }
 
+const SILK_DIRECT_DECODE_FORMATS = new Set(["wav", "mp3", "ogg", "flac"]);
+const SILK_WORKER_RESULT_MARKER = "__ROSMONTIS_SILK_JSON__:";
+const SILK_WORKER_SCRIPT = [
+  '"use strict";',
+  "const cfg = JSON.parse(process.argv[1]);",
+  "let addon;",
+  "if (/\\.(?:c|m)?js$/i.test(cfg.addonPath)) {",
+  "  addon = require(cfg.addonPath);",
+  "} else {",
+  "  const mod = { exports: {} };",
+  "  process.dlopen(mod, cfg.addonPath);",
+  "  addon = mod.exports;",
+  "}",
+  "(async () => {",
+  '  if (cfg.op === "encode_silk") {',
+  "    await addon.convertToNTSilkTct(cfg.inputPath, cfg.outputPath);",
+  "    let durationSec = 0;",
+  '    if (typeof addon.getDuration === "function") {',
+  "      try { durationSec = Number(await addon.getDuration(cfg.inputPath)) || 0; } catch (_e) { durationSec = 0; }",
+  "    }",
+  `    process.stdout.write("\\n${SILK_WORKER_RESULT_MARKER}" + JSON.stringify({ ok: true, durationSec }) + "\\n");`,
+  '  } else if (cfg.op === "decode_silk") {',
+  "    await addon.decodeAudioToFmt(cfg.inputPath, cfg.outputPath, cfg.format);",
+  `    process.stdout.write("\\n${SILK_WORKER_RESULT_MARKER}" + JSON.stringify({ ok: true }) + "\\n");`,
+  "  } else {",
+  '    throw new Error("Unsupported SILK worker op: " + cfg.op);',
+  "  }",
+  "})().catch((err) => {",
+  "  process.stderr.write(String(err && err.stack ? err.stack : err));",
+  "  process.exit(1);",
+  "});",
+].join("\n");
+
+/**
+ * Execute an external native SILK v3 `.node` addon (or JS worker stub) inside an isolated
+ * Node child process so addon faults cannot affect the Electron main process.
+ * @param {string} addonPath
+ * @param {Record<string, any>} payload
+ * @param {Record<string, any>} [options]
+ * @returns {Promise<Record<string, any>>}
+ */
+function _execSilkAddonWorker(addonPath, payload, options = {}) {
+  const resolvedAddon = path.resolve(addonPath);
+  const nodeBin = resolveNodeBinaryFromEnv(options.nodeBinPath, resolvedAddon);
+  const timeoutMs = Math.max(2000, Number(options.transcodeTimeoutMs || 30000));
+  const workerArg = JSON.stringify({
+    ...payload,
+    addonPath: resolvedAddon,
+  });
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      nodeBin,
+      ["-e", SILK_WORKER_SCRIPT, workerArg],
+      {
+        timeout: timeoutMs,
+        windowsHide: true,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          /** @type {any} */ (err).stderr = stderr ? String(stderr).trim() : "";
+          /** @type {any} */ (err).stdout = stdout ? String(stdout).trim() : "";
+          reject(err);
+          return;
+        }
+        const outText = String(stdout || "");
+        const idx = outText.lastIndexOf(SILK_WORKER_RESULT_MARKER);
+        if (idx >= 0) {
+          const line = outText.slice(idx + SILK_WORKER_RESULT_MARKER.length).split(/\r?\n/)[0];
+          try {
+            resolve(JSON.parse(line));
+            return;
+          } catch (_parseErr) {
+            // Fall back to generic ok marker when worker wrote extra stdout after JSON.
+          }
+        }
+        resolve({ ok: true });
+      }
+    );
+  });
+}
+
+/**
+ * Transcode an input audio file to Tencent SILK v3 (`\x02#!SILK_V3`) via an optional
+ * external native SILK codec addon executed in an isolated Node worker process.
+ * @param {string} inputPath
+ * @param {Record<string, any>} [options]
+ */
+async function transcodeAudioToSilkV3(inputPath, options = {}) {
+  const addonPath = resolveSilkAddonPathFromEnv(options.silkAddonPath);
+  if (!addonPath || !fs.existsSync(addonPath)) {
+    /** @type {Error & { code?: string }} */
+    const missing = new Error("Native SILK v3 codec addon (ffmpegAddon) is not available");
+    missing.code = "ERR_SILK_ADDON_UNAVAILABLE";
+    throw missing;
+  }
+
+  const maxMediaBytes = resolveMaxMediaBytes(options);
+  const tempDir = resolveTempDirFromEnv(options.tempDir);
+  await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
+  const maxTempFiles = Math.max(8, Number(options.maxTempFiles || 128));
+
+  const resolvedInput = path.resolve(inputPath);
+  const tmpOut = path.join(
+    tempDir,
+    `ptt_silk_${process.pid}_${crypto.randomBytes(6).toString("hex")}.part.silk`
+  );
+
+  try {
+    const workerRes = await _execSilkAddonWorker(
+      addonPath,
+      {
+        op: "encode_silk",
+        inputPath: resolvedInput,
+        outputPath: tmpOut,
+      },
+      options
+    );
+
+    const rawOutBuf = await fs.promises.readFile(tmpOut);
+    await _unlinkTempSilent(tmpOut);
+
+    if (rawOutBuf.length === 0) {
+      throw new Error("SILK codec worker produced an empty output file");
+    }
+
+    const outBuf = _startsWithBytes(rawOutBuf, RAW_SILK_MAGIC)
+      ? Buffer.concat([Buffer.from([0x02]), rawOutBuf])
+      : rawOutBuf;
+
+    if (!_startsWithBytes(outBuf, TENCENT_SILK_MAGIC)) {
+      throw new Error(
+        `SILK codec output lacks Tencent SILK_V3 magic (${outBuf.subarray(0, 10).toString("hex")})`
+      );
+    }
+
+    if (outBuf.length > maxMediaBytes) {
+      /** @type {Error & { code?: string }} */
+      const err = new Error(
+        `Transcoded SILK v3 voice (${outBuf.length} bytes) exceeds maximum limit (${maxMediaBytes} bytes)`
+      );
+      err.code = "ERR_MEDIA_TOO_LARGE";
+      throw err;
+    }
+
+    const md5HexStr = crypto.createHash("md5").update(outBuf).digest("hex");
+    const fileName = `${md5HexStr}.amr`;
+    const finalPath = path.join(tempDir, fileName);
+    await writeTempMediaAtomically(finalPath, outBuf, false);
+    await pruneTempDirAsync(tempDir, maxTempFiles);
+
+    const info = inspectAudioBuffer(outBuf);
+    const durationSec =
+      info.durationSec > 0
+        ? info.durationSec
+        : Number(workerRes?.durationSec) > 0
+        ? Number(workerRes.durationSec)
+        : 0;
+    const duration =
+      info.duration || (durationSec > 0 ? Math.max(1, Math.round(durationSec)) : 3);
+
+    return {
+      localPath: finalPath,
+      fileName,
+      fileSize: outBuf.length,
+      md5HexStr,
+      format: "silk_tencent",
+      formatType: 1,
+      duration,
+      durationSec,
+      waveAmplitudes: info.waveAmplitudes,
+      isTempFile: true,
+    };
+  } catch (err) {
+    await _unlinkTempSilent(tmpOut);
+    if (err && (err.code === "ERR_MEDIA_TOO_LARGE" || err.code === "ERR_SILK_ADDON_UNAVAILABLE")) {
+      throw err;
+    }
+    const detected = options.detectedFormat
+      ? String(options.detectedFormat).toUpperCase()
+      : "non-SILK";
+    const detail =
+      err && err.code === "ENOENT"
+        ? "node worker binary not found"
+        : String(err?.stderr || err?.message || "unknown SILK transcode error");
+    /** @type {Error & { code?: string }} */
+    const wrapped = new Error(
+      `Failed to transcode ${detected} audio to Tencent SILK v3: ${detail}`
+    );
+    wrapped.code = "ERR_VOICE_TRANSCODE_FAILED";
+    throw wrapped;
+  }
+}
+
 function _execFfmpeg(ffmpegBin, args, timeoutMs = 30000) {
   const binStr = String(ffmpegBin || "");
   const isNodeScript = /\.(?:c|m)?js$/i.test(binStr);
@@ -685,7 +882,7 @@ async function prepareVoiceMedia(media, options = {}) {
   const maxMediaBytes = resolveMaxMediaBytes(options);
   const { buf, info } = await inspectAudioFile(media.localPath);
 
-  if (info.isNtNativeVoice) {
+  if (info.format === "silk_tencent") {
     return {
       localPath: media.localPath,
       fileName: media.fileName || `${media.md5HexStr}.amr`,
@@ -732,27 +929,84 @@ async function prepareVoiceMedia(media, options = {}) {
     };
   }
 
+  // Prefer native 24kHz Tencent SILK v3 (\x02#!SILK_V3) via isolated worker when configured
+  // so desktop NTQQ (AudioFoundation) and mobile QQ both play outbound voice natively.
+  const addonPath = resolveSilkAddonPathFromEnv(options.silkAddonPath);
+  /** @type {any} */
+  let silkErr = null;
+  if (addonPath && fs.existsSync(addonPath)) {
+    try {
+      const silkTranscoded = await transcodeAudioToSilkV3(media.localPath, {
+        ...options,
+        silkAddonPath: addonPath,
+        detectedFormat: info.format,
+      });
+      return {
+        localPath: silkTranscoded.localPath,
+        fileName: silkTranscoded.fileName,
+        fileSize: silkTranscoded.fileSize,
+        md5HexStr: silkTranscoded.md5HexStr,
+        format: silkTranscoded.format,
+        formatType: silkTranscoded.formatType,
+        duration: silkTranscoded.duration,
+        durationSec: silkTranscoded.durationSec,
+        waveAmplitudes: silkTranscoded.waveAmplitudes,
+        extraTempMedia: { localPath: silkTranscoded.localPath, isTempFile: true },
+      };
+    } catch (err) {
+      if (err && err.code === "ERR_MEDIA_TOO_LARGE") {
+        throw err;
+      }
+      silkErr = err;
+    }
+  }
+
+  // Fallback 1: if input is already AMR-NB (NT-native voice), pass through without re-encoding.
+  if (info.isNtNativeVoice) {
+    return {
+      localPath: media.localPath,
+      fileName: media.fileName || `${media.md5HexStr}.amr`,
+      fileSize: media.fileSize || buf.length,
+      md5HexStr: media.md5HexStr,
+      format: info.format,
+      formatType: 1,
+      duration: info.duration || 3,
+      durationSec: info.durationSec,
+      waveAmplitudes: info.waveAmplitudes,
+      extraTempMedia: null,
+    };
+  }
+
+  // Fallback 2: external SILK CLI encoder (if configured via ROSMONTIS_SILK_ENCODER_PATH).
   const silkEncoded = await _encodeSilkViaExternalCli(media.localPath, options);
   if (silkEncoded) {
     return silkEncoded;
   }
 
-  const transcoded = await transcodeAudioToAmrNb(media.localPath, {
-    ...options,
-    detectedFormat: info.format,
-  });
-  return {
-    localPath: transcoded.localPath,
-    fileName: transcoded.fileName,
-    fileSize: transcoded.fileSize,
-    md5HexStr: transcoded.md5HexStr,
-    format: transcoded.format,
-    formatType: transcoded.formatType,
-    duration: transcoded.duration,
-    durationSec: transcoded.durationSec,
-    waveAmplitudes: transcoded.waveAmplitudes,
-    extraTempMedia: { localPath: transcoded.localPath, isTempFile: true },
-  };
+  // Fallback 3: ffmpeg AMR-NB transcode.
+  try {
+    const transcoded = await transcodeAudioToAmrNb(media.localPath, {
+      ...options,
+      detectedFormat: info.format,
+    });
+    return {
+      localPath: transcoded.localPath,
+      fileName: transcoded.fileName,
+      fileSize: transcoded.fileSize,
+      md5HexStr: transcoded.md5HexStr,
+      format: transcoded.format,
+      formatType: transcoded.formatType,
+      duration: transcoded.duration,
+      durationSec: transcoded.durationSec,
+      waveAmplitudes: transcoded.waveAmplitudes,
+      extraTempMedia: { localPath: transcoded.localPath, isTempFile: true },
+    };
+  } catch (amrErr) {
+    if (silkErr && amrErr && amrErr.code === "ERR_VOICE_TRANSCODE_FAILED") {
+      amrErr.message = `${amrErr.message} (SILK worker also failed: ${silkErr.message})`;
+    }
+    throw amrErr;
+  }
 }
 
 async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
@@ -765,9 +1019,10 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
   }
 
   const spec = OUT_FORMAT_SPECS[normFmt];
+  let rawBuf;
   let info;
   try {
-    ({ info } = await inspectAudioFile(inputPath));
+    ({ buf: rawBuf, info } = await inspectAudioFile(inputPath));
   } catch (_) {
     return null;
   }
@@ -793,8 +1048,99 @@ async function transcodeRecordOutFormat(inputPath, rawOutFormat, options = {}) {
   let effectiveInputPath = path.resolve(inputPath);
   let decodedSilkWavTempPath = "";
 
-  // Decode SILK v3 via external SILK CLI if available; for wav output no ffmpeg is needed!
+  // Decode SILK v3 via isolated native addon worker (when configured) or external SILK CLI.
   if (info.format === "silk_tencent" || info.format === "silk_raw") {
+    const addonPath = resolveSilkAddonPathFromEnv(options.silkAddonPath);
+    if (addonPath && fs.existsSync(addonPath)) {
+      const addonTmpOut = path.join(
+        tempDir,
+        `rec_silk_out_${process.pid}_${crypto.randomBytes(6).toString("hex")}${spec.ext}`
+      );
+      let silkInputPath = path.resolve(inputPath);
+      let tmpPrefixedSilk = "";
+      let tmpMidWav = "";
+      try {
+        if (info.format === "silk_raw" && rawBuf) {
+          tmpPrefixedSilk = path.join(
+            tempDir,
+            `rec_silk_in_${process.pid}_${crypto.randomBytes(6).toString("hex")}.silk`
+          );
+          await fs.promises.writeFile(
+            tmpPrefixedSilk,
+            Buffer.concat([Buffer.from([0x02]), rawBuf]),
+            { mode: 0o600 }
+          );
+          silkInputPath = tmpPrefixedSilk;
+        }
+
+        if (SILK_DIRECT_DECODE_FORMATS.has(normFmt)) {
+          await _execSilkAddonWorker(
+            addonPath,
+            {
+              op: "decode_silk",
+              inputPath: silkInputPath,
+              outputPath: addonTmpOut,
+              format: normFmt,
+            },
+            options
+          );
+        } else {
+          tmpMidWav = path.join(
+            tempDir,
+            `rec_silk_mid_${process.pid}_${crypto.randomBytes(6).toString("hex")}.wav`
+          );
+          await _execSilkAddonWorker(
+            addonPath,
+            {
+              op: "decode_silk",
+              inputPath: silkInputPath,
+              outputPath: tmpMidWav,
+              format: "wav",
+            },
+            options
+          );
+          await _execFfmpeg(
+            ffmpegBin,
+            [
+              "-nostdin",
+              "-hide_banner",
+              "-loglevel",
+              "error",
+              "-y",
+              "-i",
+              tmpMidWav,
+              ...spec.args,
+              addonTmpOut,
+            ],
+            timeoutMs
+          );
+        }
+
+        const outBuf = await fs.promises.readFile(addonTmpOut);
+        if (outBuf.length > 0 && outBuf.length <= maxMediaBytes) {
+          const md5HexStr = crypto.createHash("md5").update(outBuf).digest("hex");
+          const fileName = `${md5HexStr}${spec.ext}`;
+          const finalPath = path.join(tempDir, fileName);
+          await writeTempMediaAtomically(finalPath, outBuf, false);
+          await pruneTempDirAsync(tempDir, maxTempFiles);
+          return {
+            localPath: finalPath,
+            fileName,
+            fileSize: outBuf.length,
+            md5HexStr,
+            isTempFile: true,
+          };
+        }
+      } catch (workerErr) {
+        // Native SILK worker failed; fall through to external SILK CLI decoder below.
+        options?.logger?.debug?.("audio_codec.decodeSilkWorker", workerErr);
+      } finally {
+        await _unlinkTempSilent(addonTmpOut);
+        if (tmpPrefixedSilk) await _unlinkTempSilent(tmpPrefixedSilk);
+        if (tmpMidWav) await _unlinkTempSilent(tmpMidWav);
+      }
+    }
+
     const wavBuf = await _decodeSilkViaExternalCli(inputPath, info.format, options);
     if (!wavBuf) {
       return null;
@@ -879,6 +1225,7 @@ module.exports = {
   wrapPcmS16leToWavBuffer,
   inspectAudioBuffer,
   inspectAudioFile,
+  transcodeAudioToSilkV3,
   transcodeAudioToAmrNb,
   prepareVoiceMedia,
   transcodeRecordOutFormat,

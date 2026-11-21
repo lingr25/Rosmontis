@@ -513,6 +513,8 @@ class OutboundPipeline {
       prepareNtVideoPath: this._prepareNtVideoPath.bind(this),
       ffmpegPath: this.config?.ffmpegPath,
       silkEncoderPath: this.config?.silkEncoderPath,
+      silkAddonPath: this.config?.silkAddonPath,
+      nodeBinPath: this.config?.nodeBinPath,
       ...this._mediaSecurityOptions(),
     });
 

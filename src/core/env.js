@@ -1,6 +1,7 @@
 // @ts-check
 "use strict";
 
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
@@ -218,6 +219,111 @@ function resolveSilkEncoderPathFromEnv(explicitPath) {
   return pickPrefixedEnv("SILK_ENCODER_PATH", ["SILK_ENCODER_PATH"]) || "";
 }
 
+/**
+ * @param {any} raw
+ * @returns {boolean}
+ */
+function _isDisabledPathSentinel(raw) {
+  return /^(?:none|off|false|0|disabled)$/i.test(String(raw || "").trim());
+}
+
+/**
+ * Resolve an optional external native SILK v3 `.node` addon (loaded strictly inside
+ * an isolated Node child worker process, never inside the Electron main process).
+ * @param {string | false | null} [explicitAddonPath]
+ * @returns {string}
+ */
+function resolveSilkAddonPathFromEnv(explicitAddonPath) {
+  if (explicitAddonPath === false || explicitAddonPath === null) {
+    return "";
+  }
+  if (typeof explicitAddonPath === "string") {
+    const trimmed = explicitAddonPath.trim();
+    if (!trimmed || _isDisabledPathSentinel(trimmed)) {
+      return "";
+    }
+    return trimmed;
+  }
+
+  const envAddon = pickPrefixedEnv("SILK_ADDON_PATH", ["FFMPEG_ADDON_PATH"]);
+  if (envAddon) {
+    return _isDisabledPathSentinel(envAddon) ? "" : envAddon;
+  }
+
+  const fileName = `ffmpegAddon.${process.platform}.${process.arch}.node`;
+  const candidates = [
+    path.join("/app/runtime/native/ffmpeg", fileName),
+    path.join(getHomeDir(), "runtime", "native", "ffmpeg", fileName),
+    path.resolve(__dirname, "..", "native", "ffmpeg", fileName),
+    path.resolve(process.cwd(), "native", "ffmpeg", fileName),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate && fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch (_) {
+      // Candidate path may be inaccessible in restricted containers; probe next location.
+    }
+  }
+  return "";
+}
+
+/**
+ * Resolve a standalone `node` executable for running isolated worker child processes
+ * (important when running inside Electron where `process.execPath` is the QQ binary).
+ * @param {string} [explicitNodePath]
+ * @param {string} [addonPath]
+ * @returns {string}
+ */
+function resolveNodeBinaryFromEnv(explicitNodePath, addonPath = "") {
+  if (typeof explicitNodePath === "string" && explicitNodePath.trim() !== "") {
+    return explicitNodePath.trim();
+  }
+  const envNode = pickPrefixedEnv("NODE_BIN", ["NODE_BIN"]);
+  if (envNode) {
+    return envNode;
+  }
+
+  const isElectronRuntime = Boolean(
+    typeof process !== "undefined" && process && process.versions && process.versions.electron
+  );
+  if (
+    !isElectronRuntime &&
+    typeof process?.execPath === "string" &&
+    /^node(?:\.exe)?$/i.test(path.basename(process.execPath))
+  ) {
+    return process.execPath;
+  }
+
+  if (typeof addonPath === "string" && addonPath.trim() !== "") {
+    const nodeExe = process.platform === "win32" ? "node.exe" : "node";
+    const bundledNode = path.resolve(path.dirname(addonPath), "..", "..", nodeExe);
+    try {
+      if (fs.existsSync(bundledNode)) {
+        return bundledNode;
+      }
+    } catch (_) {
+      // Ignore permission/stat errors while probing optional bundled node binary.
+    }
+  }
+
+  if (process.platform !== "win32") {
+    for (const posixNode of ["/usr/local/bin/node", "/usr/bin/node"]) {
+      try {
+        if (fs.existsSync(posixNode)) {
+          return posixNode;
+        }
+      } catch (_) {
+        // Probe next standard POSIX node path.
+      }
+    }
+  }
+
+  return "node";
+}
+
 function resolveStateDirFromEnv(explicitStateDir) {
   if (typeof explicitStateDir === "string" && explicitStateDir.trim() !== "") {
     return explicitStateDir.trim();
@@ -262,6 +368,8 @@ module.exports = {
   resolveFfmpegPathFromEnv,
   resolveSilkDecoderPathFromEnv,
   resolveSilkEncoderPathFromEnv,
+  resolveSilkAddonPathFromEnv,
+  resolveNodeBinaryFromEnv,
   resolveStateDirFromEnv,
   resolveConfigDirsFromEnv,
 };
