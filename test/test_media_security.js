@@ -955,8 +955,9 @@ async function runMediaSecurityTests() {
         },
       });
 
-      const origDownloadElement = bridge._downloadRichMediaElement.bind(bridge);
-      bridge._downloadRichMediaElement = async (opts) => {
+      const origDownloadElement =
+        bridge.inboundPipeline._downloadRichMediaElement.bind(bridge.inboundPipeline);
+      bridge.inboundPipeline._downloadRichMediaElement = async (opts) => {
         downloadElementCalls.push(opts);
         return origDownloadElement(opts);
       };

@@ -18,6 +18,10 @@ const { resolveTempDirFromEnv } = require("../core/env");
 const { pruneTempDirAsync } = require("../core/media_security");
 const { createActionRouter } = require("../core/primitives");
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {any} rawMsgId
+ */
 function resolveMessageEntry(bridge, rawMsgId) {
   const store = bridge?.messageIdStore;
   if (!store || rawMsgId === undefined || rawMsgId === null || rawMsgId === "") {
@@ -46,15 +50,19 @@ async function statNonEmptyFile(candidatePath) {
   return null;
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {any} media
+ */
 function trackActionTempMedia(bridge, media) {
   if (!media || !media.isTempFile || !media.localPath) return;
   if (typeof bridge.tempFileCleaner?.track === "function") {
     bridge.tempFileCleaner.track(media.localPath);
   } else if (
     !bridge.config?.cleanupTempImmediately &&
-    typeof bridge._scheduleMediaCleanup === "function"
+    typeof bridge.tempCleanupQueue?.scheduleMedia === "function"
   ) {
-    bridge._scheduleMediaCleanup(media);
+    bridge.tempCleanupQueue.scheduleMedia(media);
   }
 }
 
@@ -200,6 +208,10 @@ function sanitizeDownloadFileName(rawName, fallback = "file") {
   return cleaned || fallback;
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string} [preferredName="file"]
+ */
 async function allocateTempDownloadPath(bridge, preferredName = "file") {
   const tempDir = resolveTempDirFromEnv(bridge?.config?.tempDir);
   await fs.promises.mkdir(tempDir, { recursive: true, mode: 0o700 });
@@ -211,6 +223,12 @@ async function allocateTempDownloadPath(bridge, preferredName = "file") {
   return { tempDir, filePath };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string | number} groupId
+ * @param {string} fileId
+ * @param {any} [rawBusId]
+ */
 async function resolveGroupFileMeta(bridge, groupId, fileId, rawBusId) {
   const explicitBus =
     rawBusId !== undefined &&
@@ -220,6 +238,7 @@ async function resolveGroupFileMeta(bridge, groupId, fileId, rawBusId) {
     Number(rawBusId) > 0
       ? Number(rawBusId)
       : 0;
+  /** @type {Record<string, any> | null} */
   let fileInfo = null;
   if (groupId && fileId) {
     try {
@@ -238,22 +257,29 @@ async function resolveGroupFileMeta(bridge, groupId, fileId, rawBusId) {
       bridge?.logger?.debug?.("file_actions", err);
     }
   }
-  const busId =
-    explicitBus ||
-    (Number(fileInfo?.busId || fileInfo?.busid || 0) > 0
-      ? Number(fileInfo.busId || fileInfo.busid)
-      : 102);
+  const candidateBus = Number(fileInfo?.busId || fileInfo?.busid || 0);
+  const busId = explicitBus || (candidateBus > 0 ? candidateBus : 102);
   return { busId, fileInfo };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string} targetPath
+ * @param {string[]} [extraKeys]
+ * @param {number} [timeoutMs]
+ */
 async function waitRichMediaTargetFile(bridge, targetPath, extraKeys = [], timeoutMs = 8000) {
   const effectiveTimeout = Math.max(50, Number(timeoutMs) || 8000);
-  if (!bridge._richMediaWaiters) {
-    bridge._richMediaWaiters = new Map();
+  if (!bridge.inboundPipeline._richMediaWaiters) {
+    bridge.inboundPipeline._richMediaWaiters = new Map();
   }
+  const richMediaWaiters = bridge.inboundPipeline._richMediaWaiters;
   const waitKeys = [targetPath, ...extraKeys].map((k) => String(k || "")).filter(Boolean);
+  /** @type {NodeJS.Timeout | null} */
   let timer = null;
+  /** @type {NodeJS.Timeout | null} */
   let pollTimer = null;
+  /** @type {{ msgId: string, elementId: string, targetPath: any, resolve: (downloadedPath: any) => void } | null} */
   let waiterEntry = null;
   let settled = false;
 
@@ -266,17 +292,18 @@ async function waitRichMediaTargetFile(bridge, targetPath, extraKeys = [], timeo
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    if (waiterEntry && bridge._richMediaWaiters) {
+    if (waiterEntry && richMediaWaiters) {
       for (const k of waitKeys) {
-        const set = bridge._richMediaWaiters.get(k);
+        const set = richMediaWaiters.get(k);
         if (set) {
           set.delete(waiterEntry);
-          if (set.size === 0) bridge._richMediaWaiters.delete(k);
+          if (set.size === 0) richMediaWaiters.delete(k);
         }
       }
     }
   };
 
+  /** @type {((candidate: any) => void) | null} */
   let finishRef = null;
   const promise = new Promise((resolve) => {
     let polling = false;
@@ -287,20 +314,23 @@ async function waitRichMediaTargetFile(bridge, targetPath, extraKeys = [], timeo
       resolve(String(candidate || targetPath || ""));
     };
     finishRef = finish;
-    waiterEntry = {
+    const entry = {
       msgId: "",
       elementId: "0",
       targetPath,
       resolve: (downloadedPath) => finish(downloadedPath || targetPath),
     };
+    waiterEntry = entry;
     for (const k of waitKeys) {
-      if (!bridge._richMediaWaiters.has(k)) {
-        bridge._richMediaWaiters.set(k, new Set());
+      let waiterSet = richMediaWaiters.get(k);
+      if (!waiterSet) {
+        waiterSet = new Set();
+        richMediaWaiters.set(k, waiterSet);
       }
-      bridge._richMediaWaiters.get(k).add(waiterEntry);
+      waiterSet.add(entry);
     }
     if (targetPath) {
-      pollTimer = setInterval(async () => {
+      const pTimer = setInterval(async () => {
         if (polling || settled) return;
         polling = true;
         try {
@@ -310,20 +340,24 @@ async function waitRichMediaTargetFile(bridge, targetPath, extraKeys = [], timeo
           polling = false;
         }
       }, 150);
-      pollTimer.unref?.();
+      pTimer.unref?.();
+      pollTimer = pTimer;
     }
-    timer = setTimeout(() => finish(targetPath), effectiveTimeout);
-    timer.unref?.();
+    const t = setTimeout(() => finish(targetPath), effectiveTimeout);
+    t.unref?.();
+    timer = t;
   });
 
   return {
     promise,
-    cancel: () => finishRef && finishRef(""),
+    cancel: () => {
+      if (finishRef) finishRef("");
+    },
   };
 }
 
 /**
- * @param {any} bridge
+ * @param {import("../types").BridgeHost} bridge
  * @param {string | number} groupId
  * @param {string} fileId
  * @param {Record<string, any>} [options]
@@ -407,7 +441,7 @@ async function downloadGroupFileToLocal(bridge, groupId, fileId, options = {}) {
 }
 
 /**
- * @param {any} bridge
+ * @param {import("../types").BridgeHost} bridge
  * @param {string | number} groupId
  * @param {string} folderId
  * @param {Record<string, any>} [options]
@@ -478,6 +512,11 @@ function inspectMsgFileElement(msg) {
   return { fileElement, fileUuid };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {any} peer
+ * @param {any} sent
+ */
 async function extractUploadedFileUuid(bridge, peer, sent) {
   const entry = resolveMessageEntry(bridge, sent.message_id);
   let { fileElement: storeFileEl, fileUuid } = inspectMsgFileElement(entry?.rawMsg);
@@ -572,7 +611,7 @@ async function extractUploadedFileUuid(bridge, peer, sent) {
 // Declarative File Action Handlers & Aliases
 // ============================================================================
 
-/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
+/** @type {Record<string, import("../types").BridgeActionHandler>} */
 const ACTION_HANDLERS = {
   async get_group_root_files(p) {
     return await listGroupFiles(this, Number(p.group_id || 0), "/", {
@@ -626,7 +665,7 @@ const ACTION_HANDLERS = {
       !/^(sent_|fwd_|echo_timeout_)/.test(String(mediaDesc.ntMsgId)) &&
       mediaDesc.peerUid &&
       mediaDesc.elementId &&
-      typeof this._downloadRichMediaElement === "function"
+      typeof this.inboundPipeline?._downloadRichMediaElement === "function"
     ) {
       try {
         const { tempDir, filePath: fallbackSavePath } = await allocateTempDownloadPath(
@@ -636,7 +675,7 @@ const ACTION_HANDLERS = {
         const targetPath = mediaDesc.sourcePath
           ? String(mediaDesc.sourcePath)
           : fallbackSavePath;
-        const dlPath = await this._downloadRichMediaElement({
+        const dlPath = await this.inboundPipeline._downloadRichMediaElement({
           msgId: String(mediaDesc.ntMsgId),
           chatType: Number(mediaDesc.chatType || 2),
           peerUid: String(mediaDesc.peerUid),
@@ -676,6 +715,7 @@ const ACTION_HANDLERS = {
     const fileHash = String(p.file_hash || "").trim().toLowerCase();
     const userId = String(p.user_id || "").trim();
 
+    /** @type {Record<string, any> | null} */
     let mediaDesc = null;
     if (p.msg_id || p.message_id) {
       const entry = resolveMessageEntry(this, p.msg_id || p.message_id);
@@ -697,7 +737,7 @@ const ACTION_HANDLERS = {
 
     if (!mediaDesc && userId) {
       try {
-        const peer = await this._resolvePeerForUser(userId);
+        const peer = await this.outboundPipeline._resolvePeerForUser(userId);
         if (peer?.peerUid) {
           const histRes = await this.invokeNt(
             "nodeIKernelMsgService/getMsgsIncludeSelf",
@@ -755,9 +795,9 @@ const ACTION_HANDLERS = {
     const timeoutMs = Number(this.config?.richMediaDownloadTimeoutMs) || 8000;
 
     let candidatePath = "";
-    if (typeof this._downloadRichMediaElement === "function") {
+    if (typeof this.inboundPipeline?._downloadRichMediaElement === "function") {
       try {
-        candidatePath = await this._downloadRichMediaElement({
+        candidatePath = await this.inboundPipeline._downloadRichMediaElement({
           msgId: ntMsgId,
           chatType: Number(mediaDesc.chatType || 1),
           peerUid,
@@ -817,7 +857,7 @@ const ACTION_HANDLERS = {
     const groupIdStr = String(groupId);
     const folder = String(p.folder || p.folder_id || "/").trim();
     const peer = { chatType: 2, peerUid: groupIdStr, guildId: "" };
-    const sent = await this._sendMessageToPeer(peer, [
+    const sent = await this.outboundPipeline._sendMessageToPeer(peer, [
       {
         type: "file",
         data: {
@@ -830,6 +870,7 @@ const ACTION_HANDLERS = {
     const fileUuid = await extractUploadedFileUuid(this, peer, sent);
     if (folder && folder !== "/" && fileUuid) {
       const retryBackoffs = [120, 250];
+      /** @type {any} */
       let lastMoveErr = null;
       for (let attempt = 0; attempt <= retryBackoffs.length; attempt += 1) {
         if (attempt > 0) {
@@ -898,8 +939,8 @@ const ACTION_HANDLERS = {
   },
 
   async upload_private_file(p) {
-    const peer = await this._resolvePeerForUser(p.user_id);
-    const sent = await this._sendMessageToPeer(peer, [
+    const peer = await this.outboundPipeline._resolvePeerForUser(p.user_id);
+    const sent = await this.outboundPipeline._sendMessageToPeer(peer, [
       {
         type: "file",
         data: {

@@ -24,6 +24,10 @@ const {
 } = require("./echo_correlator");
 const { OutboundRateLimiter } = require("./rate_limiter");
 
+/** @typedef {import("../types").BridgeHost} BridgeHost */
+/** @typedef {import("../types").BridgeConfig} BridgeConfig */
+/** @typedef {import("../types").RateLimitConfig} RateLimitConfig */
+
 const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
 
 /** @type {any} */
@@ -76,66 +80,55 @@ function isBridgeUnavailableError(err) {
   return Boolean(err && (err.code === BRIDGE_UNAVAILABLE_TAG || err[BRIDGE_UNAVAILABLE_TAG]));
 }
 
-const LEGACY_OUTBOUND_CTRL_SYM = Symbol("rosmontisLegacyOutboundPipeline");
-const LEGACY_OUTBOUND_STATE_KEYS = Object.freeze([
-  "rateLimiter",
-  "_rateLimiterConfigRef",
-]);
-
 /**
  * Composed outbound message staging, rate-limiting & send/echo pipeline.
  */
 class OutboundPipeline {
   /**
-   * @param {any} [bridge]
+   * @param {BridgeHost | Partial<BridgeHost>} [bridge={}]
    */
   constructor(bridge = {}) {
-    /** @type {any} */
-    this.bridge = bridge || {};
-    /** @type {any} */
+    /** @type {BridgeHost} */
+    this.bridge = /** @type {BridgeHost} */ (bridge || {});
+    /** @type {InstanceType<typeof OutboundRateLimiter> | null} */
     this.rateLimiter = Object.prototype.hasOwnProperty.call(this.bridge, "rateLimiter")
-      ? this.bridge.rateLimiter
+      ? this.bridge.rateLimiter ?? null
       : null;
-    /** @type {any} */
-    this._rateLimiterConfigRef = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_rateLimiterConfigRef"
-    )
-      ? this.bridge._rateLimiterConfigRef
-      : undefined;
+    /** @type {RateLimitConfig | undefined} */
+    this._rateLimiterConfigRef = undefined;
   }
 
-  /** @returns {any} */
+  /** @returns {BridgeConfig | undefined} */
   get config() {
     return this.bridge.config;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("./primitives").BridgeLogger> | undefined} */
   get logger() {
     return this.bridge.logger;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("../onebot/stores").MessageIdStore>} */
   get messageIdStore() {
     return this.bridge.messageIdStore;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("../onebot/stores").UinUidStore>} */
   get uinUidStore() {
     return this.bridge.uinUidStore;
   }
 
   /** @returns {string} */
   get selfUin() {
-    return this.bridge.selfUin;
+    return this.bridge.selfUin || "";
   }
 
   /** @returns {string} */
   get selfUid() {
-    return this.bridge.selfUid;
+    return this.bridge.selfUid || "";
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof OutboundRateLimiter>} */
   _ensureRateLimiter() {
     const cfgRef = this.config?.rateLimit;
     if (!this.rateLimiter) {
@@ -179,22 +172,13 @@ class OutboundPipeline {
   _ensureEchoCorrelator() {
     const b = this.bridge;
     if (!b.echoCorrelator) {
+      const ctor = /** @type {any} */ (b?.constructor);
       b.echoCorrelator = new EchoCorrelator({
         getSignatureFns: () => ({
-          _ntElementsSignature: b?.constructor?._ntElementsSignature,
-          _elementsSignatureMatch: b?.constructor?._elementsSignatureMatch,
+          _ntElementsSignature: ctor?._ntElementsSignature || _ntElementsSignature,
+          _elementsSignatureMatch: ctor?._elementsSignatureMatch || _elementsSignatureMatch,
         }),
       });
-      if (b._sendEchoWaiters instanceof Map) {
-        b.echoCorrelator.waiters = b._sendEchoWaiters;
-      } else {
-        b._sendEchoWaiters = b.echoCorrelator.waiters;
-      }
-      if (b.sendEchoStats && typeof b.sendEchoStats === "object") {
-        b.echoCorrelator.stats = b.sendEchoStats;
-      } else {
-        b.sendEchoStats = b.echoCorrelator.stats;
-      }
     }
     return b.echoCorrelator;
   }
@@ -515,7 +499,7 @@ class OutboundPipeline {
   async _sendMessageToPeer(peer, message, autoEscape = false, groupId = undefined, options = {}) {
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
     this._enforceOutboundRateLimit(peerKey);
-    this.bridge._sessionScheduler?.cancelPeerReaction?.(peerKey);
+    this.bridge.sessionController?.scheduler.cancelPeerReaction(peerKey);
 
     // Phase 1 (unlocked): concurrent heavy I/O (HTTP media download, EXIF normalize, @UIN->UID)
     const { elements, sideEffects, cleanupCallbacks } = await oneBotSegmentsToNtElements(message, {
@@ -534,11 +518,18 @@ class OutboundPipeline {
 
     try {
       // Phase 2 (AIO-mutex serialized): activate target AIO + dispatch sendMsg IPC, then release immediately
-      const { echoWaiter, sendRes } = await this.bridge._withAioLock(
+      const runWithLock = this.bridge.sessionController
+        ? this.bridge.sessionController.withLock.bind(this.bridge.sessionController)
+        : (/** @type {() => Promise<any>} */ fn) => fn();
+      const { echoWaiter, sendRes } = await runWithLock(
         async () => {
-          this.bridge._sessionScheduler?.cancelPeerReaction?.(peerKey);
-          if (this.config?.humanSimulation !== false && !options.skipHumanSimulation) {
-            await this.bridge._activateSessionUnlocked({
+          this.bridge.sessionController?.scheduler.cancelPeerReaction(peerKey);
+          if (
+            this.config?.humanSimulation !== false &&
+            !options.skipHumanSimulation &&
+            this.bridge.sessionController
+          ) {
+            await this.bridge.sessionController.activateUnlocked({
               chatType: peer.chatType,
               peerUid: peer.peerUid,
               guildId: peer.guildId || "",
@@ -574,7 +565,7 @@ class OutboundPipeline {
               ["0", peer, elements, new Map()]
             );
             if (this.config?.humanSimulation !== false && !options.skipHumanSimulation) {
-              this.bridge._touchAioActivity?.();
+              this.bridge.sessionController?.touchActivity();
             }
             return { echoWaiter: waiter, sendRes: res };
           } catch (err) {
@@ -619,11 +610,7 @@ class OutboundPipeline {
           const peerKeyStr = this._sendPeerKey(peer);
           const warnKey = `send-echo-timeout:${peerKeyStr}`;
           const warnMsg = `sendMsg to ${peerKeyStr} succeeded but no onAddSendMsg echo arrived within ${echoTimeoutMs}ms; message_id will not be recallable`;
-          if (typeof this.bridge._logWarn === "function") {
-            this.bridge._logWarn(warnKey, warnMsg);
-          } else {
-            this.logger?.warnThrottled?.(warnKey, warnMsg, 60000);
-          }
+          this.logger?.warnThrottled?.(warnKey, warnMsg, 60000);
         }
       }
       if (!realMsgId) {
@@ -643,7 +630,10 @@ class OutboundPipeline {
 
       return { message_id: shortId, real_id: realMsgId };
     } finally {
-      this.bridge._scheduleTempCleanup?.(cleanupCallbacks, Boolean(options.cleanupTempImmediately));
+      this.bridge.tempCleanupQueue?.schedule(
+        cleanupCallbacks,
+        Boolean(options.cleanupTempImmediately)
+      );
     }
   }
 
@@ -656,9 +646,10 @@ class OutboundPipeline {
   async _invokeForwardWithEcho(peer, invokeFn, fallbackSeed = "") {
     const peerKey = `${peer?.chatType || 0}:${peer?.peerUid || ""}:${peer?.guildId || ""}`;
     this._enforceOutboundRateLimit(peerKey);
+    const fwdTimeoutCfg = Number(this.config?.forwardEchoTimeoutMs);
     const timeoutMs =
-      Number(this.config?.forwardEchoTimeoutMs) > 0
-        ? Number(this.config.forwardEchoTimeoutMs)
+      fwdTimeoutCfg > 0
+        ? fwdTimeoutCfg
         : Math.min(Math.max(50, Number(this.config?.sendEchoTimeoutMs) || 200), 200);
     const echoWaiter = this._registerSendEchoWaiter(
       peer,
@@ -735,8 +726,8 @@ class OutboundPipeline {
     let targetUin = /^\d+$/.test(rawUserStr) ? Number(rawUserStr) : 0;
     if (!targetUin && rawUserStr && this.uinUidStore) {
       targetUin = Number(this.uinUidStore.getUinSync(rawUserStr) || 0);
-      if (!targetUin && typeof this.bridge._ensureUinForUid === "function") {
-        targetUin = Number((await this.bridge._ensureUinForUid(rawUserStr)) || 0);
+      if (!targetUin && this.bridge.inboundPipeline) {
+        targetUin = Number((await this.bridge.inboundPipeline._ensureUinForUid(rawUserStr)) || 0);
       }
     }
     const targetGroup = groupId ? Number(groupId) : 0;
@@ -825,77 +816,8 @@ class OutboundPipeline {
   }
 }
 
-/**
- * Resolves or lazily binds an `OutboundPipeline` for legacy `outboundPipelineMixin` hosts.
- * @param {any} host
- * @returns {OutboundPipeline}
- */
-function _resolveLegacyOutboundPipeline(host) {
-  if (host instanceof OutboundPipeline) return host;
-  if (host && host.outboundPipeline instanceof OutboundPipeline) return host.outboundPipeline;
-  if (host && host[LEGACY_OUTBOUND_CTRL_SYM] instanceof OutboundPipeline) {
-    return host[LEGACY_OUTBOUND_CTRL_SYM];
-  }
-  const ctrl = new OutboundPipeline(host);
-  if (host && typeof host === "object") {
-    Object.defineProperty(host, LEGACY_OUTBOUND_CTRL_SYM, {
-      value: ctrl,
-      enumerable: false,
-      configurable: true,
-    });
-    for (const key of LEGACY_OUTBOUND_STATE_KEYS) {
-      const desc = Object.getOwnPropertyDescriptor(host, key);
-      if (!desc || ("value" in desc && desc.configurable !== false)) {
-        Object.defineProperty(host, key, {
-          enumerable: true,
-          configurable: true,
-          get() {
-            return /** @type {any} */ (ctrl)[key];
-          },
-          set(val) {
-            /** @type {any} */ (ctrl)[key] = val;
-          },
-        });
-      }
-    }
-  }
-  return ctrl;
-}
-
-const OUTBOUND_PIPELINE_METHODS = /** @type {const} */ ([
-  "_ensureRateLimiter",
-  "_enforceOutboundRateLimit",
-  "_ensureEchoCorrelator",
-  "_resolvePeerForUser",
-  "_prepareNtImagePath",
-  "_prepareNtRecordPath",
-  "_prepareNtVideoPath",
-  "_sendPeerKey",
-  "_registerSendEchoWaiter",
-  "_matchSendEcho",
-  "_hasRichMediaElements",
-  "_computeSendEchoTimeoutMs",
-  "_mediaSecurityOptions",
-  "_sendMessageToPeer",
-  "_invokeForwardWithEcho",
-  "_sendPokeInternal",
-]);
-
-/**
- * Backward-compatible mixin facade delegating to `OutboundPipeline`.
- * @type {Record<string, (...args: any[]) => any>}
- */
-const outboundPipelineMixin = {};
-for (const methodName of OUTBOUND_PIPELINE_METHODS) {
-  outboundPipelineMixin[methodName] = function (/** @type {any[]} */ ...args) {
-    const ctrl = _resolveLegacyOutboundPipeline(this);
-    return /** @type {any} */ (ctrl)[methodName](...args);
-  };
-}
-
 module.exports = {
   OutboundPipeline,
-  outboundPipelineMixin,
   _ntElementsSignature,
   _elementsSignatureMatch,
   BRIDGE_UNAVAILABLE_TAG,

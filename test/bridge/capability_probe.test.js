@@ -513,12 +513,12 @@ test("get_login_qrcode waits for async onQRCodeGetPicture and Tier 1 void RPC do
 
   // Simulate Tier 1 renderer IPC resolving void (undefined) for both setAutoLogin and getQRCodePicture
   const tier1Calls = [];
-  bridge._canInvokeRenderer = () => true;
-  bridge._invokeRendererCommand = async (_type, cmdPayload) => {
+  bridge.rendererIpc._canInvokeRenderer = () => true;
+  bridge.rendererIpc._invokeRendererCommand = async (_type, cmdPayload) => {
     tier1Calls.push(cmdPayload.cmd);
     if (cmdPayload.cmd === "nodeIKernelLoginService/getQRCodePicture") {
       setTimeout(() => {
-        bridge._handleKernelEvent("nodeIKernelLoginListener", "onQRCodeGetPicture", [
+        bridge.inboundPipeline._handleKernelEvent("nodeIKernelLoginListener", "onQRCodeGetPicture", [
           { pngBase64QrcodeData: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" },
         ]);
       }, 20);
@@ -540,10 +540,10 @@ test("get_login_qrcode waits for async onQRCodeGetPicture and Tier 1 void RPC do
 
   // QQ 3.2.34+ nests QR data inside qrcodeInfo (and get_login_qrcode must resolve fast even if RPC callback stalls)
   bridge.lastQrCodeBase64 = "";
-  bridge._invokeRendererCommand = async () =>
+  bridge.rendererIpc._invokeRendererCommand = async () =>
     new Promise((resolve) => {
       setTimeout(() => {
-        bridge._handleKernelEvent("nodeIKernelLoginListener", "onQRCodeGetPicture", [
+        bridge.inboundPipeline._handleKernelEvent("nodeIKernelLoginListener", "onQRCodeGetPicture", [
           {
             qrcodeInfo: {
               pngBase64QrcodeData: "data:image/png;base64,QQ3235NESTEDQR==",
@@ -564,5 +564,29 @@ test("get_login_qrcode waits for async onQRCodeGetPicture and Tier 1 void RPC do
   const elapsedMs = Date.now() - t0;
   assert.strictEqual(nestedQrResp.status, "ok");
   assert.strictEqual(nestedQrResp.data.qrcode_base64, "data:image/png;base64,QQ3235NESTEDQR==");
+  assert.strictEqual(nestedQrResp.data.refreshed, true);
+  assert.strictEqual(bridge.inboundPipeline._qrCodeWaiters.size, 0);
   assert.ok(elapsedMs < 1000, `Expected early return on onQRCodeGetPicture, got ${elapsedMs}ms`);
+
+  // Direct QR return cancels _qrCodeWaiters immediately without leaving dangling listeners,
+  // and login/kick events clear consumed pre-login QR codes
+  bridge.rendererIpc._invokeRendererCommand = async () => ({
+    pngBase64QrcodeData: "data:image/png;base64,DIRECTQR==",
+  });
+  const directQrResp = await bridge.handleOneBotAction("get_login_qrcode", {
+    refresh: true,
+    wait_ms: 5000,
+  });
+  assert.strictEqual(directQrResp.data.qrcode_base64, "data:image/png;base64,DIRECTQR==");
+  assert.strictEqual(directQrResp.data.refreshed, true);
+  assert.strictEqual(
+    bridge.inboundPipeline._qrCodeWaiters.size,
+    0,
+    "Direct QR resolution must immediately cancel _qrCodeWaiters"
+  );
+
+  await bridge.inboundPipeline._handleKernelEvent("nodeIKernelLoginListener", "onUserLoggedIn", [
+    { uin: "100010001", uid: "u_100010001", nick: "LoggedBot" },
+  ]);
+  assert.strictEqual(bridge.lastQrCodeBase64, "", "Consumed QR must be cleared upon login");
 });

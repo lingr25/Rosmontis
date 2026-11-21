@@ -244,6 +244,7 @@ class HumanSessionController {
       getActivePeerKey: () => this.activeAioPeerKey,
       switchCooldownMs: initCfg.aioSwitchCooldownMs ?? 800,
       enforceHardCooldownOnExplicit: Boolean(initCfg.enforceSwitchCooldownOnSend),
+      logger: this.logger,
     });
   }
 
@@ -460,7 +461,7 @@ class HumanSessionController {
         focused: this.windowFocused,
       };
     }
-    if (switchDecision.waitMs > 0) {
+    if (typeof switchDecision.waitMs === "number" && switchDecision.waitMs > 0) {
       await this.scheduler.sleepUnref(switchDecision.waitMs);
     }
 

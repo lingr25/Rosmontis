@@ -28,7 +28,7 @@ for (const mod of SUB_MODULES) {
 }
 
 /**
- * @this {any}
+ * @this {import("../types").BridgeHost}
  * @param {string} action
  * @param {Record<string, any>} p
  * @param {import("../types").ActionContext} [context]

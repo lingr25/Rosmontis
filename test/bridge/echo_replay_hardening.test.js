@@ -189,17 +189,17 @@ test("send_private_msg maps message_id to the real onAddSendMsg msgId so delete_
         const plan = pendingEchoes.shift() || {};
         if (plan.foreignFirst) {
           // A manual send from the QQ UI to the same peer must not be mistaken for ours
-          await bridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+          await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
             echoFor("7600000000000000900", "我是手动发的", "90"),
           ]);
         }
         if (plan.mode === "before") {
-          await bridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+          await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
             echoFor(plan.msgId, text, plan.msgSeq),
           ]);
         } else if (plan.mode === "after") {
           setTimeout(() => {
-            bridge
+            bridge.inboundPipeline
               ._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
                 echoFor(plan.msgId, text, plan.msgSeq),
               ])
@@ -238,7 +238,7 @@ test("send_private_msg maps message_id to the real onAddSendMsg msgId so delete_
   assert.strictEqual(r3.status, "ok");
   assert.ok(String(r3.data.real_id).startsWith("sent_"));
   assert.deepStrictEqual(bridge.sendEchoStats, { matched: 2, fromResult: 0, timedOut: 1 });
-  assert.strictEqual(bridge._sendEchoWaiters.size, 0, "waiter queues must be drained");
+  assert.strictEqual(bridge.echoCorrelator.waiters.size, 0, "waiter queues must be drained");
 });
 
 // === Section 13: Testing Token Env Guard, Echo Element Isolation, Poke Replay Guard, HTTP Null Body & Forward WS Error Safety ===
@@ -309,7 +309,7 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
           const firstEl = payload.msgElements[0];
           if (firstEl && firstEl.elementType === 1) {
             // Foreign image & poke echoes arrive first; neither may hijack our text waiter
-            await echoBridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+            await echoBridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
               {
                 msgRecord: {
                   msgId: "7700000000000000901",
@@ -322,7 +322,7 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
                 },
               },
             ]);
-            await echoBridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+            await echoBridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
               {
                 msgRecord: {
                   msgId: "7700000000000000902",
@@ -336,7 +336,7 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
               },
             ]);
             setTimeout(() => {
-              echoBridge
+              echoBridge.inboundPipeline
                 ._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
                   {
                     msgRecord: {
@@ -367,15 +367,15 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
 
     // Direct waiter out-of-order correlation for two distinct images
     const peer = { chatType: 1, peerUid: "u_friend" };
-    const wImgA = echoBridge._registerSendEchoWaiter(peer, [
+    const wImgA = echoBridge.outboundPipeline._registerSendEchoWaiter(peer, [
       { elementType: 2, picElement: { md5HexStr: "aaaa1111", fileName: "a.png", picSubType: 0 } },
     ]);
-    const wImgB = echoBridge._registerSendEchoWaiter(peer, [
+    const wImgB = echoBridge.outboundPipeline._registerSendEchoWaiter(peer, [
       { elementType: 2, picElement: { md5HexStr: "bbbb2222", fileName: "b.png", picSubType: 0 } },
     ]);
     // Foreign text echo must match neither image waiter
     assert.strictEqual(
-      echoBridge._matchSendEcho({
+      echoBridge.outboundPipeline._matchSendEcho({
         msgId: "7700000000000000903",
         msgSeq: "93",
         chatType: 1,
@@ -386,7 +386,7 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
     );
     // Image B arrives before Image A
     assert.strictEqual(
-      echoBridge._matchSendEcho({
+      echoBridge.outboundPipeline._matchSendEcho({
         msgId: "7700000000000000202",
         msgSeq: "202",
         chatType: 1,
@@ -396,7 +396,7 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
       true
     );
     assert.strictEqual(
-      echoBridge._matchSendEcho({
+      echoBridge.outboundPipeline._matchSendEcho({
         msgId: "7700000000000000201",
         msgSeq: "201",
         chatType: 1,
@@ -481,8 +481,8 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
     });
     await netBridge.startServers();
     try {
-      const httpPort = netBridge._httpServers[0].address().port;
-      const wsPort = netBridge._wsServers[0].address().port;
+      const httpPort = netBridge.serverRuntime._httpServers[0].address().port;
+      const wsPort = netBridge.serverRuntime._wsServers[0].address().port;
 
       const postRaw = (urlPath, rawBody) =>
         new Promise((resolve, reject) => {
@@ -549,14 +549,14 @@ test("Empty env token preserves config token; sendEcho isolates element types/md
         clientSock.on("error", reject);
       });
 
-      assert.strictEqual(netBridge._wsServerClients.size, 1);
-      const srvConn = Array.from(netBridge._wsServerClients)[0];
+      assert.strictEqual(netBridge.serverRuntime._wsServerClients.size, 1);
+      const srvConn = Array.from(netBridge.serverRuntime._wsServerClients)[0];
       // Directly emit a socket error on the server-side upgraded socket (simulating ECONNRESET)
       srvConn.socket.emit("error", Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }));
       clientSock.destroy();
       await new Promise((r) => setTimeout(r, 30));
 
-      assert.strictEqual(netBridge._wsServerClients.size, 0, "errored Forward WS client must be evicted");
+      assert.strictEqual(netBridge.serverRuntime._wsServerClients.size, 0, "errored Forward WS client must be evicted");
       assert.strictEqual(unhandled, null, `Unexpected unhandled error: ${unhandled}`);
     } finally {
       process.removeListener("unhandledRejection", onUnhandled);

@@ -73,8 +73,8 @@ test("Constant-time token auth (Bearer/Token/raw/query & allowQueryAccessToken: 
     });
     await secBridge.startServers();
     try {
-      const httpPort = secBridge._httpServers[0].address().port;
-      const wsPort = secBridge._wsServers[0].address().port;
+      const httpPort = secBridge.serverRuntime._httpServers[0].address().port;
+      const wsPort = secBridge.serverRuntime._wsServers[0].address().port;
 
       // Missing / wrong token -> 401
       const rNoAuth = await httpRequestRaw({ port: httpPort });
@@ -314,7 +314,7 @@ test("Constant-time token auth (Bearer/Token/raw/query & allowQueryAccessToken: 
     });
     await noQueryBridge.startServers();
     try {
-      const port = noQueryBridge._httpServers[0].address().port;
+      const port = noQueryBridge.serverRuntime._httpServers[0].address().port;
       const rQueryBlocked = await httpRequestRaw({
         port,
         urlPath: "/get_status?access_token=hdr_only_tok",
@@ -381,7 +381,7 @@ test("Constant-time token auth (Bearer/Token/raw/query & allowQueryAccessToken: 
       await loopbackBridge.startServers();
       assert.strictEqual(loopbackBridge.config.httpServers[0].accessToken, "");
       assert.strictEqual(Boolean(loopbackBridge.config.httpServers[0].protectedModeAutoToken), false);
-      const loopPort = loopbackBridge._httpServers[0].address().port;
+      const loopPort = loopbackBridge.serverRuntime._httpServers[0].address().port;
       const rLoop = await httpRequestRaw({ port: loopPort });
       assert.strictEqual(rLoop.statusCode, 200);
 
@@ -392,7 +392,7 @@ test("Constant-time token auth (Bearer/Token/raw/query & allowQueryAccessToken: 
       assert.strictEqual(publicBridge.config.wsServers[0].accessToken, generatedToken);
       assert.strictEqual(capturedWarnings.length, 1);
 
-      const pubPort = publicBridge._httpServers[0].address().port;
+      const pubPort = publicBridge.serverRuntime._httpServers[0].address().port;
       const rPubUnauth = await httpRequestRaw({ port: pubPort });
       assert.strictEqual(rPubUnauth.statusCode, 401);
 
@@ -527,7 +527,7 @@ test("Rfc6455Connection maxSendBufferBytes backpressure, periodic WS ping/pong t
   let rawTcpClient = null;
   try {
     await pingBridge.startServers();
-    const wsPort = pingBridge._wsServers[0].address().port;
+    const wsPort = pingBridge.serverRuntime._wsServers[0].address().port;
 
     let sawUpgrade = false;
     let sawPingFrame = false;
@@ -562,7 +562,7 @@ test("Rfc6455Connection maxSendBufferBytes backpressure, periodic WS ping/pong t
             if (headerStr.includes("101 Switching Protocols")) {
               sawUpgrade = true;
               upgradedAt = Date.now();
-              assert.strictEqual(pingBridge._wsServerClients.size, 1);
+              assert.strictEqual(pingBridge.serverRuntime._wsServerClients.size, 1);
               rxBuf = rxBuf.subarray(headerEnd + 4);
             }
           }
@@ -601,7 +601,7 @@ test("Rfc6455Connection maxSendBufferBytes backpressure, periodic WS ping/pong t
       closedElapsedMs >= 90 && closedElapsedMs < 500,
       `Expected unresponsive WS client closed around ~130-250ms, got ${closedElapsedMs}ms`
     );
-    assert.strictEqual(pingBridge._wsServerClients.size, 0);
+    assert.strictEqual(pingBridge.serverRuntime._wsServerClients.size, 0);
   } finally {
     if (rawTcpClient && !rawTcpClient.destroyed) rawTcpClient.destroy();
     await pingBridge.stopServers();

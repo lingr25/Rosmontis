@@ -225,13 +225,16 @@ function resolveStateDirFromEnv(explicitStateDir) {
   return pickPrefixedEnv("STATE_DIR") || "";
 }
 
+/**
+ * @returns {string[]}
+ */
 function resolveConfigDirsFromEnv() {
   const env = _getEnv();
   return [
     env.ROSMONTIS_CONFIG_DIR,
     env.ONEBOT_CONFIG_DIR,
     env.XIAO_BRIDGE_CONFIG_DIR,
-  ].filter(Boolean);
+  ].filter(/** @returns {d is string} */ (d) => typeof d === "string" && d.length > 0);
 }
 
 module.exports = {

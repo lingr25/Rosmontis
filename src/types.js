@@ -5,7 +5,7 @@
  * Shared JSDoc Type Contracts for Rosmontis (`src/types.js`)
  *
  * Pure type-annotation module (zero runtime overhead, zero dependencies) enabling
- * IDE autocompletion and JSDoc contract verification across `src/` and `test/`.
+ * IDE autocompletion and `strictNullChecks: true` JSDoc verification across `src/` and `test/`.
  */
 
 /**
@@ -31,8 +31,12 @@
  * @property {string} host
  * @property {number} port
  * @property {string} [accessToken]
+ * @property {string[]} [allowedOrigins]
  * @property {boolean} [reportSelfMessage]
  * @property {MessageFormat} [messageFormat]
+ * @property {CompatProfile} [compatProfile]
+ * @property {string} [compatAppName]
+ * @property {string} [compatAppVersion]
  * @property {boolean} [enable]
  * @property {boolean} [enabled]
  */
@@ -42,10 +46,14 @@
  * @typedef {object} ReverseWsClientConfig
  * @property {string} [name]
  * @property {string} url
+ * @property {string} [role]
  * @property {string} [accessToken]
  * @property {boolean} [reportSelfMessage]
  * @property {number} [reconnectIntervalMs]
  * @property {MessageFormat} [messageFormat]
+ * @property {CompatProfile} [compatProfile]
+ * @property {string} [compatAppName]
+ * @property {string} [compatAppVersion]
  * @property {boolean} [enable]
  * @property {boolean} [enabled]
  */
@@ -58,10 +66,14 @@
  * @property {string} [secret]
  * @property {string} [accessToken]
  * @property {number} [timeoutMs]
+ * @property {number} [maxRetries]
+ * @property {number} [retryBaseMs]
  * @property {boolean} [reportSelfMessage]
  * @property {boolean} [enableHeartbeat]
  * @property {MessageFormat} [messageFormat]
  * @property {CompatProfile} [compatProfile]
+ * @property {string} [compatAppName]
+ * @property {string} [compatAppVersion]
  * @property {boolean} [enable]
  * @property {boolean} [enabled]
  */
@@ -72,11 +84,11 @@
  * @property {string} [selfUin]
  * @property {string} [selfNickname]
  * @property {string} [tempDir]
- * @property {EndpointServerConfig[]} httpServers
- * @property {EndpointServerConfig[]} wsServers
- * @property {ReverseWsClientConfig[]} wsClients
+ * @property {EndpointServerConfig[]} [httpServers]
+ * @property {EndpointServerConfig[]} [wsServers]
+ * @property {ReverseWsClientConfig[]} [wsClients]
  * @property {HttpPostClientConfig[]} [httpClients]
- * @property {number} heartbeatIntervalMs
+ * @property {number} [heartbeatIntervalMs]
  * @property {MessageFormat} [messageFormat]
  * @property {boolean} [humanSimulation]
  * @property {number} [aioIdleExitMs]
@@ -86,6 +98,7 @@
  * @property {number} [sendRichMediaEchoTimeoutMs]
  * @property {number} [maxSendEchoTimeoutMs]
  * @property {number} [forwardEchoTimeoutMs]
+ * @property {number} [forwardMediaHydrationBudgetMs]
  * @property {number} [dedupeWindowMs]
  * @property {boolean} [autoQuickLogin]
  * @property {boolean} [keepMapHook]
@@ -98,6 +111,7 @@
  * @property {boolean} [allowPrivateUrls]
  * @property {boolean} [allowArbitraryLocalFiles]
  * @property {string[]} [allowedFileDirs]
+ * @property {boolean} [enableLocalFile2Url]
  * @property {string} [ffmpegPath]
  * @property {string} [silkDecoderPath]
  * @property {string} [silkEncoderPath]
@@ -110,6 +124,7 @@
  * @property {number} [mediaHydrationTimeoutMs]
  * @property {number} [richMediaDownloadTimeoutMs]
  * @property {number} [uploadFileUuidWaitMs]
+ * @property {boolean} [strictUploadGroupFileFolderMove]
  * @property {number} [httpPostTimeoutMs]
  * @property {boolean} [enableWebCredentialApi]
  * @property {boolean} [allowUnauthenticatedPublicBind]
@@ -181,6 +196,18 @@
  */
 
 /**
+ * Cached capability probe entry stored on `BridgeHost._capabilityProbeCache`.
+ * @typedef {object} CapabilityProbeCache
+ * @property {number} at
+ * @property {any} ntApiRef
+ * @property {any} wrapperSessionRef
+ * @property {BridgeConfig | null} configRef
+ * @property {boolean} webCredentials
+ * @property {boolean} online
+ * @property {CapabilityProbeResult} result
+ */
+
+/**
  * Outbound token-bucket rate limiter & circuit breaker configuration.
  * @typedef {object} RateLimitConfig
  * @property {boolean} [enabled]
@@ -205,6 +232,14 @@
  * @property {number} circuitOpens
  * @property {"closed" | "open" | "half_open"} circuitState
  * @property {number} activePeers
+ */
+
+/**
+ * Outbound send-echo correlation telemetry counters.
+ * @typedef {object} SendEchoStats
+ * @property {number} matched
+ * @property {number} fromResult
+ * @property {number} timedOut
  */
 
 /**
@@ -357,11 +392,19 @@
  */
 
 /**
+ * Optional per-call dispatch hints accepted by `invokeNt`.
+ * @typedef {object} InvokeNtOptions
+ * @property {boolean} [preferMainProcess]
+ * @property {number} [timeoutMs]
+ */
+
+/**
  * 3-tier NTQQ kernel service invocation function signature.
  * @callback InvokeNtFn
  * @param {string} cmd - `"<serviceName>/<methodName>"` (e.g. `"nodeIKernelMsgService/sendMsg"`)
  * @param {Record<string, any>} [payload]
  * @param {any[] | null} [positionalArgs]
+ * @param {InvokeNtOptions | null} [invokeOptions]
  * @returns {Promise<any>}
  */
 
@@ -392,33 +435,43 @@
  */
 
 /**
+ * OneBot v11 action handler method bound to `BridgeHost` as `this`.
+ * @callback BridgeActionHandler
+ * @this {BridgeHost}
+ * @param {Record<string, any>} p
+ * @param {ActionContext} context
+ * @param {string} action
+ * @returns {Promise<any> | any}
+ */
+
+/**
  * 3-tier NTQQ kernel invocation telemetry counters.
  * @typedef {object} InvokeStats
  * @property {number} tier1
  * @property {number} tier2
  * @property {number} tier3
- * @property {number} directMain
+ * @property {number} [directMain]
  * @property {number} degraded
  * @property {number} blockedReplays
  * @property {number} failed
- * @property {{ cmd: string, tier: number, at: number } | null} lastDegraded
+ * @property {{ cmd: string, tier: number, at: number } | null} [lastDegraded]
  */
 
 /**
  * Captured NTQQ kernel service registry populated by `NtCaptureController`.
  * @typedef {object} CapturedServices
- * @property {any} ntApi
- * @property {any} ntApiContainer
- * @property {any} ntStore
- * @property {any} WindowApi
- * @property {any} PerformanceApi
- * @property {any} LoggerApi
- * @property {any} UserBehaviorReportService
- * @property {any} SubWindowApi
- * @property {any} ScreenRecordApi
- * @property {any} ntCall
- * @property {any} ntSessionManager
- * @property {any} wrapperSession
+ * @property {any} [ntApi]
+ * @property {any} [ntApiContainer]
+ * @property {any} [ntStore]
+ * @property {any} [WindowApi]
+ * @property {any} [PerformanceApi]
+ * @property {any} [LoggerApi]
+ * @property {any} [UserBehaviorReportService]
+ * @property {any} [SubWindowApi]
+ * @property {any} [ScreenRecordApi]
+ * @property {any} [ntCall]
+ * @property {any} [ntSessionManager]
+ * @property {any} [wrapperSession]
  */
 
 /**
@@ -441,12 +494,99 @@
  */
 
 /**
+ * Narrow read-only host contract accepted by `probeRuntimeCapabilities` / `hasKernelMethod`.
+ * @typedef {object} CapabilityProbeHost
+ * @property {Partial<CapturedServices> | null} [capturedServices]
+ * @property {Partial<BridgeConfig> | null} [config]
+ * @property {boolean} [online]
+ * @property {CapabilityProbeCache | null} [_capabilityProbeCache]
+ */
+
+/**
+ * Narrow host contract accepted by `qzone_actions.js` web-credential & QZone helpers.
+ * @typedef {object} WebCredentialHost
+ * @property {InvokeNtFn} invokeNt
+ * @property {string | number} [selfUin]
+ * @property {Partial<BridgeConfig> | null} [config]
+ * @property {{ debug?: (scope: string, err: any) => any } | null} [logger]
+ */
+
+/**
+ * Core instance members of `NtqqOneBotBridge` exposed to composed subsystem controllers
+ * and OneBot v11 action routers (`src/actions/*.js`).
+ * @typedef {object} BridgeHostMembers
+ * @property {string | undefined} [_configDir]
+ * @property {BridgeConfig} config
+ * @property {InstanceType<typeof import("./onebot/stores").MessageIdStore>} messageIdStore
+ * @property {InstanceType<typeof import("./onebot/stores").UinUidStore>} uinUidStore
+ * @property {InstanceType<typeof import("./core/primitives").BridgeLogger>} logger
+ * @property {InstanceType<typeof import("./core/primitives").TtlDedupeSet>} eventDedupe
+ * @property {InstanceType<typeof import("./core/primitives").TempCleanupQueue>} tempCleanupQueue
+ * @property {InstanceType<typeof import("./core/echo_correlator").EchoCorrelator>} echoCorrelator
+ * @property {InstanceType<typeof import("./core/session_controller").HumanSessionController>} sessionController
+ * @property {string} selfUin
+ * @property {string} selfUid
+ * @property {string} selfNickname
+ * @property {number} startedAtMs
+ * @property {boolean} online
+ * @property {string} lastQrCodeBase64
+ * @property {CapturedServices} capturedServices
+ * @property {((cmd: string, args: any[]) => Promise<any>) | null} rendererExecute
+ * @property {((opts?: Record<string, any>) => Promise<any>) | null} rendererSimulateSession
+ * @property {((opts?: Record<string, any>) => Promise<any>) | null} rendererLeaveSession
+ * @property {CapabilityProbeCache | null} [_capabilityProbeCache]
+ * @property {{ track: (filePath: string) => void } | null} [tempFileCleaner]
+ * @property {{ ready?: boolean } | null} [dispatcher]
+ * @property {((service: string, method: string, args: any[]) => Promise<any>) | null} [ntCall]
+ * @property {((ev: any) => void) | null} [_dispatchEvent]
+ * @property {InstanceType<typeof import("./core/nt_capture").NtCaptureController>} ntCapture
+ * @property {InstanceType<typeof import("./core/renderer_ipc").RendererIpcController>} rendererIpc
+ * @property {InstanceType<typeof import("./core/inbound_pipeline").InboundPipeline>} inboundPipeline
+ * @property {InstanceType<typeof import("./core/outbound_pipeline").OutboundPipeline>} outboundPipeline
+ * @property {InstanceType<typeof import("./core/server_runtime").ServerRuntime>} serverRuntime
+ * @property {SendEchoStats} sendEchoStats
+ * @property {MapHookReleaseRecord | null} mapHookRelease
+ * @property {any} activeWebContents
+ * @property {InvokeStats} invokeStats
+ * @property {RendererHealthStats | null} rendererHealthStats
+ * @property {InstanceType<typeof import("./core/rate_limiter").OutboundRateLimiter> | null} rateLimiter
+ * @property {WebhookStats} webhookStats
+ * @property {ListenErrorEntry[]} listenErrors
+ * @property {Set<any>} wsClients
+ * @property {any[]} reverseWsClients
+ * @property {() => Promise<void>} flushStateStores
+ * @property {() => void} flushTempCleanup
+ * @property {(opts?: Record<string, any>) => Promise<any>} simulateHumanSession
+ * @property {(opts?: Record<string, any>) => Promise<any>} leaveHumanSession
+ * @property {() => void} installMapPrototypeHook
+ * @property {(reason?: string) => boolean} releaseMapPrototypeHook
+ * @property {() => void} installWrapperHook
+ * @property {(options?: Record<string, any>) => { wrapperModulesFound: number, mapsScanned: number, rmIpcChannels: string[] }} probeExistingRuntime
+ * @property {(electronModule?: any) => boolean} installElectronHooks
+ * @property {InvokeNtFn} invokeNt
+ * @property {() => Promise<void>} startServers
+ * @property {() => Promise<void>} stopServers
+ * @property {(options?: Record<string, any>) => Promise<ReloadConfigResult>} reloadConfig
+ * @property {(eventObj: any, messageFormat: string) => any} _formatEventForEndpoint
+ * @property {(event: any) => void} broadcastOneBotEvent
+ * @property {() => Promise<{ clientKey: string, expireTime: string, keyIndex: string, url: string }>} _fetchClientKey
+ * @property {(domain?: string) => Promise<Record<string, string>>} _getCookiesObject
+ * @property {(action: string, params?: Record<string, any>, echo?: any, context?: ActionContext) => Promise<OneBotActionResponse>} handleOneBotAction
+ * @property {(action: string, p: Record<string, any>, context?: ActionContext) => Promise<any>} _dispatchAction
+ */
+
+/**
+ * Full coordinator host interface implemented by `NtqqOneBotBridge` (`src/bridge_main.js`).
+ * @typedef {import("events").EventEmitter & BridgeHostMembers} BridgeHost
+ */
+
+/**
  * Constructor options accepted by `NtqqOneBotBridge` and `installMainBridge`.
  * @typedef {object} BridgeOptions
  * @property {string} [configDir]
  * @property {BridgeConfig} [config]
- * @property {any} [messageIdStore]
- * @property {any} [uinUidStore]
+ * @property {InstanceType<typeof import("./onebot/stores").MessageIdStore>} [messageIdStore]
+ * @property {InstanceType<typeof import("./onebot/stores").UinUidStore>} [uinUidStore]
  * @property {string | number} [selfUin]
  * @property {string} [selfUid]
  * @property {string} [selfNickname]

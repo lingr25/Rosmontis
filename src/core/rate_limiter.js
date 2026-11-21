@@ -78,8 +78,10 @@ class OutboundRateLimiter {
    */
   constructor(options = {}) {
     const src = options && typeof options === "object" ? options : {};
-    this._hasCustomClock = typeof src.now === "function";
-    this._now = this._hasCustomClock ? src.now : () => Date.now();
+    const customNow = typeof src.now === "function" ? src.now : null;
+    this._hasCustomClock = Boolean(customNow);
+    /** @type {() => number} */
+    this._now = customNow || (() => Date.now());
     this._usedExplicitNow = false;
     this._config = normalizeRateLimitConfig(src);
 
@@ -320,6 +322,7 @@ class OutboundRateLimiter {
   getStats(now = undefined) {
     let circuitState = this._circuitState;
     if (circuitState === "open") {
+      /** @type {number | null} */
       let checkTs = null;
       if (now !== undefined && now !== null && Number.isFinite(Number(now))) {
         checkTs = Number(now);

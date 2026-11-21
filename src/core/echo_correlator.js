@@ -153,6 +153,11 @@ function hasRichMediaElements(elements) {
 }
 
 class EchoCorrelator {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxQueuePerPeer=32]
+   * @param {(() => Record<string, any>) | null} [options.getSignatureFns=null]
+   */
   constructor({ maxQueuePerPeer = 32, getSignatureFns = null } = {}) {
     const parsedMax = Number(maxQueuePerPeer);
     this.maxQueuePerPeer =
@@ -162,6 +167,10 @@ class EchoCorrelator {
     this.stats = { matched: 0, fromResult: 0, timedOut: 0 };
   }
 
+  /**
+   * @param {((elements: any) => any) | null} [customSigFn=null]
+   * @param {((expectedSig: any, actualSig: any) => boolean) | null} [customMatchFn=null]
+   */
   _resolveSignatureFns(customSigFn = null, customMatchFn = null) {
     const dynamic = typeof this._getSignatureFns === "function" ? this._getSignatureFns() : null;
     const sigFn =
@@ -193,6 +202,12 @@ class EchoCorrelator {
     return `${Number(peer?.chatType) || 0}:${String(peer?.peerUid || "")}`;
   }
 
+  /**
+   * @param {any} peer
+   * @param {any[]} elements
+   * @param {((ntMsg: any) => boolean) | null} [elementPredicate=null]
+   * @param {((elements: any) => any) | null} [customSigFn=null]
+   */
   register(peer, elements, elementPredicate = null, customSigFn = null) {
     const key = this.peerKey(peer);
     const { sigFn } = this._resolveSignatureFns(customSigFn, null);
@@ -200,7 +215,9 @@ class EchoCorrelator {
     const waiter = {
       sig: hasPredicate ? null : sigFn(elements),
       elementPredicate: hasPredicate ? elementPredicate : null,
+      /** @type {any} */
       echo: null,
+      /** @type {((echo: any) => void) | null} */
       resolve: null,
       done: false,
     };
@@ -208,8 +225,10 @@ class EchoCorrelator {
     queue.push(waiter);
     while (queue.length > this.maxQueuePerPeer) {
       const stale = queue.shift();
-      stale.done = true;
-      if (stale.resolve) stale.resolve(null);
+      if (stale) {
+        stale.done = true;
+        if (stale.resolve) stale.resolve(null);
+      }
     }
     this.waiters.set(key, queue);
 
@@ -258,6 +277,11 @@ class EchoCorrelator {
     };
   }
 
+  /**
+   * @param {any} ntMsg
+   * @param {((elements: any) => any) | null} [customSigFn=null]
+   * @param {((expectedSig: any, actualSig: any) => boolean) | null} [customMatchFn=null]
+   */
   match(ntMsg, customSigFn = null, customMatchFn = null) {
     if (!ntMsg || !ntMsg.msgId || String(ntMsg.msgId) === "0") return false;
     const key = this.peerKey({ chatType: ntMsg.chatType, peerUid: ntMsg.peerUid });

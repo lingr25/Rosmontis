@@ -43,20 +43,29 @@ const WEB_HTTP_HELPERS = Object.freeze({
   parseJsonpOrJson,
 });
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {any} media
+ */
 function scheduleResolvedMediaCleanup(bridge, media) {
   if (!media) return;
   if (typeof media.cleanup === "function") {
-    bridge._scheduleTempCleanup(media.cleanup);
+    bridge.tempCleanupQueue?.schedule?.(media.cleanup);
   } else {
-    bridge._scheduleMediaCleanup(media);
+    bridge.tempCleanupQueue?.scheduleMedia?.(media);
   }
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string | number} ntMsgId
+ * @param {number} [timeoutMs=10000]
+ */
 function createPttTextWaiter(bridge, ntMsgId, timeoutMs = 10000) {
-  if (!(bridge._pttTextWaiters instanceof Map)) {
-    bridge._pttTextWaiters = new Map();
+  if (!(bridge.inboundPipeline._pttTextWaiters instanceof Map)) {
+    bridge.inboundPipeline._pttTextWaiters = new Map();
   }
-  const waiterMap = bridge._pttTextWaiters;
+  const waiterMap = bridge.inboundPipeline._pttTextWaiters;
   const key = String(ntMsgId || "");
   let dispatcher = /** @type {any} */ (waiterMap.get(key));
   if (typeof dispatcher !== "function" || !(dispatcher._listeners instanceof Set)) {
@@ -104,10 +113,18 @@ function createPttTextWaiter(bridge, ntMsgId, timeoutMs = 10000) {
   };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string} action
+ * @param {any} rawOutFormat
+ * @param {string} localPath
+ */
 async function maybeTranscodeGetRecordOutput(bridge, action, rawOutFormat, localPath) {
   if (action !== "get_record" || !rawOutFormat || !localPath) return null;
   const converted = await transcodeRecordOutFormat(localPath, rawOutFormat, {
-    ...(typeof bridge._mediaSecurityOptions === "function" ? bridge._mediaSecurityOptions() : {}),
+    ...(typeof bridge.outboundPipeline?._mediaSecurityOptions === "function"
+      ? bridge.outboundPipeline._mediaSecurityOptions()
+      : {}),
     ffmpegPath: bridge.config?.ffmpegPath,
     silkDecoderPath: bridge.config?.silkDecoderPath,
   });
@@ -117,9 +134,9 @@ async function maybeTranscodeGetRecordOutput(bridge, action, rawOutFormat, local
 }
 
 /**
- * @this {any}
+ * @this {import("../types").BridgeHost}
  * @param {Record<string, any>} p
- * @param {any} _context
+ * @param {import("../types").ActionContext} _context
  * @param {string} action
  */
 async function resolveOneBotMediaAction(p, _context, action) {
@@ -128,6 +145,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
   const includeB64 = Boolean(p.base64) || Boolean(this.config?.enableLocalFile2Url);
 
   // Step A: Resolve NTQQ kernel-owned media metadata via msg_id/message_id or lookupMedia
+  /** @type {Record<string, any> | null} */
   let mediaDesc = null;
   if (p.msg_id || p.message_id) {
     const entry = resolveMessageEntry(this, p.msg_id || p.message_id);
@@ -191,9 +209,9 @@ async function resolveOneBotMediaAction(p, _context, action) {
     const elementId = String(mediaDesc.elementId || "");
     const safeTargetPath = mediaDesc.sourcePath ? String(mediaDesc.sourcePath) : "";
     if (ntMsgId && !/^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) && peerUid && elementId) {
-      if (typeof this._downloadRichMediaElement === "function") {
+      if (typeof this.inboundPipeline?._downloadRichMediaElement === "function") {
         try {
-          const dlPath = await this._downloadRichMediaElement({
+          const dlPath = await this.inboundPipeline._downloadRichMediaElement({
             msgId: ntMsgId,
             chatType,
             peerUid,
@@ -251,7 +269,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
 
   if (action === "get_file" && !kernelStat) {
     const groupCode = String(
-      p.group_id || (Number(mediaDesc?.chatType) === 2 ? mediaDesc.peerUid : "") || ""
+      p.group_id || (Number(mediaDesc?.chatType) === 2 ? mediaDesc?.peerUid : "") || ""
     );
     const knownUuid = String(
       mediaDesc?.fileUuid ||
@@ -308,7 +326,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
   }
 
   if (kernelRemoteUrl || (mediaDesc?.url && /^https?:\/\//i.test(String(mediaDesc.url)))) {
-    const remoteUrl = String(kernelRemoteUrl || mediaDesc.url);
+    const remoteUrl = String(kernelRemoteUrl || mediaDesc?.url || "");
     let urlName = "";
     try {
       urlName = path.basename(new URL(remoteUrl).pathname);
@@ -342,7 +360,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
 
   let resolved;
   try {
-    resolved = await resolveMediaSource(directFile, this._mediaSecurityOptions());
+    resolved = await resolveMediaSource(directFile, this.outboundPipeline._mediaSecurityOptions());
   } catch (err) {
     if (
       err &&
@@ -394,9 +412,9 @@ async function resolveOneBotMediaAction(p, _context, action) {
 }
 
 /**
- * @this {any}
+ * @this {import("../types").BridgeHost}
  * @param {Record<string, any>} p
- * @param {any} _context
+ * @param {import("../types").ActionContext} _context
  * @param {string} action
  */
 async function handleWebCredentialOrQzoneAction(p, _context, action) {
@@ -457,7 +475,7 @@ function normalizeOcrResultLines(res) {
 // Declarative Media, Profile, Ark & Web Credential Action Handlers & Aliases
 // ============================================================================
 
-/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
+/** @type {Record<string, import("../types").BridgeActionHandler>} */
 const ACTION_HANDLERS = {
   // ---- Media / OCR / Translate / Voice / Profile / Online Status ----
   get_image: resolveOneBotMediaAction,
@@ -466,17 +484,19 @@ const ACTION_HANDLERS = {
 
   async ocr_image(p) {
     const imgSrc = String(p.image || p.file || "").trim();
+    /** @type {any} */
     let media = null;
     try {
-      media = await resolveMediaSource(imgSrc, this._mediaSecurityOptions());
+      const resolved = await resolveMediaSource(imgSrc, this.outboundPipeline._mediaSecurityOptions());
+      media = resolved;
       const res = await this.invokeNt(
         "nodeIKernelRichMediaService/getScreenOCR",
         {
-          imgFilepath: media.localPath,
-          path: media.localPath,
-          filePath: media.localPath,
+          imgFilepath: resolved.localPath,
+          path: resolved.localPath,
+          filePath: resolved.localPath,
         },
-        [media.localPath]
+        [resolved.localPath]
       );
       return normalizeOcrResultLines(res);
     } finally {
@@ -623,13 +643,15 @@ const ACTION_HANDLERS = {
   },
 
   async set_qq_avatar(p) {
+    /** @type {any} */
     let media = null;
     try {
-      media = await resolveMediaSource(p.file, this._mediaSecurityOptions());
+      const resolved = await resolveMediaSource(p.file, this.outboundPipeline._mediaSecurityOptions());
+      media = resolved;
       await this.invokeNt(
         "nodeIKernelProfileService/setHeader",
-        { path: media.localPath },
-        [media.localPath]
+        { path: resolved.localPath },
+        [resolved.localPath]
       );
       return {};
     } finally {

@@ -8,10 +8,11 @@ const {
   normalizeOneBotMessage,
   ntMsgToOneBotSegments,
   formatNtMsgToOneBotEvent,
+  stripTransientNtMedia,
 } = bridgeOneBot;
 
 const { resolveCompatVersionInfo } = require("../core/config");
-const { createActionRouter, waitForEventOnce } = require("../core/primitives");
+const { createActionRouter, createEventWaiter } = require("../core/primitives");
 const { probeRuntimeCapabilities } = require("../core/capability_probe");
 const { extractQrCodeBase64 } = require("../core/login_recovery");
 
@@ -19,6 +20,12 @@ const MAX_FORWARD_DEPTH = 3;
 const MAX_OVERFLOW_SUMMARY_LINES = 20;
 const MAX_OVERFLOW_SUMMARY_CHARS = 1500;
 
+/**
+ * @param {any} node
+ * @param {import("../types").BridgeHost} bridge
+ * @param {string} defaultSource
+ * @param {string} selfNick
+ */
 function extractNodeMeta(node, bridge, defaultSource, selfNick) {
   const nd = node;
   const d = nd.data && typeof nd.data === "object" && !Array.isArray(nd.data) ? nd.data : nd;
@@ -113,22 +120,10 @@ function buildOverflowSummaryText(overflowEntries) {
     : joined;
 }
 
-function stripTransientNtMedia(ntMsg) {
-  if (typeof bridgeOneBot.stripTransientNtMedia === "function") {
-    return bridgeOneBot.stripTransientNtMedia(ntMsg);
-  }
-  if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
-  for (const el of ntMsg.elements) {
-    if (!el || typeof el !== "object") continue;
-    if (el.picElement && Object.prototype.hasOwnProperty.call(el.picElement, "__base64Uri")) {
-      delete el.picElement.__base64Uri;
-    }
-    if (el.pttElement && Object.prototype.hasOwnProperty.call(el.pttElement, "__base64Uri")) {
-      delete el.pttElement.__base64Uri;
-    }
-  }
-}
-
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {any} rawMsgId
+ */
 function resolveMessageEntry(bridge, rawMsgId) {
   const store = bridge?.messageIdStore;
   if (!store || rawMsgId === undefined || rawMsgId === null || rawMsgId === "") {
@@ -146,6 +141,15 @@ function resolveMessageEntry(bridge, rawMsgId) {
   );
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {any[]} rawNodes
+ * @param {any} fallbackPeer
+ * @param {() => Promise<any>} getSelfPeer
+ * @param {string} [defaultSource=""]
+ * @param {number} [depth=1]
+ * @param {{ customCount: number, overflowSent: boolean }} [state]
+ */
 async function stageForwardNodes(
   bridge,
   rawNodes,
@@ -158,6 +162,7 @@ async function stageForwardNodes(
   const nodes = Array.isArray(rawNodes) ? rawNodes : [];
   const msgInfos = [];
   let stagedCustomCount = 0;
+  /** @type {{ chatType: number, peerUid: string, guildId: string } | null} */
   let firstRefPeer = null;
   const selfNick =
     bridge.selfNickname && bridge.selfNickname !== "QQBot" ? bridge.selfNickname : "";
@@ -172,7 +177,7 @@ async function stageForwardNodes(
     if (stageDelayMs > 0 && state.customCount > 1) {
       await new Promise((resolve) => setTimeout(resolve, stageDelayMs));
     }
-    return await bridge._sendMessageToPeer(
+    return await bridge.outboundPipeline._sendMessageToPeer(
       selfPeer,
       payload,
       false,
@@ -282,7 +287,7 @@ async function stageForwardNodes(
         )
     );
 
-    if (!hasNestedNodes) {
+    if (!hasNestedNodes || !rawItems) {
       const subSent = await sendStagedCustom(selfPeer, content);
       if (subSent?.real_id) {
         msgInfos.push({ msgId: String(subSent.real_id), senderShowName: nodeShowName });
@@ -324,7 +329,7 @@ async function stageForwardNodes(
             state
           );
           if (inner.msgInfos.length > 0) {
-            const innerFwd = await bridge._invokeForwardWithEcho(selfPeer, () =>
+            const innerFwd = await bridge.outboundPipeline._invokeForwardWithEcho(selfPeer, () =>
               bridge.invokeNt(
                 "nodeIKernelMsgService/multiForwardMsgWithComment",
                 {
@@ -418,12 +423,17 @@ function extractExclusiveForwardNodes(message, autoEscape = false) {
   return nodes.length > 0 ? nodes : null;
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {Record<string, any>} p
+ * @param {boolean} isGroup
+ */
 async function forwardSingleMsg(bridge, p, isGroup) {
   const entry = resolveMessageEntry(bridge, p.message_id);
   if (!entry) throw new Error("message not found");
   const dstContact = isGroup
     ? { chatType: 2, peerUid: String(p.group_id), guildId: "" }
-    : await bridge._resolvePeerForUser(p.user_id);
+    : await bridge.outboundPipeline._resolvePeerForUser(p.user_id);
   const srcContact =
     entry.peer ||
     (entry.peerUid
@@ -434,7 +444,7 @@ async function forwardSingleMsg(bridge, p, isGroup) {
         }
       : dstContact);
   const srcMsgId = String(entry.msgId || entry.ntMsgId || "");
-  const sent = await bridge._invokeForwardWithEcho(
+  const sent = await bridge.outboundPipeline._invokeForwardWithEcho(
     dstContact,
     () =>
       bridge.invokeNt(
@@ -453,10 +463,16 @@ async function forwardSingleMsg(bridge, p, isGroup) {
   return { message_id: sent.message_id, real_id: sent.real_id };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {Record<string, any>} p
+ * @param {import("../types").ActionContext} context
+ * @param {boolean} isGroup
+ */
 async function getMessageHistory(bridge, p, context, isGroup) {
   const peer = isGroup
     ? { chatType: 2, peerUid: String(p.group_id), guildId: "" }
-    : await bridge._resolvePeerForUser(p.user_id);
+    : await bridge.outboundPipeline._resolvePeerForUser(p.user_id);
   const count = Math.max(1, Math.min(Number(p.count || 20), 100));
   let startMsgId = "0";
   if (p.message_id && Number(p.message_id) > 0) {
@@ -499,7 +515,7 @@ async function getMessageHistory(bridge, p, context, isGroup) {
   const messages = [];
   for (const m of rawList) {
     try {
-      await bridge._hydrateNtMsgMedia(m, {
+      await bridge.inboundPipeline._hydrateNtMsgMedia(m, {
         skipRemoteDownload: true,
         chatType: peer.chatType,
         peerUid: peer.peerUid,
@@ -523,7 +539,7 @@ async function getMessageHistory(bridge, p, context, isGroup) {
 // Declarative Action Handlers & Aliases
 // ============================================================================
 
-/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
+/** @type {Record<string, import("../types").BridgeActionHandler>} */
 const ACTION_HANDLERS = {
   // ---- 1. Info & Status ----
   async get_login_info() {
@@ -539,7 +555,7 @@ const ACTION_HANDLERS = {
           list.find((item) => item && item.uin) ||
           null;
         if (activeAcc) {
-          this._updateSelfIdentity({
+          this.ntCapture._updateSelfIdentity({
             uin: this.selfUin || activeAcc.uin,
             uid: this.selfUid || activeAcc.uid,
             nick:
@@ -570,7 +586,8 @@ const ACTION_HANDLERS = {
       bridge: {
         invoke: { ...this.invokeStats },
         send_echo: { ...this.sendEchoStats },
-        map_hook_active: Boolean(this._mapSetHook) && Map.prototype.set === this._mapSetHook,
+        map_hook_active:
+          Boolean(this.ntCapture._mapSetHook) && Map.prototype.set === this.ntCapture._mapSetHook,
         map_hook_release: this.mapHookRelease || null,
         listenErrors: Array.isArray(this.listenErrors) ? this.listenErrors : [],
         capabilities: probeRuntimeCapabilities(this),
@@ -584,7 +601,7 @@ const ACTION_HANDLERS = {
   },
 
   async quick_login(p) {
-    return await this._tryAutoQuickLogin({
+    return await this.inboundPipeline._tryAutoQuickLogin({
       uin: p.user_id || p.uin || "",
       force: p.force !== undefined ? Boolean(p.force) : true,
     });
@@ -596,64 +613,75 @@ const ACTION_HANDLERS = {
   },
 
   async get_login_qrcode(p) {
+    let freshQr = "";
+    if (Boolean(p.clear_stale)) {
+      this.lastQrCodeBase64 = "";
+    }
     if (Boolean(p.refresh) || !this.lastQrCodeBase64) {
       const waitMs =
         p.wait_ms !== undefined && p.wait_ms !== null && Number.isFinite(Number(p.wait_ms))
           ? Math.max(0, Math.min(Number(p.wait_ms), 10000))
           : 2000;
       const rpcTimeoutMs = Math.max(1500, Math.min(waitMs > 0 ? waitMs + 1000 : 3000, 5000));
-      let qrEventArrived = false;
-      const waitQrEvent =
-        waitMs > 0 && this._qrCodeWaiters
-          ? waitForEventOnce(this._qrCodeWaiters, waitMs).then((val) => {
-              if (val) qrEventArrived = true;
-              return val;
-            })
+      const qrWaiter =
+        waitMs > 0 && this.inboundPipeline._qrCodeWaiters
+          ? createEventWaiter(this.inboundPipeline._qrCodeWaiters, waitMs)
           : null;
-      let directQr = "";
-      const invokePromise = Promise.resolve()
-        .then(() =>
-          this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {}, [], {
-            timeoutMs: rpcTimeoutMs,
-          })
-        )
-        .then((qrRes) => {
-          const extracted = extractQrCodeBase64(qrRes);
-          if (extracted) {
-            directQr = extracted;
-            this.lastQrCodeBase64 = extracted;
-          } else {
-            const shape =
-              qrRes && typeof qrRes === "object"
-                ? Object.keys(qrRes).slice(0, 16).join(",")
-                : typeof qrRes;
-            this.logger?.debug?.(
-              "login",
-              `getQRCodePicture returned without direct QR (shape=${shape})`
-            );
-          }
-        })
-        .catch((err) => {
-          this.logger?.debug?.("login", err);
-        });
-      if (waitQrEvent) {
-        await Promise.race([
-          invokePromise,
-          waitQrEvent.then((val) => {
-            if (!val) return invokePromise;
+      const waitQrPromise = qrWaiter
+        ? qrWaiter.promise.then((val) => {
+            if (val) {
+              freshQr = String(val);
+            }
             return val;
-          }),
-        ]);
-        if (!directQr && !qrEventArrived) {
-          await waitQrEvent;
+          })
+        : null;
+      try {
+        const invokePromise = Promise.resolve()
+          .then(() =>
+            this.invokeNt("nodeIKernelLoginService/getQRCodePicture", {}, [], {
+              timeoutMs: rpcTimeoutMs,
+            })
+          )
+          .then((qrRes) => {
+            const extracted = extractQrCodeBase64(qrRes);
+            if (extracted) {
+              freshQr = extracted;
+              this.lastQrCodeBase64 = extracted;
+            } else {
+              const shape =
+                qrRes && typeof qrRes === "object"
+                  ? Object.keys(qrRes).slice(0, 16).join(",")
+                  : typeof qrRes;
+              this.logger?.debug?.(
+                "login",
+                `getQRCodePicture returned without direct QR (shape=${shape})`
+              );
+            }
+          })
+          .catch((err) => {
+            this.logger?.debug?.("login", err);
+          });
+        if (waitQrPromise) {
+          await Promise.race([
+            invokePromise,
+            waitQrPromise.then((val) => {
+              if (!val) return invokePromise;
+            }),
+          ]);
+          if (!freshQr) {
+            await waitQrPromise;
+          }
+        } else {
+          await invokePromise;
         }
-      } else {
-        await invokePromise;
+      } finally {
+        qrWaiter?.cancel();
       }
     }
     return {
       online: Boolean(this.online),
-      qrcode_base64: String(this.lastQrCodeBase64 || ""),
+      qrcode_base64: String(freshQr || this.lastQrCodeBase64 || ""),
+      refreshed: Boolean(freshQr),
     };
   },
 
@@ -718,8 +746,8 @@ const ACTION_HANDLERS = {
         context
       );
     }
-    const peer = await this._resolvePeerForUser(userId, p.group_id);
-    return await this._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), p.group_id);
+    const peer = await this.outboundPipeline._resolvePeerForUser(userId, p.group_id);
+    return await this.outboundPipeline._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), p.group_id);
   },
 
   async send_group_msg(p, context) {
@@ -734,7 +762,7 @@ const ACTION_HANDLERS = {
       );
     }
     const peer = { chatType: 2, peerUid: String(groupId), guildId: "" };
-    return await this._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), groupId);
+    return await this.outboundPipeline._sendMessageToPeer(peer, p.message, Boolean(p.auto_escape), groupId);
   },
 
   async send_msg(p, context) {
@@ -806,7 +834,7 @@ const ACTION_HANDLERS = {
     }
     if (rawMsg) {
       try {
-        await this._hydrateNtMsgMedia(rawMsg);
+        await this.inboundPipeline._hydrateNtMsgMedia(rawMsg);
         const refreshed = formatNtMsgToOneBotEvent(rawMsg, {
           selfId: this.selfUin,
           uinUidStore: this.uinUidStore,
@@ -880,8 +908,8 @@ const ACTION_HANDLERS = {
     if (!peer) {
       if (p.group_id) {
         peer = { chatType: 2, peerUid: String(p.group_id), guildId: "" };
-      } else if (p.user_id && typeof this._resolvePeerForUser === "function") {
-        peer = await this._resolvePeerForUser(p.user_id, p.group_id);
+      } else if (p.user_id && typeof this.outboundPipeline?._resolvePeerForUser === "function") {
+        peer = await this.outboundPipeline._resolvePeerForUser(p.user_id, p.group_id);
       } else {
         peer = { chatType: 2, peerUid: "0", guildId: "" };
       }
@@ -909,7 +937,7 @@ const ACTION_HANDLERS = {
     const messages = [];
     for (const m of msgList) {
       try {
-        await this._hydrateNtMsgMedia(m, {
+        await this.inboundPipeline._hydrateNtMsgMedia(m, {
           downSourceType: 1,
           timeoutMs: perNodeAttemptMs,
           deadlineMs: hydrationDeadlineMs,
@@ -922,8 +950,8 @@ const ACTION_HANDLERS = {
           m.senderUin,
           nodeSenderUid ? this.uinUidStore?.getUinSync?.(nodeSenderUid) : 0
         );
-        if (!uin && nodeSenderUid && typeof this._ensureUinForUid === "function") {
-          uin = bridgeOneBot.pickPositiveUin(await this._ensureUinForUid(nodeSenderUid));
+        if (!uin && nodeSenderUid && typeof this.inboundPipeline?._ensureUinForUid === "function") {
+          uin = bridgeOneBot.pickPositiveUin(await this.inboundPipeline._ensureUinForUid(nodeSenderUid));
         }
         const shortId = this.messageIdStore.register(
           m.msgId,
@@ -974,13 +1002,14 @@ const ACTION_HANDLERS = {
       (p.group_id && action !== "send_private_forward_msg");
     const peer = isGroup
       ? { chatType: 2, peerUid: String(p.group_id), guildId: "" }
-      : await this._resolvePeerForUser(p.user_id, p.group_id);
+      : await this.outboundPipeline._resolvePeerForUser(p.user_id, p.group_id);
     const nodes = Array.isArray(p.messages)
       ? p.messages
       : Array.isArray(p.message)
       ? p.message
       : [];
 
+    /** @type {import("../types").NtPeer | null} */
     let cachedSelfPeer = null;
     const getSelfPeer = async () => {
       if (cachedSelfPeer) return cachedSelfPeer;
@@ -1004,7 +1033,7 @@ const ACTION_HANDLERS = {
 
     if (msgInfos.length > 0) {
       try {
-        const sent = await this._invokeForwardWithEcho(peer, () =>
+        const sent = await this.outboundPipeline._invokeForwardWithEcho(peer, () =>
           this.invokeNt(
             "nodeIKernelMsgService/multiForwardMsgWithComment",
             {
@@ -1034,7 +1063,7 @@ const ACTION_HANDLERS = {
             .filter(Boolean)
             .join("\n\n");
           if (combined) {
-            const fallbackRes = await this._sendMessageToPeer(peer, combined);
+            const fallbackRes = await this.outboundPipeline._sendMessageToPeer(peer, combined);
             const fbRealId = String(fallbackRes.real_id || `fwd_${Date.now()}`);
             return {
               message_id: fallbackRes.message_id,
@@ -1071,6 +1100,7 @@ const ACTION_HANDLERS = {
 
   // ---- 4. Read, Input Status, Emoji Likes, Profile Likes, Pokes ----
   async mark_msg_as_read(p, _context, action) {
+    /** @type {{ chatType: number, peerUid: string, guildId?: string } | null} */
     let peer = null;
     if (p.message_id) {
       const entry = resolveMessageEntry(this, p.message_id);
@@ -1085,12 +1115,12 @@ const ACTION_HANDLERS = {
       if (isGroupTarget && (p.group_id || p.target_id)) {
         peer = { chatType: 2, peerUid: String(p.group_id || p.target_id), guildId: "" };
       } else if (p.user_id || p.target_id) {
-        peer = await this._resolvePeerForUser(p.user_id || p.target_id);
+        peer = await this.outboundPipeline._resolvePeerForUser(p.user_id || p.target_id);
       }
     }
     if (peer && peer.peerUid) {
       const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
-      this._sessionScheduler.cancelPeerReaction(peerKey);
+      this.sessionController.scheduler.cancelPeerReaction(peerKey);
       await this.simulateHumanSession({
         chatType: peer.chatType,
         peerUid: peer.peerUid,
@@ -1111,9 +1141,9 @@ const ACTION_HANDLERS = {
   async set_input_status(p) {
     const userId = p.user_id;
     if (!userId) throw new Error("user_id is required");
-    const peer = await this._resolvePeerForUser(userId);
+    const peer = await this.outboundPipeline._resolvePeerForUser(userId);
     const peerKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId || ""}`;
-    this._sessionScheduler.cancelPeerReaction(peerKey);
+    this.sessionController.scheduler.cancelPeerReaction(peerKey);
     const eventType = Number(p.event_type ?? 1);
     await this.simulateHumanSession({
       chatType: peer.chatType,
@@ -1153,7 +1183,7 @@ const ACTION_HANDLERS = {
       entry?.peer ||
       (p.group_id
         ? { chatType: 2, peerUid: String(p.group_id), guildId: "" }
-        : await this._resolvePeerForUser(p.user_id));
+        : await this.outboundPipeline._resolvePeerForUser(p.user_id));
     const msgSeq = String(entry?.msgSeq || p.msg_seq || "0");
     const emojiId = String(p.emoji_id || "");
     const emojiType = String(p.emoji_type || (Number(emojiId) > 999 ? "2" : "1"));
@@ -1236,17 +1266,17 @@ const ACTION_HANDLERS = {
   },
 
   async group_poke(p) {
-    await this._sendPokeInternal(p.group_id, p.user_id);
+    await this.outboundPipeline._sendPokeInternal(p.group_id, p.user_id);
     return {};
   },
 
   async friend_poke(p) {
-    await this._sendPokeInternal(undefined, p.user_id);
+    await this.outboundPipeline._sendPokeInternal(undefined, p.user_id);
     return {};
   },
 
   async send_poke(p) {
-    await this._sendPokeInternal(p.group_id, p.user_id || p.target_id);
+    await this.outboundPipeline._sendPokeInternal(p.group_id, p.user_id || p.target_id);
     return {};
   },
 

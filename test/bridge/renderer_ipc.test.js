@@ -383,19 +383,19 @@ test("_isTrustedIpcEvent blocks spoofed renderer events, __ROSMONTIS_BRIDGE_CMD_
 
       // Spoof 1: Unknown webContents
       const unknownWc = { id: 99, mainFrame: mainFrameObj, isDestroyed: () => false, getURL: () => currentRendererUrl };
-      onBridgeEvent({ sender: unknownWc, senderFrame: mainFrameObj }, makeFakeRecvPayload("spoof_1", bridge._ipcAuthToken));
+      onBridgeEvent({ sender: unknownWc, senderFrame: mainFrameObj }, makeFakeRecvPayload("spoof_1", bridge.rendererIpc._ipcAuthToken));
 
       // Spoof 2: Subframe (senderFrame !== sender.mainFrame)
       onBridgeEvent(
         { sender: fakeWebContents, senderFrame: childSubFrameObj },
-        makeFakeRecvPayload("spoof_2", bridge._ipcAuthToken)
+        makeFakeRecvPayload("spoof_2", bridge.rendererIpc._ipcAuthToken)
       );
 
       // Spoof 3: Untrusted https://evil.example URL
       currentRendererUrl = "https://evil.example/malicious.html";
       onBridgeEvent(
         { sender: fakeWebContents, senderFrame: mainFrameObj },
-        makeFakeRecvPayload("spoof_3", bridge._ipcAuthToken)
+        makeFakeRecvPayload("spoof_3", bridge.rendererIpc._ipcAuthToken)
       );
       currentRendererUrl = "app://./renderer/index.html#/main/message";
 

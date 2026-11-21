@@ -45,29 +45,58 @@ function walkJsFiles(dirPath) {
 }
 
 /**
- * Scan `src/**\/*.js` for `// @ts-check` directives in the leading file header.
- * @returns {{ total: number, checked: number, percent: string, uncovered: string[] }}
+ * Verify `jsconfig.json` enables `strictNullChecks: true` (directly or via `strict: true`).
+ * @returns {boolean}
+ */
+function verifyStrictNullChecksConfig() {
+  if (!fs.existsSync(JSCONFIG_PATH)) {
+    throw new Error(`Missing jsconfig.json at ${JSCONFIG_PATH}`);
+  }
+  const parsed = JSON.parse(fs.readFileSync(JSCONFIG_PATH, "utf8"));
+  const compilerOptions = parsed && typeof parsed === "object" ? parsed.compilerOptions || {} : {};
+  const enabled =
+    compilerOptions.strictNullChecks === true ||
+    (compilerOptions.strict === true && compilerOptions.strictNullChecks !== false);
+  if (!enabled) {
+    throw new Error("jsconfig.json must enable compilerOptions.strictNullChecks: true");
+  }
+  return true;
+}
+
+/**
+ * Scan `src/**\/*.js` for `// @ts-check` directives in the leading file header and
+ * verify zero `@ts-ignore` / `@ts-nocheck` suppressions across `src/**\/*.js`.
+ * @returns {{ total: number, checked: number, percent: string, uncovered: string[], suppressions: string[] }}
  */
 function collectTsCheckCoverage() {
   const files = walkJsFiles(SRC_DIR);
   /** @type {string[]} */
   const uncovered = [];
+  /** @type {string[]} */
+  const suppressions = [];
   let checked = 0;
 
   for (const filePath of files) {
+    const rel = path.relative(REPO_ROOT, filePath).replace(/\\/g, "/");
     const raw = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
-    const headerLines = raw.split(/\r?\n/).slice(0, 10);
+    const lines = raw.split(/\r?\n/);
+    const headerLines = lines.slice(0, 10);
     const enabled = headerLines.some((line) => /^\s*\/\/\s*@ts-check\b/.test(line));
     if (enabled) {
       checked += 1;
     } else {
-      uncovered.push(path.relative(REPO_ROOT, filePath).replace(/\\/g, "/"));
+      uncovered.push(rel);
+    }
+    for (let i = 0; i < lines.length; i += 1) {
+      if (/^\s*\/\/\s*@ts-(?:ignore|nocheck)\b/.test(lines[i])) {
+        suppressions.push(`${rel}:${i + 1}`);
+      }
     }
   }
 
   const total = files.length;
   const percent = total > 0 ? ((checked / total) * 100).toFixed(1) : "0.0";
-  return { total, checked, percent, uncovered };
+  return { total, checked, percent, uncovered, suppressions };
 }
 
 /**
@@ -154,10 +183,14 @@ function resolveGlobalTsc() {
   const whichRes = spawnSync(locator, ["tsc"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   if (whichRes.status !== 0 || !whichRes.stdout) return null;
 
-  const firstMatch = whichRes.stdout
+  const matches = whichRes.stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find(Boolean);
+    .filter(Boolean);
+  const firstMatch =
+    process.platform === "win32"
+      ? matches.find((line) => /\.(cmd|exe|bat)$/i.test(line)) || matches[0]
+      : matches[0];
   if (!firstMatch) return null;
 
   const candidateRoots = [path.join(REPO_ROOT, "node_modules", "@types")];
@@ -213,12 +246,16 @@ function installIsolatedToolchain(targetDir) {
 /**
  * Execute `tsc --noEmit -p jsconfig.json` with optional `--typeRoots`.
  * @param {{ mode: "node" | "bin", executable: string, typeRoots: string | null }} tool
+ * @param {boolean} [verbose=false]
  * @returns {number}
  */
-function runTsc(tool) {
+function runTsc(tool, verbose = false) {
   const tscArgs = ["--noEmit", "-p", JSCONFIG_PATH];
   if (tool.typeRoots) {
     tscArgs.push("--typeRoots", tool.typeRoots);
+  }
+  if (verbose) {
+    console.log(`[typecheck] Invoking (${tool.mode}): ${tool.executable} ${tscArgs.join(" ")}`);
   }
 
   let res;
@@ -227,7 +264,7 @@ function runTsc(tool) {
       cwd: REPO_ROOT,
       stdio: "inherit",
     });
-  } else if (process.platform === "win32" && /\.(cmd|bat)$/i.test(tool.executable)) {
+  } else if (process.platform === "win32" && !/\.exe$/i.test(tool.executable)) {
     const quotedExe = `"${tool.executable.replace(/"/g, '\\"')}"`;
     const quotedArgs = tscArgs.map((arg) => (/[\s"&|<>^]/.test(arg) ? `"${arg.replace(/"/g, '\\"')}"` : arg)).join(" ");
     res = spawnSync(`${quotedExe} ${quotedArgs}`, {
@@ -255,14 +292,27 @@ function main() {
   const verbose = args.has("--verbose");
   const coverageOnly = args.has("--coverage-only");
 
+  const strictNullChecksEnabled = verifyStrictNullChecksConfig();
   const coverage = collectTsCheckCoverage();
   console.log(
-    `[typecheck] @ts-check coverage: ${coverage.checked}/${coverage.total} src files (${coverage.percent}%)`
+    `[typecheck] @ts-check coverage: ${coverage.checked}/${coverage.total} src files (${coverage.percent}%) | strictNullChecks: ${strictNullChecksEnabled} | suppressions: ${coverage.suppressions.length}`
   );
-  if (verbose && coverage.uncovered.length > 0) {
-    console.log("[typecheck] Uncovered src files:");
+  if (coverage.uncovered.length > 0) {
+    console.error("[typecheck] Uncovered src files:");
     for (const rel of coverage.uncovered) {
-      console.log(`  - ${rel}`);
+      console.error(`  - ${rel}`);
+    }
+    if (!coverageOnly) {
+      throw new Error(`Expected 100% @ts-check coverage across src/**/*.js, missing ${coverage.uncovered.length} file(s)`);
+    }
+  }
+  if (coverage.suppressions.length > 0) {
+    console.error("[typecheck] Forbidden @ts-ignore / @ts-nocheck directives:");
+    for (const loc of coverage.suppressions) {
+      console.error(`  - ${loc}`);
+    }
+    if (!coverageOnly) {
+      throw new Error(`Forbidden @ts-ignore / @ts-nocheck in src/**/*.js (${coverage.suppressions.length} found)`);
     }
   }
   if (coverageOnly) {
@@ -273,7 +323,7 @@ function main() {
     const localTool = resolveLocalTsc();
     if (localTool) {
       console.log(`[typecheck] Using local tsc: ${localTool.executable}`);
-      const code = runTsc(localTool);
+      const code = runTsc(localTool, verbose);
       if (code === 0) console.log("[typecheck] Passed with 0 errors.");
       process.exit(code);
     }
@@ -281,7 +331,7 @@ function main() {
     const globalTool = resolveGlobalTsc();
     if (globalTool) {
       console.log(`[typecheck] Using global tsc: ${globalTool.executable}`);
-      const code = runTsc(globalTool);
+      const code = runTsc(globalTool, verbose);
       if (code === 0) console.log("[typecheck] Passed with 0 errors.");
       process.exit(code);
     }
@@ -304,11 +354,14 @@ function main() {
       toolchain = installIsolatedToolchain(tmpDir);
     }
 
-    const exitCode = runTsc({
-      mode: "node",
-      executable: toolchain.tscJs,
-      typeRoots: toolchain.typeRoots,
-    });
+    const exitCode = runTsc(
+      {
+        mode: "node",
+        executable: toolchain.tscJs,
+        typeRoots: toolchain.typeRoots,
+      },
+      verbose
+    );
     if (exitCode === 0) {
       console.log("[typecheck] Passed with 0 errors.");
     }

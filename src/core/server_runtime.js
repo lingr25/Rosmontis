@@ -37,6 +37,9 @@ const {
 
 const { isQuietLogsEnabled } = require("./env");
 
+/** @typedef {import("../types").BridgeHost} BridgeHost */
+/** @typedef {import("../types").BridgeConfig} BridgeConfig */
+/** @typedef {import("../types").ActionContext} ActionContext */
 /** @typedef {import("../types").ListenErrorEntry} ListenErrorEntry */
 /** @typedef {import("../types").WebhookStats} WebhookStats */
 /** @typedef {import("../types").ReloadConfigResult} ReloadConfigResult */
@@ -123,6 +126,7 @@ function computeConfigDiff(prevConfig = {}, nextConfig = {}) {
       changedKeys.push(key);
     }
   }
+  /** @type {Set<string>} */
   const networkSet = new Set(NETWORK_RELOAD_KEYS);
   const networkChangedKeys = changedKeys.filter((k) => networkSet.has(k));
   return {
@@ -200,151 +204,62 @@ function hasMeaningfulQuickOperation(obj) {
   return false;
 }
 
-const LEGACY_SERVER_CTRL_SYM = Symbol("rosmontisLegacyServerRuntime");
-const LEGACY_SERVER_STATE_KEYS = Object.freeze([
-  "_httpServers",
-  "_wsServers",
-  "_wsServerClients",
-  "_reverseWsClients",
-  "_wsClientHandles",
-  "_activeWebhookReqs",
-  "_webhookRetryTimers",
-  "_webhookQueue",
-  "_webhookGeneration",
-  "webhookStats",
-  "_sighupHandler",
-  "listenErrors",
-  "_heartbeatTimer",
-  "_wsPingTimer",
-  "_stopped",
-  "_transportAsyncLocal",
-  "_reloadChain",
-  "_pendingDeferredReloadCancels",
-  "_pendingNetworkRestart",
-]);
-
 /**
  * Composed HTTP / WebSocket / Webhook / Hot-Reload transport runtime.
  */
 class ServerRuntime {
   /**
-   * @param {any} [bridge]
+   * @param {BridgeHost | Partial<BridgeHost>} [bridge={}]
    */
   constructor(bridge = {}) {
-    /** @type {any} */
-    this.bridge = bridge || {};
+    /** @type {BridgeHost} */
+    this.bridge = /** @type {BridgeHost} */ (bridge || {});
     /** @type {http.Server[]} */
-    this._httpServers =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_httpServers") &&
-      Array.isArray(this.bridge._httpServers)
-        ? this.bridge._httpServers
-        : [];
+    this._httpServers = [];
     /** @type {http.Server[]} */
-    this._wsServers =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_wsServers") &&
-      Array.isArray(this.bridge._wsServers)
-        ? this.bridge._wsServers
-        : [];
+    this._wsServers = [];
     /** @type {Set<any>} */
-    this._wsServerClients =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_wsServerClients") &&
-      this.bridge._wsServerClients instanceof Set
-        ? this.bridge._wsServerClients
-        : new Set();
+    this._wsServerClients = new Set();
     /** @type {any[]} */
-    this._reverseWsClients =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_reverseWsClients") &&
-      Array.isArray(this.bridge._reverseWsClients)
-        ? this.bridge._reverseWsClients
-        : [];
+    this._reverseWsClients = [];
     /** @type {any[]} */
     this._wsClientHandles = this._reverseWsClients;
     /** @type {Set<any>} */
-    this._activeWebhookReqs =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_activeWebhookReqs") &&
-      this.bridge._activeWebhookReqs instanceof Set
-        ? this.bridge._activeWebhookReqs
-        : new Set();
-    /** @type {Set<any>} */
-    this._webhookRetryTimers =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_webhookRetryTimers") &&
-      this.bridge._webhookRetryTimers instanceof Set
-        ? this.bridge._webhookRetryTimers
-        : new Set();
-    /** @type {any[]} */
-    this._webhookQueue =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_webhookQueue") &&
-      Array.isArray(this.bridge._webhookQueue)
-        ? this.bridge._webhookQueue
-        : [];
+    this._activeWebhookReqs = new Set();
+    /** @type {Set<{ timer: ReturnType<typeof setTimeout> | null, cancel: () => void }>} */
+    this._webhookRetryTimers = new Set();
+    /** @type {Array<{ clientCfg: Record<string, any>, event: any, resolve: (val: any) => void, reject: (err: any) => void }>} */
+    this._webhookQueue = [];
     /** @type {number} */
-    this._webhookGeneration = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_webhookGeneration"
-    )
-      ? Number(this.bridge._webhookGeneration) || 0
-      : 0;
+    this._webhookGeneration = 0;
     /** @type {WebhookStats} */
-    this.webhookStats =
-      Object.prototype.hasOwnProperty.call(this.bridge, "webhookStats") &&
-      this.bridge.webhookStats &&
-      typeof this.bridge.webhookStats === "object"
-        ? this.bridge.webhookStats
-        : { ok: 0, failed: 0, retries: 0, dropped: 0, inFlight: 0, queued: 0 };
+    this.webhookStats = { ok: 0, failed: 0, retries: 0, dropped: 0, inFlight: 0, queued: 0 };
     /** @type {(() => void) | null} */
-    this._sighupHandler = Object.prototype.hasOwnProperty.call(this.bridge, "_sighupHandler")
-      ? this.bridge._sighupHandler
-      : null;
+    this._sighupHandler = null;
     /** @type {ListenErrorEntry[]} */
-    this.listenErrors =
-      Object.prototype.hasOwnProperty.call(this.bridge, "listenErrors") &&
-      Array.isArray(this.bridge.listenErrors)
-        ? this.bridge.listenErrors
-        : [];
+    this.listenErrors = [];
     /** @type {ReturnType<typeof setInterval> | null} */
-    this._heartbeatTimer = Object.prototype.hasOwnProperty.call(this.bridge, "_heartbeatTimer")
-      ? this.bridge._heartbeatTimer
-      : null;
+    this._heartbeatTimer = null;
     /** @type {ReturnType<typeof setInterval> | null} */
-    this._wsPingTimer = Object.prototype.hasOwnProperty.call(this.bridge, "_wsPingTimer")
-      ? this.bridge._wsPingTimer
-      : null;
+    this._wsPingTimer = null;
     /** @type {boolean} */
-    this._stopped = Object.prototype.hasOwnProperty.call(this.bridge, "_stopped")
-      ? Boolean(this.bridge._stopped)
-      : false;
+    this._stopped = false;
     /** @type {AsyncLocalStorage<any> | null} */
-    this._transportAsyncLocal = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_transportAsyncLocal"
-    )
-      ? this.bridge._transportAsyncLocal
-      : null;
+    this._transportAsyncLocal = null;
     /** @type {Promise<any> | null} */
-    this._reloadChain = Object.prototype.hasOwnProperty.call(this.bridge, "_reloadChain")
-      ? this.bridge._reloadChain
-      : null;
+    this._reloadChain = null;
     /** @type {Set<() => void>} */
-    this._pendingDeferredReloadCancels =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_pendingDeferredReloadCancels") &&
-      this.bridge._pendingDeferredReloadCancels instanceof Set
-        ? this.bridge._pendingDeferredReloadCancels
-        : new Set();
+    this._pendingDeferredReloadCancels = new Set();
     /** @type {Promise<void> | null} */
-    this._pendingNetworkRestart = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_pendingNetworkRestart"
-    )
-      ? this.bridge._pendingNetworkRestart
-      : null;
+    this._pendingNetworkRestart = null;
   }
 
-  /** @returns {any} */
+  /** @returns {BridgeConfig | undefined} */
   get config() {
     return this.bridge.config;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("./primitives").BridgeLogger> | undefined} */
   get logger() {
     return this.bridge.logger;
   }
@@ -485,7 +400,7 @@ class ServerRuntime {
   _computeReadiness() {
     const b = this.bridge;
     const online = Boolean(b.online);
-    const ntReady = typeof b._isNtReady === "function" ? Boolean(b._isNtReady()) : true;
+    const ntReady = b.inboundPipeline ? Boolean(b.inboundPipeline._isNtReady()) : true;
     const rendererUnresponsive = Boolean(b.rendererHealthStats?.unresponsiveActive);
     const ready = online && ntReady && !rendererUnresponsive;
     return {
@@ -505,8 +420,15 @@ class ServerRuntime {
       0,
       Math.floor((Date.now() - (b.startedAtMs || Date.now())) / 1000)
     );
-    const inv = b.invokeStats || {};
-    const echo = b.sendEchoStats || {};
+    const inv = b.invokeStats || {
+      tier1: 0,
+      tier2: 0,
+      tier3: 0,
+      degraded: 0,
+      blockedReplays: 0,
+      failed: 0,
+    };
+    const echo = b.sendEchoStats || { matched: 0, fromResult: 0, timedOut: 0 };
     const wh = this._ensureWebhookState();
 
     let wsServerClients = 0;
@@ -525,7 +447,7 @@ class ServerRuntime {
     const rateLimitRejected = Number(b.rateLimiter?.getStats?.()?.rejected || 0);
     const rendererCrashes = Number(b.rendererHealthStats?.crashes || 0);
     const msgStoreSize = Number(b.messageIdStore?.byShortId?.size ?? b.messageIdStore?.size ?? 0);
-    const uinUidStoreSize = Number(b.uinUidStore?.uinToUid?.size ?? b.uinUidStore?.size ?? 0);
+    const uinUidStoreSize = Number(b.uinUidStore?.uinToUid?.size ?? 0);
 
     const lines = [
       "# HELP rosmontis_up Whether the Rosmontis bridge process is up.",
@@ -604,7 +526,7 @@ class ServerRuntime {
           ? this.bridge.reloadConfig.bind(this.bridge)
           : this.reloadConfig.bind(this);
       reloadFn().catch((/** @type {any} */ err) => {
-        this.bridge._logWarn?.(
+        this.logger?.warnThrottled?.(
           "sighup-reload-err",
           `SIGHUP config reload failed: ${err?.message || err}`,
           5000
@@ -921,6 +843,7 @@ class ServerRuntime {
 
         conn.on("message", (/** @type {any} */ text) => {
           if (wsRole === "event") {
+            /** @type {any} */
             let payload = null;
             try {
               payload = typeof text === "string" ? JSON.parse(text) : text;
@@ -974,8 +897,10 @@ class ServerRuntime {
     }
 
     // 4. Start Heartbeat Timer
-    if (!this._heartbeatTimer && this.config?.heartbeatIntervalMs > 0) {
+    const heartbeatMs = Number(this.config?.heartbeatIntervalMs || 0);
+    if (!this._heartbeatTimer && heartbeatMs > 0) {
       this._heartbeatTimer = setInterval(() => {
+        const interval = Number(this.config?.heartbeatIntervalMs || heartbeatMs);
         this.bridge.broadcastOneBotEvent?.(
           formatMetaEvent(
             "heartbeat",
@@ -988,12 +913,12 @@ class ServerRuntime {
                   Math.floor((Date.now() - (this.bridge.startedAtMs || Date.now())) / 1000)
                 ),
               },
-              interval: this.config.heartbeatIntervalMs,
+              interval,
             },
             { selfId: this.bridge.selfUin }
           )
         );
-      }, this.config.heartbeatIntervalMs);
+      }, heartbeatMs);
       if (typeof this._heartbeatTimer.unref === "function") {
         this._heartbeatTimer.unref();
       }
@@ -1157,7 +1082,7 @@ class ServerRuntime {
       tasks.push(
         this._enqueueWebhookDelivery(clientCfg, event).catch((err) => {
           const warnKey = `webhook-err:${clientCfg.name || clientCfg.url}`;
-          this.bridge._logWarn?.(
+          this.logger?.warnThrottled?.(
             warnKey,
             `HTTP POST webhook delivery failed (${clientCfg.url}): ${err?.message || err}`,
             60000
@@ -1185,7 +1110,7 @@ class ServerRuntime {
     if (stats.inFlight >= maxConcurrency && this._webhookQueue.length >= maxQueueSize) {
       stats.dropped += 1;
       stats.queued = this._webhookQueue.length;
-      this.bridge._logWarn?.(
+      this.logger?.warnThrottled?.(
         `webhook-queue-full:${clientCfg.name || clientCfg.url}`,
         `HTTP POST webhook queue full (max=${maxQueueSize}); dropping event for ${clientCfg.url}`,
         30000
@@ -1208,6 +1133,7 @@ class ServerRuntime {
 
     while (stats.inFlight < maxConcurrency && this._webhookQueue.length > 0) {
       const task = this._webhookQueue.shift();
+      if (!task) break;
       stats.queued = this._webhookQueue.length;
       stats.inFlight += 1;
       const generation = this._webhookGeneration;
@@ -1349,6 +1275,7 @@ class ServerRuntime {
     this._webhookRetryTimers.clear();
     while (this._webhookQueue.length > 0) {
       const pending = this._webhookQueue.shift();
+      if (!pending) continue;
       try {
         pending.resolve(null);
       } catch (err) {
@@ -1647,7 +1574,9 @@ class ServerRuntime {
         }
         this._pendingDeferredReloadCancels.add(cancelPending);
 
-        const deferredRestartPromise = (async () => {
+        /** @type {Promise<void> | null} */
+        let deferredRestartPromise = null;
+        deferredRestartPromise = (async () => {
           try {
             await triggerPromise;
             this._pendingDeferredReloadCancels?.delete(cancelPending);
@@ -1656,7 +1585,7 @@ class ServerRuntime {
             if (cancelled || this._stopped) return;
             await this.startServers();
           } catch (/** @type {any} */ err) {
-            this.bridge._logWarn?.(
+            this.logger?.warnThrottled?.(
               "reload-restart-err",
               `Deferred network reload failed: ${err?.message || err}`,
               5000
@@ -1713,15 +1642,15 @@ class ServerRuntime {
       }
       this._pendingDeferredReloadCancels.clear();
     }
-    if (typeof this.bridge._aioInteractionSeq === "number") {
-      this.bridge._aioInteractionSeq += 1;
+    if (this.bridge.sessionController) {
+      this.bridge.sessionController.interactionSeq += 1;
+      this.bridge.sessionController.clearIdleTimers();
+      this.bridge.sessionController.scheduler.dispose();
     }
-    this.bridge._clearIdleTimers?.();
-    this.bridge._sessionScheduler?.dispose?.();
     if (this.bridge.echoCorrelator && typeof this.bridge.echoCorrelator.clear === "function") {
       this.bridge.echoCorrelator.clear();
     }
-    this.bridge._rejectPendingRendererCmds?.(null, "bridge servers stopped");
+    this.bridge.rendererIpc?._rejectPendingRendererCmds(null, "bridge servers stopped");
     await this._stopNetworkRuntime();
     if (typeof this.bridge.flushStateStores === "function") {
       try {
@@ -1734,84 +1663,8 @@ class ServerRuntime {
   }
 }
 
-/**
- * Resolves or lazily binds a `ServerRuntime` for legacy `serverRuntimeMixin` hosts.
- * @param {any} host
- * @returns {ServerRuntime}
- */
-function _resolveLegacyServerRuntime(host) {
-  if (host instanceof ServerRuntime) return host;
-  if (host && host.serverRuntime instanceof ServerRuntime) return host.serverRuntime;
-  if (host && host[LEGACY_SERVER_CTRL_SYM] instanceof ServerRuntime) {
-    return host[LEGACY_SERVER_CTRL_SYM];
-  }
-  const ctrl = new ServerRuntime(host);
-  if (host && typeof host === "object") {
-    Object.defineProperty(host, LEGACY_SERVER_CTRL_SYM, {
-      value: ctrl,
-      enumerable: false,
-      configurable: true,
-    });
-    for (const key of LEGACY_SERVER_STATE_KEYS) {
-      const desc = Object.getOwnPropertyDescriptor(host, key);
-      if (!desc || ("value" in desc && desc.configurable !== false)) {
-        Object.defineProperty(host, key, {
-          enumerable: true,
-          configurable: true,
-          get() {
-            return /** @type {any} */ (ctrl)[key];
-          },
-          set(val) {
-            /** @type {any} */ (ctrl)[key] = val;
-          },
-        });
-      }
-    }
-  }
-  return ctrl;
-}
-
-const SERVER_RUNTIME_METHODS = /** @type {const} */ ([
-  "_checkAuth",
-  "_recordListenError",
-  "_listenServerInstance",
-  "_getTransportAls",
-  "_ensureWebhookState",
-  "_computeReadiness",
-  "_formatPrometheusMetrics",
-  "_installSighupHandler",
-  "_removeSighupHandler",
-  "_syncSighupHandler",
-  "_handleWsActionMessage",
-  "startServers",
-  "_startReverseWsLoop",
-  "_dispatchHttpWebhookEvent",
-  "_enqueueWebhookDelivery",
-  "_drainWebhookQueue",
-  "_waitWebhookRetry",
-  "_runWebhookTaskWithRetry",
-  "_clearWebhookRuntime",
-  "_postEventToHttpClient",
-  "_stopNetworkRuntime",
-  "reloadConfig",
-  "stopServers",
-]);
-
-/**
- * Backward-compatible mixin facade delegating to `ServerRuntime`.
- * @type {Record<string, (...args: any[]) => any>}
- */
-const serverRuntimeMixin = {};
-for (const methodName of SERVER_RUNTIME_METHODS) {
-  serverRuntimeMixin[methodName] = function (/** @type {any[]} */ ...args) {
-    const ctrl = _resolveLegacyServerRuntime(this);
-    return /** @type {any} */ (ctrl)[methodName](...args);
-  };
-}
-
 module.exports = {
   ServerRuntime,
-  serverRuntimeMixin,
   writeHttpJson,
   buildEndpointActionContext,
   buildFailedActionReply,

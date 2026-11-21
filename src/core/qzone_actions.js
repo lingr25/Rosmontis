@@ -127,6 +127,9 @@ function resolveHelpers(helpers = {}) {
   };
 }
 
+/**
+ * @param {import("../types").WebCredentialHost} bridge
+ */
 async function fetchClientKey(bridge) {
   const res = await bridge.invokeNt(
     "nodeIKernelTicketService/forceFetchClientKey",
@@ -142,7 +145,7 @@ async function fetchClientKey(bridge) {
 }
 
 /**
- * @param {any} bridge
+ * @param {import("../types").WebCredentialHost} bridge
  * @param {string} [domain]
  * @param {Record<string, any>} [helpers]
  * @returns {Promise<Record<string, string>>}
@@ -198,7 +201,7 @@ async function getCookiesObject(bridge, domain = "qun.qq.com", helpers = {}) {
 }
 
 /**
- * @param {any} bridge
+ * @param {import("../types").WebCredentialHost} bridge
  * @param {string} action
  * @param {Record<string, any>} [p]
  * @param {Record<string, any>} [helpers]

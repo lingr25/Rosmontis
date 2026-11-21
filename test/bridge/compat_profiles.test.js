@@ -266,9 +266,9 @@ test("compatProfile (global & per-endpoint), get_status.time, .handle_quick_oper
   await compatBridge.startServers();
   let wsNapClient = null;
   try {
-    const portDefault = compatBridge._httpServers[0].address().port;
-    const portSnow = compatBridge._httpServers[1].address().port;
-    const wsPortNap = compatBridge._wsServers[0].address().port;
+    const portDefault = compatBridge.serverRuntime._httpServers[0].address().port;
+    const portSnow = compatBridge.serverRuntime._httpServers[1].address().port;
+    const wsPortNap = compatBridge.serverRuntime._wsServers[0].address().port;
 
     // Default HTTP endpoint reports Rosmontis; SnowLuma HTTP endpoint reports SnowLuma
     const vDef = await httpJson(portDefault, "/get_version_info", {});

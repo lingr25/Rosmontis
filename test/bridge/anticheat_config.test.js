@@ -375,11 +375,11 @@ test("Dynamic User-Agent, temp file cleanup, multi-window activeWebContents cont
   devtoolsWc.getURL = () => "devtools://devtools/bundled/inspector.html";
   devtoolsWc.executeJavaScript = async () => ({ ok: true });
 
-  controller._attachToWebContents(mainWc);
+  controller.rendererIpc._attachToWebContents(mainWc);
   assert.strictEqual(controller.activeWebContents, mainWc);
 
   // Auxiliary devtools window must NOT overwrite active main window
-  controller._attachToWebContents(devtoolsWc);
+  controller.rendererIpc._attachToWebContents(devtoolsWc);
   assert.strictEqual(controller.activeWebContents, mainWc);
 
   // When mainWc is destroyed, activeWebContents is cleared
@@ -388,7 +388,7 @@ test("Dynamic User-Agent, temp file cleanup, multi-window activeWebContents cont
 
   // Verify onAddSendMsg deduplication
   let sendBroadcastCount = 0;
-  controller._broadcastOneBotEvent = () => {
+  controller.broadcastOneBotEvent = () => {
     sendBroadcastCount += 1;
   };
   const sampleSentMsg = {
@@ -398,8 +398,8 @@ test("Dynamic User-Agent, temp file cleanup, multi-window activeWebContents cont
     peerUid: "u_friend_1",
     elements: [],
   };
-  await controller._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [sampleSentMsg]);
-  await controller._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [sampleSentMsg]);
+  await controller.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [sampleSentMsg]);
+  await controller.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [sampleSentMsg]);
   assert.strictEqual(sendBroadcastCount, 0);
   assert.notStrictEqual(controller.messageIdStore.getByMsgId("7888888888888888888"), null);
 });
@@ -422,7 +422,7 @@ test("Map.prototype.set hook is restored to native once ntApi/ntStore/session ar
   });
   bridge.installMapPrototypeHook();
   assert.ok(!/\[native code\]/.test(Map.prototype.set.toString()), "hook should be active");
-  assert.strictEqual(bridge._mapSetHook, Map.prototype.set);
+  assert.strictEqual(bridge.ntCapture._mapSetHook, Map.prototype.set);
 
   // Simulate 908.background.js DI registrations
   const di = new Map();
@@ -434,7 +434,7 @@ test("Map.prototype.set hook is restored to native once ntApi/ntStore/session ar
     ),
   });
   await sleep(30);
-  assert.ok(bridge._mapSetHook, "must not release before ntStore/session are captured");
+  assert.ok(bridge.ntCapture._mapSetHook, "must not release before ntStore/session are captured");
 
   const listenerMap = new Map();
   const fakeSession = { getMsgService: () => ({}), getGroupService: () => ({}) };
@@ -457,7 +457,7 @@ test("Map.prototype.set hook is restored to native once ntApi/ntStore/session ar
 
   // Kernel listeners registered after release still reach the bridge via the instance patch
   const seen = [];
-  bridge._handleKernelEvent = async (listenerName, eventName) => {
+  bridge.inboundPipeline._handleKernelEvent = async (listenerName, eventName) => {
     seen.push(`${listenerName}/${eventName}`);
   };
   const lateEmitter = new EventEmitter();

@@ -54,6 +54,9 @@ function isWildcardNtApiProxy(ntApiTarget) {
   }
 }
 
+/**
+ * @param {import("../types").CapabilityProbeHost | null | undefined} bridge
+ */
 function resolveNtApiTarget(bridge) {
   const raw = bridge?.capturedServices?.ntApi;
   if (!raw || (typeof raw !== "object" && typeof raw !== "function")) {
@@ -82,6 +85,9 @@ function resolveNtApiTarget(bridge) {
   return raw;
 }
 
+/**
+ * @param {import("../types").CapabilityProbeHost | null | undefined} bridge
+ */
 function resolveWrapperSession(bridge) {
   const cs = bridge?.capturedServices;
   if (!cs || typeof cs !== "object") return null;
@@ -222,7 +228,7 @@ function hasKernelMethodOnResolved(
  * Read-only check for whether a specific NTQQ kernel RPC (`serviceName/methodName`)
  * is actually exposed by the captured `wrapperSession` or explicit `ntApi` runtime.
  *
- * @param {Record<string, any>} bridge
+ * @param {import("../types").CapabilityProbeHost | null | undefined} bridge
  * @param {string} serviceName
  * @param {string} methodName
  * @returns {boolean}
@@ -246,7 +252,7 @@ function hasKernelMethod(bridge, serviceName, methodName) {
  * Results are lightly cached on `bridge._capabilityProbeCache` and auto-invalidated
  * when captured service references or web-credential gating change (or via `forceRefresh`).
  *
- * @param {Record<string, any>} bridge
+ * @param {import("../types").CapabilityProbeHost | null | undefined} bridge
  * @param {object} [options]
  * @param {boolean} [options.forceRefresh=false]
  * @param {number} [options.ttlMs=10000]

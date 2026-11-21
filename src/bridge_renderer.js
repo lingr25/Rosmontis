@@ -48,207 +48,43 @@ const DEFAULT_REGISTERED_EVENTS = [
   "nodeIKernelSessionListener/onSessionInitComplete",
 ];
 
-const KNOWN_MAP_FIELDS = new Set(["msgAttributeInfos", "thumbPath", "picThumbPath"]);
 const BRIDGE_EVENT_CHANNEL = "__ROSMONTIS_BRIDGE_EVENT__";
 const BRIDGE_CMD_CHANNEL = "__ROSMONTIS_BRIDGE_CMD__";
 const BRIDGE_CMD_ACK_CHANNEL = "__ROSMONTIS_BRIDGE_CMD_ACK__";
 const BRIDGE_UNAVAILABLE_TAG = "ROSMONTIS_BRIDGE_UNAVAILABLE";
 const DEFAULT_BOUNDED_LRU_MAX = 2000;
 const SESSION_STEP_TIMEOUT_MS = 4000;
-const MAX_CODEC_DEPTH = 32;
 
+/** @type {WeakMap<object, () => void> | null} */
 const _cleanupByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
+/** @type {WeakMap<object, (token: string) => boolean> | null} */
 const _bootstrapAuthByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
+/** @type {WeakMap<object, (fn: (scope: string, err: any) => void) => void> | null} */
 const _diagSetterByWindow = typeof WeakMap === "function" ? new WeakMap() : null;
 
-function getObjectTag(val) {
-  return Object.prototype.toString.call(val);
+/** @type {typeof import("./core/wire_codec") | null} */
+let _wireCodecInlined = null;
+/* __ROSMONTIS_WIRE_CODEC_INJECT__ */
+const _wireCodec =
+  _wireCodecInlined || (typeof require === "function" ? require("./core/wire_codec") : null);
+if (!_wireCodec) {
+  throw new Error("Rosmontis wire codec is not initialized in renderer bundle");
 }
-
-function isMapLike(val) {
-  return val instanceof Map || getObjectTag(val) === "[object Map]";
-}
-
-function isSetLike(val) {
-  return val instanceof Set || getObjectTag(val) === "[object Set]";
-}
-
-function toUint8View(val) {
-  if (val instanceof Uint8Array) return val;
-  if (ArrayBuffer.isView(val)) {
-    return new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
-  }
-  if (getObjectTag(val) === "[object Uint8Array]") {
-    return Uint8Array.from(val);
-  }
-  return null;
-}
-
-function setOwnProp(target, key, value) {
-  if (key === "__proto__") {
-    Object.defineProperty(target, key, {
-      value,
-      enumerable: true,
-      configurable: true,
-      writable: true,
-    });
-  } else {
-    target[key] = value;
-  }
-}
-
-function encodeBridgeValue(val, { forJson = false, depth = 0, seen = null } = {}) {
-  if (val === undefined) {
-    return forJson ? { __rosmontisVoid__: true } : undefined;
-  }
-  if (val === null) return null;
-  if (typeof val === "bigint") return val.toString();
-  if (typeof val === "function" || typeof val === "symbol") {
-    return forJson ? { __rosmontisVoid__: true } : undefined;
-  }
-  if (typeof val !== "object") return val;
-
-  const u8 = toUint8View(val);
-  if (u8) {
-    return forJson ? { __rosmontisUint8Array__: Array.from(u8) } : u8;
-  }
-  if (val instanceof Date || getObjectTag(val) === "[object Date]") {
-    return forJson ? val.toISOString() : val;
-  }
-  if (depth > MAX_CODEC_DEPTH) {
-    return val;
-  }
-
-  const ancestors = seen || new Set();
-  if (ancestors.has(val)) {
-    return null;
-  }
-  ancestors.add(val);
-
-  try {
-    const nextOpts = { forJson, depth: depth + 1, seen: ancestors };
-
-    if (isMapLike(val)) {
-      return {
-        __rosmontisMap__: Array.from(val.entries(), ([k, v]) => [
-          encodeBridgeValue(k, nextOpts),
-          encodeBridgeValue(v, nextOpts),
-        ]),
-      };
-    }
-    if (isSetLike(val)) {
-      return Array.from(val.values(), (v) => encodeBridgeValue(v, nextOpts));
-    }
-    if (Array.isArray(val)) {
-      return val.map((item) => encodeBridgeValue(item, nextOpts));
-    }
-
-    const out = {};
-    for (const [k, v] of Object.entries(val)) {
-      setOwnProp(out, k, encodeBridgeValue(v, nextOpts));
-    }
-    return out;
-  } finally {
-    ancestors.delete(val);
-  }
-}
-
-function encodeBridgeMaps(val, depth = 0) {
-  return encodeBridgeValue(val, { forJson: false, depth });
-}
-
-function serializeBridgeResult(val) {
-  const encoded = encodeBridgeValue(val, { forJson: true, depth: 0 });
-  return JSON.stringify(encoded, (_key, item) => (typeof item === "bigint" ? item.toString() : item));
-}
-
-function reviveBridgePayload(val, fieldName = "", depth = 0, seen = null) {
-  if (val === null || val === undefined || typeof val !== "object") {
-    return val;
-  }
-
-  const u8 = toUint8View(val);
-  if (u8) return u8;
-
-  if (val instanceof Date || getObjectTag(val) === "[object Date]") {
-    return val;
-  }
-  if (depth > MAX_CODEC_DEPTH) {
-    return val;
-  }
-
-  const ancestors = seen || new Set();
-  if (ancestors.has(val)) {
-    return val;
-  }
-  ancestors.add(val);
-
-  try {
-    if (isMapLike(val)) {
-      const revivedMap = new Map();
-      for (const [k, v] of val.entries()) {
-        revivedMap.set(
-          reviveBridgePayload(k, "", depth + 1, ancestors),
-          reviveBridgePayload(v, "", depth + 1, ancestors)
-        );
-      }
-      return revivedMap;
-    }
-
-    if (Array.isArray(val)) {
-      return val.map((item) => reviveBridgePayload(item, "", depth + 1, ancestors));
-    }
-
-    const keys = Object.keys(val);
-    if (keys.length === 1) {
-      if (val.__rosmontisVoid__ === true) {
-        return undefined;
-      }
-      if (Array.isArray(val.__rosmontisMap__)) {
-        return new Map(
-          val.__rosmontisMap__.map((entry) => [
-            Array.isArray(entry)
-              ? reviveBridgePayload(entry[0], "", depth + 1, ancestors)
-              : undefined,
-            Array.isArray(entry)
-              ? reviveBridgePayload(entry[1], "", depth + 1, ancestors)
-              : undefined,
-          ])
-        );
-      }
-      if (Array.isArray(val.__rosmontisUint8Array__)) {
-        return Uint8Array.from(val.__rosmontisUint8Array__);
-      }
-      if (Array.isArray(val.__rosmontisBytes__)) {
-        return Uint8Array.from(val.__rosmontisBytes__);
-      }
-    } else if (
-      keys.length === 2 &&
-      val.type === "Buffer" &&
-      Array.isArray(val.data) &&
-      val.data.every((b) => typeof b === "number")
-    ) {
-      return Uint8Array.from(val.data);
-    }
-
-    if (KNOWN_MAP_FIELDS.has(fieldName)) {
-      return new Map(
-        Object.entries(val).map(([k, v]) => [
-          /^\d+$/.test(k) && fieldName !== "msgAttributeInfos" ? Number(k) : k,
-          reviveBridgePayload(v, "", depth + 1, ancestors),
-        ])
-      );
-    }
-
-    const out = {};
-    for (const [k, v] of Object.entries(val)) {
-      setOwnProp(out, k, reviveBridgePayload(v, k, depth + 1, ancestors));
-    }
-    return out;
-  } finally {
-    ancestors.delete(val);
-  }
-}
+const {
+  KNOWN_MAP_FIELDS,
+  MAX_CODEC_DEPTH,
+  safeJsJson,
+  getObjectTag,
+  isMapLike,
+  isSetLike,
+  toUint8View,
+  setOwnProp,
+  encodeBridgeValue,
+  encodeBridgeMaps,
+  serializeBridgeResult,
+  serializeBridgePayload,
+  reviveBridgePayload,
+} = _wireCodec;
 
 function setBoundedMap(map, key, value, maxEntries = DEFAULT_BOUNDED_LRU_MAX) {
   if (!isMapLike(map)) return map;
@@ -318,6 +154,7 @@ function installRendererBridge(targetWindow, options = {}) {
     return win.__ROSMONTIS_RENDERER_BRIDGE__;
   }
 
+  /** @type {((scope: string, err: any) => void) | null} */
   let diagnosticHandler =
     typeof options.onDiagnostic === "function" ? options.onDiagnostic : null;
 
@@ -443,6 +280,15 @@ function installRendererBridge(targetWindow, options = {}) {
   const attachedHandlerByChannel = new Map();
   const registeredWindowIds = new Set();
 
+  /**
+   * @type {{
+   *   activeAioPeer: Record<string, any> | null,
+   *   activeAioPeerKey: string,
+   *   focused: boolean,
+   *   lastReadAtByPeer: Map<string, number>,
+   *   lastTypingAtByPeer: Map<string, number>,
+   * }}
+   */
   const sessionState = {
     activeAioPeer: null,
     activeAioPeerKey: "",
@@ -683,7 +529,7 @@ function installRendererBridge(targetWindow, options = {}) {
           throw unknownErr;
         }
       }
-    } catch (err) {
+    } catch (/** @type {any} */ err) {
       reportDiag("handleBridgeCommand", err);
       const message = String(err?.message || err || "Renderer command failed");
       const code =
@@ -1255,8 +1101,17 @@ if (typeof module !== "undefined" && module.exports) {
     installRendererBridge,
     DEFAULT_REGISTERED_EVENTS,
     KNOWN_MAP_FIELDS,
+    MAX_CODEC_DEPTH,
+    safeJsJson,
+    getObjectTag,
+    isMapLike,
+    isSetLike,
+    toUint8View,
+    setOwnProp,
+    encodeBridgeValue,
     encodeBridgeMaps,
     serializeBridgeResult,
+    serializeBridgePayload,
     reviveBridgePayload,
     setBoundedMap,
   };

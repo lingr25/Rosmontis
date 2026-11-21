@@ -51,7 +51,7 @@ test("ntStore.emitter hyphenated events, async get_friend_list/get_group_list, a
   });
 
   assert.strictEqual(bridge.online, false);
-  bridge._inspectInversifyCache(fakeNtStore);
+  bridge.ntCapture._inspectInversifyCache(fakeNtStore);
 
   const friendsResp = await bridge.handleOneBotAction("get_friend_list", { no_cache: true });
   assert.strictEqual(friendsResp.status, "ok");
@@ -78,7 +78,7 @@ test("ntStore.emitter hyphenated events, async get_friend_list/get_group_list, a
     },
   };
   const rBridge = rendererMod.installRendererBridge(mockWin, { windowId: 2, autoRegisterListeners: false });
-  const serialized = bridge._serializeBridgePayload([
+  const serialized = bridge.rendererIpc._serializeBridgePayload([
     {
       msgId: "0",
       msgAttributeInfos: new Map(),
@@ -202,12 +202,12 @@ test("Inbound rkey-less image hydration, outbound copyFileWithDelExifInfo & 3.2.
     },
   });
 
-  bridge._attachNtStoreRootEmitter(rootEmitter);
+  bridge.ntCapture._attachNtStoreRootEmitter(rootEmitter);
   const broadcasted = [];
   bridge.broadcastOneBotEvent = (ev) => broadcasted.push(ev);
 
   // 8a. Inbound NTQQv2 image without rkey= downloads and becomes base64://
-  await bridge._processIncomingNtMessage({
+  await bridge.inboundPipeline._processIncomingNtMessage({
     msgId: "750001",
     msgSeq: "88",
     msgTime: "1760000000",
@@ -394,7 +394,7 @@ test("MemberRole (2/3/4), RichMedia getGroupFileList fileListForm, doubt buddy A
       assert.strictEqual(infoResp.data.role, expectedRole);
     }
 
-    await contractBridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+    await contractBridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
       [
         {
           msgId: "7800000000000000002",

@@ -82,7 +82,7 @@ test(
             msgId: myId,
           });
           setImmediate(() => {
-            curBridge._handleKernelEvent("KernelMsgListener", "onAddSendMsg", [
+            curBridge.inboundPipeline._handleKernelEvent("KernelMsgListener", "onAddSendMsg", [
               {
                 msgId: myId,
                 msgSeq: String(sendSeq),
@@ -101,7 +101,7 @@ test(
           const curBridge = getBridge();
           const fwdId = `75990000000000${++sendSeq}`;
           setImmediate(() => {
-            curBridge._handleKernelEvent("KernelMsgListener", "onAddSendMsg", [
+            curBridge.inboundPipeline._handleKernelEvent("KernelMsgListener", "onAddSendMsg", [
               {
                 msgId: fwdId,
                 msgSeq: String(sendSeq),
@@ -290,7 +290,7 @@ test(
       const receivedEvents = [];
       bridgeA.on("onebot_event", (ev) => receivedEvents.push(ev));
 
-      const slowBatchPromise = bridgeA._handleKernelEvent("KernelMsgListener", "onRecvMsg", [
+      const slowBatchPromise = bridgeA.inboundPipeline._handleKernelEvent("KernelMsgListener", "onRecvMsg", [
         [
           {
             msgId: "7600001",
@@ -315,7 +315,7 @@ test(
         await new Promise((r) => setTimeout(r, 10));
       }
 
-      await bridgeA._handleKernelEvent("KernelMsgListener", "onRecvMsg", [
+      await bridgeA.inboundPipeline._handleKernelEvent("KernelMsgListener", "onRecvMsg", [
         [
           {
             msgId: "7600002",
@@ -342,7 +342,7 @@ test(
       await slowBatchPromise;
 
       // 5. Extended inbound notices: group_msg_emoji_like, group_card, notify/title & lucky_king
-      await bridgeA._handleKernelEvent("KernelMsgListener", "onMsgInfoListUpdate", [
+      await bridgeA.inboundPipeline._handleKernelEvent("KernelMsgListener", "onMsgInfoListUpdate", [
         [
           {
             msgId: "7600002",
@@ -367,12 +367,12 @@ test(
         "Must emit group_msg_emoji_like notice on emojiLikesList update"
       );
 
-      await bridgeA._handleKernelEvent("KernelGroupListener", "onMemberInfoChange", [
+      await bridgeA.inboundPipeline._handleKernelEvent("KernelGroupListener", "onMemberInfoChange", [
         "888002",
         1,
         new Map([["u_30002", { uid: "u_30002", uin: "30002", cardName: "OldCard" }]]),
       ]);
-      await bridgeA._handleKernelEvent("KernelGroupListener", "onMemberInfoChange", [
+      await bridgeA.inboundPipeline._handleKernelEvent("KernelGroupListener", "onMemberInfoChange", [
         "888002",
         1,
         new Map([["u_30002", { uid: "u_30002", uin: "30002", cardName: "NewCard" }]]),
@@ -390,7 +390,7 @@ test(
         "Must emit group_card notice when known member cardName changes"
       );
 
-      await bridgeA._handleKernelEvent("KernelMsgListener", "onRecvMsg", [
+      await bridgeA.inboundPipeline._handleKernelEvent("KernelMsgListener", "onRecvMsg", [
         [
           {
             msgId: "7600003",

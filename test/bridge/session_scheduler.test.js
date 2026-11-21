@@ -54,7 +54,7 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
   {
     const { bridge, calls } = createPrivateCausalBridge({ autoReadAndTypeOnPrivateRecv: false });
     try {
-      await bridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+      await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
         [
           {
             msgId: "c_in_1",
@@ -119,16 +119,16 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
         user_id: 100020002,
         event_type: 1,
       });
-      assert.strictEqual(bridge._activeAioPeerKey, "1:u_priv_1:");
-      assert.strictEqual(bridge._windowFocused, true);
+      assert.strictEqual(bridge.sessionController.activeAioPeerKey, "1:u_priv_1:");
+      assert.strictEqual(bridge.sessionController.windowFocused, true);
 
       // Never call send_private_msg; let idle timers settle cleanly
       await new Promise((r) => setTimeout(r, 160));
 
-      assert.strictEqual(bridge._activeAioPeerKey, "");
-      assert.strictEqual(bridge._windowFocused, false);
-      assert.strictEqual(bridge._sendEchoWaiters.size, 0);
-      assert.strictEqual(bridge._sessionScheduler.pendingReactionCount, 0);
+      assert.strictEqual(bridge.sessionController.activeAioPeerKey, "");
+      assert.strictEqual(bridge.sessionController.windowFocused, false);
+      assert.strictEqual(bridge.echoCorrelator.waiters.size, 0);
+      assert.strictEqual(bridge.sessionController.scheduler.pendingReactionCount, 0);
       assert.ok(
         calls.some(
           (c) =>
@@ -247,7 +247,7 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
     });
     try {
       const pushPrivRecv = (msgId, peerUid, uin, text) =>
-        bridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+        bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
           [
             {
               msgId,
@@ -268,11 +268,11 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
       await pushPrivRecv("burst_1", "u_priv_1", "100020002", "msg 1");
       await pushPrivRecv("burst_2", "u_priv_1", "100020002", "msg 2");
       await pushPrivRecv("burst_3", "u_priv_1", "100020002", "msg 3");
-      assert.strictEqual(bridge._sessionScheduler.pendingReactionCount, 1);
+      assert.strictEqual(bridge.sessionController.scheduler.pendingReactionCount, 1);
       assert.strictEqual(calls.length, 0, "Auto-read reaction must wait for reaction delay");
 
       await new Promise((r) => setTimeout(r, 110));
-      assert.strictEqual(bridge._sessionScheduler.pendingReactionCount, 0);
+      assert.strictEqual(bridge.sessionController.scheduler.pendingReactionCount, 0);
       const readCalls = calls.filter((c) => c.cmd === "nodeIKernelMsgService/setMsgRead");
       const typingCalls = calls.filter((c) => c.cmd === "nodeIKernelMsgService/sendShowInputStatusReq");
       assert.strictEqual(readCalls.length, 1, "Coalesced burst must mark read once");
@@ -280,13 +280,13 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
       assert.ok(typingCalls[0].at >= readCalls[0].at, "sendShowInputStatusReq must occur after setMsgRead");
 
       // Wait for 400ms cooldown from u_priv_1 switch to expire before testing cancel on u_priv_2 / u_priv_3
-      bridge._sessionScheduler.lastSwitchAt = Date.now() - 1000;
+      bridge.sessionController.scheduler.lastSwitchAt = Date.now() - 1000;
 
       // (b) Immediate cancellation when send_private_msg or set_input_status runs first
       bridge.config.autoReadReactionDelayMs = 150;
       calls.length = 0;
       await pushPrivRecv("cancel_by_send", "u_priv_2", "100030003", "fast reply test");
-      assert.strictEqual(bridge._sessionScheduler.hasPendingReaction("1:u_priv_2:"), true);
+      assert.strictEqual(bridge.sessionController.scheduler.hasPendingReaction("1:u_priv_2:"), true);
 
       const fastReply = await bridge.handleOneBotAction("send_private_msg", {
         user_id: 100030003,
@@ -294,7 +294,7 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
       });
       assert.strictEqual(fastReply.status, "ok");
       assert.strictEqual(
-        bridge._sessionScheduler.hasPendingReaction("1:u_priv_2:"),
+        bridge.sessionController.scheduler.hasPendingReaction("1:u_priv_2:"),
         false,
         "send_private_msg must immediately cancel pending auto-read/typing reaction"
       );
@@ -306,34 +306,34 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
       );
 
       await pushPrivRecv("cancel_by_typing", "u_priv_3", "100040004", "explicit typing test");
-      assert.strictEqual(bridge._sessionScheduler.hasPendingReaction("1:u_priv_3:"), true);
-      bridge._sessionScheduler.lastSwitchAt = Date.now() - 1000;
+      assert.strictEqual(bridge.sessionController.scheduler.hasPendingReaction("1:u_priv_3:"), true);
+      bridge.sessionController.scheduler.lastSwitchAt = Date.now() - 1000;
       await bridge.handleOneBotAction("set_input_status", {
         user_id: 100040004,
         event_type: 1,
       });
       assert.strictEqual(
-        bridge._sessionScheduler.hasPendingReaction("1:u_priv_3:"),
+        bridge.sessionController.scheduler.hasPendingReaction("1:u_priv_3:"),
         false,
         "set_input_status must immediately cancel pending auto-read/typing reaction"
       );
 
       // (c) Advisory switch skipped when another peer just switched within aioSwitchCooldownMs (400ms)
       bridge.config.autoReadReactionDelayMs = 20;
-      bridge._recentReadByPeer.clear();
-      bridge._recentTypingByPeer.clear();
+      bridge.sessionController.recentReadByPeer.clear();
+      bridge.sessionController.recentTypingByPeer.clear();
       await bridge.handleOneBotAction("send_group_msg", {
         group_id: 999888,
         message: "锁定当前活跃群会话",
       });
-      assert.strictEqual(bridge._activeAioPeerKey, "2:999888:");
+      assert.strictEqual(bridge.sessionController.activeAioPeerKey, "2:999888:");
       calls.length = 0;
 
       // Incoming private message arrives immediately while 400ms cooldown from 2:999888: is active
       await pushPrivRecv("cooldown_skip_1", "u_priv_1", "100020002", "should skip advisory switch");
       await new Promise((r) => setTimeout(r, 55));
       assert.strictEqual(
-        bridge._activeAioPeerKey,
+        bridge.sessionController.activeAioPeerKey,
         "2:999888:",
         "Advisory auto-read reaction must skip switching when another peer just switched within aioSwitchCooldownMs"
       );
@@ -405,8 +405,8 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
     let wsStrClient = null;
     let wsArrClient = null;
     try {
-      const wsStrPort = fmtBridge._wsServers[0].address().port;
-      const wsArrPort = fmtBridge._wsServers[1].address().port;
+      const wsStrPort = fmtBridge.serverRuntime._wsServers[0].address().port;
+      const wsArrPort = fmtBridge.serverRuntime._wsServers[1].address().port;
       wsStrClient = await connectWsTestClient(wsStrPort);
       wsArrClient = await connectWsTestClient(wsArrPort);
 
@@ -417,7 +417,7 @@ test("Full private-chat causal timeline, CausalSessionScheduler peer-affinity & 
       fmtBridge.on("onebot_event", (ev) => localEvents.push(ev));
 
       // Emit incoming message containing face + text
-      await fmtBridge._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
+      await fmtBridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onRecvMsg", [
         [
           {
             msgId: "fmt_msg_7001",

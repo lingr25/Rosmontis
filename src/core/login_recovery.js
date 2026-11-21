@@ -4,14 +4,38 @@
 /**
  * Login State, QR Code & Auto-Quick-Login Recovery Subsystem (`src/core/login_recovery.js`)
  *
- * Extracted from `src/core/inbound_pipeline.js`:
+ * Typed helper class (`LoginRecovery`) composed by `InboundPipeline`:
  * - Login / QR / session-init / kicked-offline kernel event handlers
- * - Self-identity synchronization helpers (`_syncSelfIdentityFromLogin`)
- * - Saved-account selection & auto-quick-login recovery (`_tryAutoQuickLogin`)
+ * - Self-identity synchronization helpers (`syncSelfIdentityFromLogin`)
+ * - Saved-account selection & auto-quick-login recovery (`tryAutoQuickLogin`)
  */
 
 const { formatNoticeEvent } = require("../bridge_onebot");
 const { pickPositiveUin, normalizeLoginIdentity } = require("./nt_normalizer");
+
+/** @typedef {import("../types").InvokeNtFn} InvokeNtFn */
+/** @typedef {import("../types").NormalizedLoginIdentity} NormalizedLoginIdentity */
+
+/**
+ * Host contract required by `LoginRecovery` (satisfied by `InboundPipeline`).
+ * @typedef {object} LoginRecoveryHost
+ * @property {boolean} online
+ * @property {string} selfUin
+ * @property {string} selfUid
+ * @property {string} selfNickname
+ * @property {string} lastQrCodeBase64
+ * @property {any} activeWebContents
+ * @property {Set<(qrBase64: string) => void>} _qrCodeWaiters
+ * @property {number} _autoQuickLoginAttempts
+ * @property {number} _lastAutoQuickLoginAt
+ * @property {InstanceType<typeof import("./primitives").BridgeLogger>} [logger]
+ * @property {InvokeNtFn} invokeNt
+ * @property {(identity?: Record<string, any>) => void} _updateSelfIdentity
+ * @property {(opts?: Record<string, any>) => any} _resetHumanSessionState
+ * @property {(ev: any) => void} _dispatchInboundEvent
+ * @property {(wc: any) => boolean} _isWebContentsAlive
+ * @property {(url: any) => boolean} _isTrustedRendererUrl
+ */
 
 const LOGIN_KERNEL_EVENTS = Object.freeze(
   new Set([
@@ -44,6 +68,11 @@ const QR_CONTAINER_KEYS = Object.freeze([
   "info",
 ]);
 
+/**
+ * @param {any} payload
+ * @param {number} [depth=0]
+ * @returns {string}
+ */
 function extractQrCodeBase64(payload, depth = 0) {
   if (!payload || depth > 4) return "";
   if (typeof payload === "string") {
@@ -84,6 +113,10 @@ function extractQrCodeBase64(payload, depth = 0) {
   return "";
 }
 
+/**
+ * @param {any} payload
+ * @returns {boolean}
+ */
 function isSessionInitSuccess(payload) {
   const code =
     payload && typeof payload === "object"
@@ -92,16 +125,25 @@ function isSessionInitSuccess(payload) {
   return !Number.isFinite(code) || code === 0;
 }
 
+/**
+ * @param {any[]} list
+ * @param {string} [preferredUin=""]
+ * @returns {any | null}
+ */
 function selectQuickLoginAccount(list, preferredUin = "") {
   if (!Array.isArray(list) || list.length === 0) return null;
   const targetUin = String(preferredUin || "").trim();
   return (
-    (targetUin && list.find((item) => item && String(item.uin) === targetUin)) ||
+    (targetUin ? list.find((item) => item && String(item.uin) === targetUin) : null) ||
     list.find((item) => item && (item.isQuickLogin || item.isAutoLogin) && item.uin) ||
     null
   );
 }
 
+/**
+ * @param {string | number} selfUin
+ * @param {any} firstArg
+ */
 function buildBotOfflineNoticePayload(selfUin, firstArg) {
   return {
     user_id: pickPositiveUin(selfUin),
@@ -110,154 +152,184 @@ function buildBotOfflineNoticePayload(selfUin, firstArg) {
   };
 }
 
-const loginRecoveryMixin = {
-  /** @this {any} */
-  _syncSelfIdentityFromLogin(rawIdentity, { markOnline = true } = {}) {
+class LoginRecovery {
+  /**
+   * @param {LoginRecoveryHost} host
+   */
+  constructor(host) {
+    /** @type {LoginRecoveryHost} */
+    this.host = host;
+  }
+
+  /**
+   * @param {any} rawIdentity
+   * @param {{ markOnline?: boolean }} [options={}]
+   * @returns {NormalizedLoginIdentity}
+   */
+  syncSelfIdentityFromLogin(rawIdentity, { markOnline = true } = {}) {
     const identity = normalizeLoginIdentity(rawIdentity);
-    if (typeof this._updateSelfIdentity === "function") {
-      this._updateSelfIdentity({
+    if (typeof this.host._updateSelfIdentity === "function") {
+      this.host._updateSelfIdentity({
         ...identity,
         markOnline: Boolean(markOnline),
       });
       return identity;
     }
     if (identity.uin && /^\d+$/.test(String(identity.uin))) {
-      this.selfUin = String(identity.uin);
+      this.host.selfUin = String(identity.uin);
     }
     if (identity.uid) {
-      this.selfUid = String(identity.uid);
+      this.host.selfUid = String(identity.uid);
     }
     if (identity.nick) {
-      this.selfNickname = String(identity.nick);
+      this.host.selfNickname = String(identity.nick);
     }
     if (markOnline) {
-      this.online = true;
+      this.host.online = true;
     }
     return identity;
-  },
+  }
 
-  /** @this {any} */
-  _handleQrCodeEvent(firstArg) {
+  /**
+   * @param {any} firstArg
+   */
+  handleQrCodeEvent(firstArg) {
     const pngBase64 = extractQrCodeBase64(firstArg);
     if (pngBase64) {
-      this.lastQrCodeBase64 = pngBase64;
-      if (this._qrCodeWaiters && this._qrCodeWaiters.size > 0) {
-        for (const resolveWaiter of Array.from(this._qrCodeWaiters)) {
+      this.host.lastQrCodeBase64 = pngBase64;
+      if (this.host._qrCodeWaiters && this.host._qrCodeWaiters.size > 0) {
+        for (const resolveWaiter of Array.from(this.host._qrCodeWaiters)) {
           try {
             resolveWaiter(pngBase64);
           } catch (err) {
-            this.logger?.debug?.("login_recovery", err);
+            this.host.logger?.debug?.("login_recovery", err);
           }
         }
-        this._qrCodeWaiters.clear();
+        this.host._qrCodeWaiters.clear();
       }
-      this.logger?.debug?.("login", `QR code updated (length=${pngBase64.length})`);
+      this.host.logger?.debug?.("login", `QR code updated (length=${pngBase64.length})`);
     } else {
       const argShape =
         firstArg && typeof firstArg === "object"
           ? Object.keys(firstArg).slice(0, 16).join(",")
           : typeof firstArg;
-      const nestedInfo = firstArg?.qrcodeInfo || firstArg?.qrCodeInfo || firstArg?.result || firstArg?.data;
+      const nestedInfo =
+        firstArg?.qrcodeInfo || firstArg?.qrCodeInfo || firstArg?.result || firstArg?.data;
       const nestedShape =
         nestedInfo && typeof nestedInfo === "object"
           ? Object.keys(nestedInfo).slice(0, 16).join(",")
           : "";
-      this.logger?.debug?.(
+      this.host.logger?.debug?.(
         "login",
         `QR event without base64 payload (shape=${argShape}${nestedShape ? `, nested=${nestedShape}` : ""})`
       );
     }
-  },
+  }
 
-  /** @this {any} */
-  _handleUserLoggedInEvent(firstArg) {
-    this._syncSelfIdentityFromLogin(firstArg, { markOnline: true });
-  },
+  /**
+   * @param {any} firstArg
+   */
+  handleUserLoggedInEvent(firstArg) {
+    this.host.lastQrCodeBase64 = "";
+    this.syncSelfIdentityFromLogin(firstArg, { markOnline: true });
+  }
 
-  /** @this {any} */
-  _handleSessionInitCompleteEvent(firstArg) {
+  /**
+   * @param {any} firstArg
+   */
+  handleSessionInitCompleteEvent(firstArg) {
     if (isSessionInitSuccess(firstArg)) {
-      this.online = true;
+      this.host.online = true;
     }
-  },
+  }
 
-  /** @this {any} */
-  _handleKickedOffLineEvent(firstArg) {
-    this.online = false;
-    this._resetHumanSessionState?.({ resetRenderer: true });
-    this._dispatchInboundEvent?.(
+  /**
+   * @param {any} firstArg
+   */
+  handleKickedOffLineEvent(firstArg) {
+    this.host.online = false;
+    this.host.lastQrCodeBase64 = "";
+    this.host._resetHumanSessionState?.({ resetRenderer: true });
+    this.host._dispatchInboundEvent?.(
       formatNoticeEvent(
         "bot_offline",
-        buildBotOfflineNoticePayload(this.selfUin, firstArg),
-        { selfId: this.selfUin }
+        buildBotOfflineNoticePayload(this.host.selfUin, firstArg),
+        { selfId: this.host.selfUin }
       )
     );
-  },
+  }
 
-  /** @this {any} */
-  _handleLoginKernelEvent(eventName, args) {
+  /**
+   * @param {string} eventName
+   * @param {any[]} args
+   * @returns {boolean}
+   */
+  handleLoginKernelEvent(eventName, args) {
     const firstArg = args && args.length > 0 ? args[0] : undefined;
     if (eventName === "onQRCodeGetPicture" || eventName === "onQRCodeSessionQuickLoginFailed") {
-      this._handleQrCodeEvent(firstArg);
+      this.handleQrCodeEvent(firstArg);
       return true;
     }
     if (eventName === "onUserLoggedIn" || eventName === "onQRCodeLoginSucceed") {
-      this._handleUserLoggedInEvent(firstArg);
+      this.handleUserLoggedInEvent(firstArg);
       return true;
     }
     if (eventName === "onSessionInitComplete") {
-      this._handleSessionInitCompleteEvent(firstArg);
+      this.handleSessionInitCompleteEvent(firstArg);
       return true;
     }
     if (eventName === "onKickedOffLine") {
-      this._handleKickedOffLineEvent(firstArg);
+      this.handleKickedOffLineEvent(firstArg);
       return true;
     }
     return false;
-  },
+  }
 
   /**
-   * @this {any}
+   * @param {Record<string, any>} [options={}]
    */
-  async _tryAutoQuickLogin(
-    { uin: explicitUin = "", force = false, webContents = null } = /** @type {Record<string, any>} */ ({})
-  ) {
-    if (this.online && !force) {
+  async tryAutoQuickLogin({ uin: explicitUin = "", force = false, webContents = null } = {}) {
+    if (this.host.online && !force) {
       return { skipped: true, reason: "already_online", online: true };
     }
     const now = Date.now();
     if (!force) {
-      if ((this._autoQuickLoginAttempts || 0) >= 3) {
-        return { skipped: true, reason: "max_attempts_reached", online: Boolean(this.online) };
+      if ((this.host._autoQuickLoginAttempts || 0) >= 3) {
+        return { skipped: true, reason: "max_attempts_reached", online: Boolean(this.host.online) };
       }
-      if (this._lastAutoQuickLoginAt && now - this._lastAutoQuickLoginAt < 12000) {
-        return { skipped: true, reason: "cooldown", online: Boolean(this.online) };
+      if (this.host._lastAutoQuickLoginAt && now - this.host._lastAutoQuickLoginAt < 12000) {
+        return { skipped: true, reason: "cooldown", online: Boolean(this.host.online) };
       }
-      this._lastAutoQuickLoginAt = now;
-      this._autoQuickLoginAttempts = (this._autoQuickLoginAttempts || 0) + 1;
+      this.host._lastAutoQuickLoginAt = now;
+      this.host._autoQuickLoginAttempts = (this.host._autoQuickLoginAttempts || 0) + 1;
     }
 
     try {
-      await this.invokeNt("nodeIKernelLoginService/setAutoLogin", { shouldAutoLogin: true }, [true]);
+      await this.host.invokeNt(
+        "nodeIKernelLoginService/setAutoLogin",
+        { shouldAutoLogin: true },
+        [true]
+      );
     } catch (err) {
-      this.logger?.debug?.("login_recovery", err);
+      this.host.logger?.debug?.("login_recovery", err);
     }
 
+    /** @type {any} */
     let loginRes = null;
     try {
-      loginRes = await this.invokeNt("nodeIKernelLoginService/getLoginList", {}, []);
+      loginRes = await this.host.invokeNt("nodeIKernelLoginService/getLoginList", {}, []);
     } catch (err) {
-      this.logger?.debug?.("login_recovery", err);
+      this.host.logger?.debug?.("login_recovery", err);
     }
     const list = Array.isArray(loginRes?.LocalLoginInfoList) ? loginRes.LocalLoginInfoList : [];
-    const targetUin = String(explicitUin || this.selfUin || "").trim();
+    const targetUin = String(explicitUin || this.host.selfUin || "").trim();
     const acc = selectQuickLoginAccount(list, targetUin);
 
     if (!acc || (!acc.isQuickLogin && !acc.isAutoLogin && !force)) {
       return {
         skipped: true,
         reason: acc ? "quick_login_unavailable" : "no_saved_account",
-        accounts: list.map((x) => ({
+        accounts: list.map((/** @type {any} */ x) => ({
           uin: String(x?.uin || ""),
           isQuickLogin: Boolean(x?.isQuickLogin),
           isAutoLogin: Boolean(x?.isAutoLogin),
@@ -266,26 +338,35 @@ const loginRecoveryMixin = {
     }
 
     const uin = String(acc.uin);
-    if (typeof this._updateSelfIdentity === "function") {
-      this._updateSelfIdentity({
+    if (typeof this.host._updateSelfIdentity === "function") {
+      this.host._updateSelfIdentity({
         uin,
-        uid: acc.uid || this.selfUid,
-        nick: acc.nickName || acc.nick || this.selfNickname,
+        uid: acc.uid || this.host.selfUid,
+        nick: acc.nickName || acc.nick || this.host.selfNickname,
         markOnline: false,
       });
     } else {
-      this._syncSelfIdentityFromLogin(
-        { uin, uid: acc.uid || this.selfUid, nick: acc.nickName || acc.nick || this.selfNickname },
+      this.syncSelfIdentityFromLogin(
+        {
+          uin,
+          uid: acc.uid || this.host.selfUid,
+          nick: acc.nickName || acc.nick || this.host.selfNickname,
+        },
         { markOnline: false }
       );
     }
 
     try {
-      await this.invokeNt("nodeIKernelSettingService/setAutoLoginSwitch", { state: true }, [true]);
+      await this.host.invokeNt(
+        "nodeIKernelSettingService/setAutoLoginSwitch",
+        { state: true },
+        [true]
+      );
     } catch (err) {
-      this.logger?.debug?.("login_recovery", err);
+      this.host.logger?.debug?.("login_recovery", err);
     }
 
+    /** @type {any} */
     let quickRes = null;
     let methodUsed = "";
     for (const cmd of [
@@ -293,27 +374,27 @@ const loginRecoveryMixin = {
       "nodeIKernelLoginService/quickLogin",
     ]) {
       try {
-        quickRes = await this.invokeNt(cmd, { uin }, [uin]);
+        quickRes = await this.host.invokeNt(cmd, { uin }, [uin]);
         const code = Number(quickRes?.result ?? quickRes?.resultCode ?? 0);
         if (!Number.isNaN(code) && code === 0) {
           methodUsed = cmd;
           break;
         }
       } catch (err) {
-        this.logger?.debug?.("login_recovery", err);
+        this.host.logger?.debug?.("login_recovery", err);
       }
     }
 
-    const wc = webContents || this.activeWebContents;
+    const wc = webContents || this.host.activeWebContents;
     const isAlive =
-      typeof this._isWebContentsAlive === "function"
-        ? this._isWebContentsAlive(wc)
+      typeof this.host._isWebContentsAlive === "function"
+        ? this.host._isWebContentsAlive(wc)
         : Boolean(wc && (typeof wc.isDestroyed !== "function" || !wc.isDestroyed()));
     const isTrusted =
       !wc ||
       typeof wc.getURL !== "function" ||
-      (typeof this._isTrustedRendererUrl === "function"
-        ? this._isTrustedRendererUrl(wc.getURL())
+      (typeof this.host._isTrustedRendererUrl === "function"
+        ? this.host._isTrustedRendererUrl(wc.getURL())
         : true);
 
     if (
@@ -335,7 +416,7 @@ const loginRecoveryMixin = {
         );
         if (clicked) methodUsed = "dom_button_click";
       } catch (err) {
-        this.logger?.debug?.("login_recovery", err);
+        this.host.logger?.debug?.("login_recovery", err);
       }
     }
 
@@ -344,13 +425,13 @@ const loginRecoveryMixin = {
       uin,
       method: methodUsed,
       result: quickRes || null,
-      online: Boolean(this.online),
+      online: Boolean(this.host.online),
     };
-  },
-};
+  }
+}
 
 module.exports = {
-  loginRecoveryMixin,
+  LoginRecovery,
   LOGIN_KERNEL_EVENTS,
   extractQrCodeBase64,
   isSessionInitSuccess,

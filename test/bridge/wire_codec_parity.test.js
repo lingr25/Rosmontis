@@ -1,7 +1,9 @@
+// @ts-check
 "use strict";
 
 /**
- * Cross-process wire codec parity tests (`src/core/primitives.js` <-> `src/bridge_renderer.js`)
+ * Cross-process wire codec single-source-of-truth & parity tests
+ * (`src/core/wire_codec.js` <-> `src/core/primitives.js` <-> `src/bridge_renderer.js`)
  * and decomposed module / facade verification (`image_probe.js`, `ntqq_meta.js`,
  * `media_downloader.js`, `media_security.js`, `stores.js`, `segment_converter.js`, `bridge_onebot.js`).
  */
@@ -13,7 +15,9 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const vm = require("vm");
 
+const wireCodec = require("../../src/core/wire_codec");
 const primitives = require("../../src/core/primitives");
 const renderer = require("../../src/bridge_renderer");
 const imageProbe = require("../../src/core/image_probe");
@@ -24,6 +28,235 @@ const storesMod = require("../../src/onebot/stores");
 const segmentConverter = require("../../src/onebot/segment_converter");
 const onebotFacade = require("../../src/bridge_onebot");
 
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
+
+// ============================================================================
+// 0. Unified Wire Codec Single Source of Truth & VM Browser Injection
+// ============================================================================
+
+test("Wire codec single source of truth: zero duplicate codec definitions in primitives.js or bridge_renderer.js", () => {
+  const wireCodecSrc = fs.readFileSync(path.join(REPO_ROOT, "src", "core", "wire_codec.js"), "utf8");
+  const primitivesSrc = fs.readFileSync(path.join(REPO_ROOT, "src", "core", "primitives.js"), "utf8");
+  const rendererSrc = fs.readFileSync(path.join(REPO_ROOT, "src", "bridge_renderer.js"), "utf8");
+
+  assert.strictEqual(wireCodecSrc.split(/\r?\n/)[0].trim(), "// @ts-check");
+  assert.strictEqual(
+    /\brequire\s*\(/.test(wireCodecSrc),
+    false,
+    "src/core/wire_codec.js must have zero require() calls"
+  );
+  assert.strictEqual(/\bfunction\s+encodeBridgeValue\b/.test(wireCodecSrc), true);
+  assert.strictEqual(/\bfunction\s+reviveBridgePayload\b/.test(wireCodecSrc), true);
+
+  for (const [label, src] of [
+    ["src/core/primitives.js", primitivesSrc],
+    ["src/bridge_renderer.js", rendererSrc],
+  ]) {
+    assert.strictEqual(
+      /\bfunction\s+encodeBridgeValue\b/.test(src),
+      false,
+      `${label} must not define duplicate function encodeBridgeValue`
+    );
+    assert.strictEqual(
+      /\bfunction\s+reviveBridgePayload\b/.test(src),
+      false,
+      `${label} must not define duplicate function reviveBridgePayload`
+    );
+    assert.strictEqual(
+      /\bfunction\s+serializeBridgePayload\b/.test(src),
+      false,
+      `${label} must not define duplicate function serializeBridgePayload`
+    );
+    assert.strictEqual(
+      /\bfunction\s+serializeBridgeResult\b/.test(src),
+      false,
+      `${label} must not define duplicate function serializeBridgeResult`
+    );
+    assert.strictEqual(
+      /\bfunction\s+encodeBridgeMaps\b/.test(src),
+      false,
+      `${label} must not define duplicate function encodeBridgeMaps`
+    );
+  }
+
+  assert.strictEqual(
+    rendererSrc.includes(wireCodec.WIRE_CODEC_INJECTION_MARKER),
+    true,
+    "src/bridge_renderer.js must contain WIRE_CODEC_INJECTION_MARKER"
+  );
+
+  // Reference identity in Node.js across wire_codec.js, primitives.js, and bridge_renderer.js
+  assert.strictEqual(primitives.KNOWN_MAP_FIELDS, wireCodec.KNOWN_MAP_FIELDS);
+  assert.strictEqual(renderer.KNOWN_MAP_FIELDS, wireCodec.KNOWN_MAP_FIELDS);
+  assert.strictEqual(primitives.encodeBridgeValue, wireCodec.encodeBridgeValue);
+  assert.strictEqual(renderer.encodeBridgeValue, wireCodec.encodeBridgeValue);
+  assert.strictEqual(primitives.encodeBridgeMaps, wireCodec.encodeBridgeMaps);
+  assert.strictEqual(renderer.encodeBridgeMaps, wireCodec.encodeBridgeMaps);
+  assert.strictEqual(primitives.serializeBridgeResult, wireCodec.serializeBridgeResult);
+  assert.strictEqual(renderer.serializeBridgeResult, wireCodec.serializeBridgeResult);
+  assert.strictEqual(primitives.serializeBridgePayload, wireCodec.serializeBridgePayload);
+  assert.strictEqual(renderer.serializeBridgePayload, wireCodec.serializeBridgePayload);
+  assert.strictEqual(primitives.reviveBridgePayload, wireCodec.reviveBridgePayload);
+  assert.strictEqual(renderer.reviveBridgePayload, wireCodec.reviveBridgePayload);
+  assert.strictEqual(primitives.safeJsJson, wireCodec.safeJsJson);
+  assert.strictEqual(renderer.safeJsJson, wireCodec.safeJsJson);
+});
+
+test("Standalone VM browser injection (require === undefined) preserves 100% lossless round-trip parity", async () => {
+  const inlineSnippet = wireCodec.getInlineWireCodecSource();
+  assert.ok(inlineSnippet.length > 100);
+  assert.strictEqual(
+    /\brequire\b/.test(inlineSnippet),
+    false,
+    "getInlineWireCodecSource() must contain zero require references"
+  );
+
+  const rawRendererSrc = fs.readFileSync(path.join(REPO_ROOT, "src", "bridge_renderer.js"), "utf8");
+  const injectedSrc = wireCodec.injectWireCodecIntoRendererSource(rawRendererSrc);
+  assert.strictEqual(
+    injectedSrc.includes(wireCodec.WIRE_CODEC_INJECTION_MARKER),
+    false,
+    "injectWireCodecIntoRendererSource must replace WIRE_CODEC_INJECTION_MARKER"
+  );
+  assert.strictEqual(
+    wireCodec.injectWireCodecIntoRendererSource(injectedSrc),
+    injectedSrc,
+    "injectWireCodecIntoRendererSource must be idempotent on already-spliced source"
+  );
+
+  /** @type {Array<{ channel: string, args: any[] }>} */
+  const sentIpcFrames = [];
+  /** @type {Record<string, any>} */
+  const mockWindow = {
+    webContentId: 3,
+    ipcImpl: {
+      on() {},
+      /**
+       * @param {string} channel
+       * @param {...any} args
+       */
+      send(channel, ...args) {
+        sentIpcFrames.push({ channel, args });
+      },
+    },
+  };
+
+  /** @type {Record<string, any>} */
+  const sandboxWithNoRequire = {
+    require: undefined,
+    window: mockWindow,
+    module: { exports: {} },
+    URLSearchParams,
+    setTimeout,
+    clearTimeout,
+  };
+  sandboxWithNoRequire.globalThis = sandboxWithNoRequire;
+
+  vm.runInNewContext(injectedSrc, sandboxWithNoRequire, { filename: "bridge_renderer.injected.js" });
+
+  const vmExports = sandboxWithNoRequire.module.exports;
+  assert.strictEqual(typeof vmExports.installRendererBridge, "function");
+  assert.strictEqual(typeof vmExports.encodeBridgeValue, "function");
+  assert.strictEqual(typeof vmExports.reviveBridgePayload, "function");
+  assert.ok(mockWindow.__ROSMONTIS_RENDERER_BRIDGE__, "auto-installed on window without require");
+  assert.strictEqual(mockWindow.__ROSMONTIS_RENDERER_BRIDGE__.windowId, 3);
+
+  // Also prove spliced source never invokes `require` even if `require` is a throwing function
+  const throwingRequireSandbox = {
+    require() {
+      throw new Error("spliced renderer bundle must never invoke require at load");
+    },
+    module: { exports: /** @type {Record<string, any>} */ ({}) },
+    URLSearchParams,
+    setTimeout,
+    clearTimeout,
+  };
+  vm.runInNewContext(injectedSrc, throwingRequireSandbox);
+  assert.strictEqual(typeof throwingRequireSandbox.module.exports.reviveBridgePayload, "function");
+
+  // Full lossless round-trip parity between Node `wireCodec` and isolated VM `vmExports`
+  const payload = {
+    bigPos: 9223372036854775807n,
+    bigNeg: -9223372036854775808n,
+    undefTop: undefined,
+    arr: [undefined, "ok", new Uint8Array([0, 128, 255])],
+    buf: Buffer.from([4, 5, 6]),
+    nestedMap: new Map(
+      /** @type {Array<[any, any]>} */ ([
+        [0, "/cache/0.png"],
+        [
+          "meta",
+          new Map(
+            /** @type {Array<[any, any]>} */ ([
+              ["voidVal", undefined],
+              ["bytes", new Uint8Array([9, 10])],
+            ])
+          ),
+        ],
+      ])
+    ),
+  };
+
+  // Node -> JSON wire -> VM revive
+  const mainWire = wireCodec.serializeBridgePayload(payload);
+  const vmRevived = vmExports.reviveBridgePayload(
+    vm.runInNewContext(`(${mainWire})`, { Object, Array })
+  );
+  assert.strictEqual(vmRevived.bigPos, "9223372036854775807");
+  assert.strictEqual(vmRevived.bigNeg, "-9223372036854775808");
+  assert.strictEqual(vmRevived.arr[0], null); // JSON array undefined via JSON.stringify
+  assert.strictEqual(vmRevived.arr[1], "ok");
+  assert.strictEqual(vmExports.toUint8View(vmRevived.arr[2]) !== null, true);
+  assert.deepStrictEqual(Array.from(vmRevived.arr[2]), [0, 128, 255]);
+  assert.deepStrictEqual(Array.from(vmRevived.buf), [4, 5, 6]);
+  assert.strictEqual(vmExports.isMapLike(vmRevived.nestedMap), true);
+  assert.strictEqual(vmRevived.nestedMap.get(0), "/cache/0.png");
+  assert.strictEqual(vmRevived.nestedMap.get("meta").has("voidVal"), true);
+  assert.strictEqual(vmRevived.nestedMap.get("meta").get("voidVal"), undefined);
+  assert.deepStrictEqual(Array.from(vmRevived.nestedMap.get("meta").get("bytes")), [9, 10]);
+
+  // VM (with cyclic ref, undefined, BigInt, __proto__, KNOWN_MAP_FIELDS) -> JSON wire -> Node revive
+  const vmResultJson = vm.runInNewContext(
+    `(() => {
+      const cyc = { label: "vm-root" };
+      cyc.self = cyc;
+      const protoObj = JSON.parse('{"__proto__":{"safeOwn":42}}');
+      const revivedKnown = module.exports.reviveBridgePayload({
+        msgAttributeInfos: { "7": { keepStr: true } },
+        picElement: { thumbPath: { "720": "/vm/720.jpg" } },
+      });
+      return module.exports.serializeBridgeResult({
+        voidVal: undefined,
+        arrVoid: [undefined, 1],
+        big: 18446744073709551615n,
+        bytes: new Uint8Array([11, 22, 33]),
+        cyc,
+        proto: module.exports.reviveBridgePayload(protoObj),
+        known: revivedKnown,
+      });
+    })()`,
+    sandboxWithNoRequire
+  );
+
+  const nodeRevived = wireCodec.reviveBridgePayload(JSON.parse(vmResultJson));
+  assert.strictEqual("voidVal" in nodeRevived, true);
+  assert.strictEqual(nodeRevived.voidVal, undefined);
+  assert.deepStrictEqual(nodeRevived.arrVoid, [undefined, 1]);
+  assert.strictEqual(nodeRevived.big, "18446744073709551615");
+  assert.ok(nodeRevived.bytes instanceof Uint8Array);
+  assert.deepStrictEqual(Array.from(nodeRevived.bytes), [11, 22, 33]);
+  assert.strictEqual(nodeRevived.cyc.label, "vm-root");
+  assert.strictEqual(nodeRevived.cyc.self, null);
+  assert.strictEqual(/** @type {any} */ ({}).safeOwn, undefined);
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(nodeRevived.proto, "__proto__"), true);
+  assert.strictEqual(nodeRevived.proto.__proto__.safeOwn, 42);
+  assert.ok(nodeRevived.known.msgAttributeInfos instanceof Map);
+  assert.strictEqual(nodeRevived.known.msgAttributeInfos.has("7"), true);
+  assert.strictEqual(nodeRevived.known.msgAttributeInfos.has(7), false);
+  assert.ok(nodeRevived.known.picElement.thumbPath instanceof Map);
+  assert.strictEqual(nodeRevived.known.picElement.thumbPath.get(720), "/vm/720.jpg");
+});
+
 // ============================================================================
 // 1. Wire Codec Parity: primitives.js <-> bridge_renderer.js
 // ============================================================================
@@ -32,12 +265,22 @@ test("Wire codec parity: nested Maps (numeric & string keys), Uint8Array, Buffer
   const isoDate = "2026-11-20T19:20:45.123Z";
   const dateVal = new Date(isoDate);
 
-  const deepMap = new Map([
-    [0, "/tmp/thumb_0.jpg"],
-    [720, "/tmp/thumb_720.jpg"],
-    ["nested", new Map([[1, "one"], ["bytes", new Uint8Array([0, 127, 255])]])],
-    ["empty", new Map()],
-  ]);
+  const deepMap = new Map(
+    /** @type {Array<[any, any]>} */ ([
+      [0, "/tmp/thumb_0.jpg"],
+      [720, "/tmp/thumb_720.jpg"],
+      [
+        "nested",
+        new Map(
+          /** @type {Array<[any, any]>} */ ([
+            [1, "one"],
+            ["bytes", new Uint8Array([0, 127, 255])],
+          ])
+        ),
+      ],
+      ["empty", new Map()],
+    ])
+  );
 
   // --- Direction A: Main -> Renderer -> Main ---
   const mainPayload = {
@@ -62,7 +305,7 @@ test("Wire codec parity: nested Maps (numeric & string keys), Uint8Array, Buffer
   assert.strictEqual(inRenderer.createdAt, isoDate);
   assert.ok(inRenderer.u8 instanceof Uint8Array);
   assert.deepStrictEqual(Array.from(inRenderer.u8), [1, 2, 3, 254, 255]);
-  // Buffer.prototype.toJSON() yields { type: "Buffer", data: [...] } which renderer revives to Uint8Array
+  // Buffer.prototype.toJSON() yields { type: "Buffer", data: [...] } which revives to Uint8Array
   assert.ok(inRenderer.buf instanceof Uint8Array);
   assert.deepStrictEqual(Array.from(inRenderer.buf), [10, 20, 30, 40]);
   assert.strictEqual(inRenderer.xss, "</script><img src=x>&\u2028\u2029");
@@ -99,15 +342,18 @@ test("Wire codec parity: nested Maps (numeric & string keys), Uint8Array, Buffer
 test("Wire codec parity: Renderer -> Main -> Renderer roundtrip with undefined, Set, Buffer, Int16Array, Date", () => {
   const dt = new Date("2026-05-01T00:00:00.000Z");
   const subBytes = new Uint8Array([9, 8, 7, 6, 5]).subarray(1, 4); // [8, 7, 6]
+  const mapWithUndef = new Map(
+    /** @type {Array<[any, any]>} */ ([
+      ["k", undefined],
+      [42, new Map([[99, Buffer.from([0xaa, 0xbb])]])],
+    ])
+  );
   const rendererResult = {
     undefProp: undefined,
     fnProp: () => "ignored",
     symProp: Symbol("s"),
     arrWithUndef: [undefined, "x", undefined],
-    mapWithUndef: new Map([
-      ["k", undefined],
-      [42, new Map([[99, Buffer.from([0xaa, 0xbb])]])],
-    ]),
+    mapWithUndef,
     setVal: new Set(["a", "b"]),
     sub: subBytes,
     big: 123456789012345678901234567890n,
@@ -142,6 +388,7 @@ test("Wire codec parity: Renderer -> Main -> Renderer roundtrip with undefined, 
   const mJson = primitives.serializeBridgePayload(inMain);
   const backInRenderer = renderer.reviveBridgePayload(JSON.parse(mJson));
   assert.ok(backInRenderer.mapWithUndef instanceof Map);
+  assert.strictEqual(backInRenderer.mapWithUndef.get("k"), undefined);
   assert.deepStrictEqual(Array.from(backInRenderer.mapWithUndef.get(42).get(99)), [0xaa, 0xbb]);
   assert.deepStrictEqual(Array.from(backInRenderer.sub), [8, 7, 6]);
   assert.strictEqual(backInRenderer.big, "123456789012345678901234567890");
@@ -160,7 +407,7 @@ test("Wire codec parity: Renderer -> Main -> Renderer roundtrip with undefined, 
   assert.deepStrictEqual(structured.m, { __rosmontisMap__: [[1, "v"]] });
   assert.strictEqual(structured.undef, undefined);
 
-  // Legacy `__rosmontisBytes__` tag revived by renderer
+  // Legacy `__rosmontisBytes__` tag revived by wire codec
   const legacyBytes = renderer.reviveBridgePayload({ __rosmontisBytes__: [7, 8, 9] });
   assert.ok(legacyBytes instanceof Uint8Array);
   assert.deepStrictEqual(Array.from(legacyBytes), [7, 8, 9]);
@@ -168,7 +415,8 @@ test("Wire codec parity: Renderer -> Main -> Renderer roundtrip with undefined, 
 
 test("Wire codec parity: circular references, __proto__ pollution defense, and KNOWN_MAP_FIELDS", () => {
   // 1. Circular references
-  const cyclic = { name: "root", child: {} };
+  /** @type {Record<string, any>} */
+  const cyclic = { name: "root", child: /** @type {Record<string, any>} */ ({}) };
   cyclic.child.back = cyclic;
   cyclic.self = cyclic;
 
@@ -183,14 +431,15 @@ test("Wire codec parity: circular references, __proto__ pollution defense, and K
   assert.strictEqual(revivedCyclicMain.self, null);
   assert.strictEqual(revivedCyclicMain.child.back, null);
 
-  // Renderer reviveBridgePayload also handles in-memory cyclic objects without stack overflow
+  // reviveBridgePayload also handles in-memory cyclic objects without stack overflow
+  /** @type {Record<string, any>} */
   const inMemCyclic = { tag: "loop" };
   inMemCyclic.self = inMemCyclic;
   const revivedInMem = renderer.reviveBridgePayload(inMemCyclic);
   assert.strictEqual(revivedInMem.tag, "loop");
   assert.strictEqual(revivedInMem.self, inMemCyclic);
 
-  // primitives.serializeBridgePayload delegates to JSON.stringify and rejects cycles cleanly
+  // serializeBridgePayload delegates to JSON.stringify and rejects cycles cleanly
   assert.throws(() => primitives.serializeBridgePayload(cyclic), TypeError);
 
   // 2. __proto__ own-property pollution defense
@@ -198,21 +447,33 @@ test("Wire codec parity: circular references, __proto__ pollution defense, and K
   const parsedMalicious = JSON.parse(maliciousJson);
 
   const mainSafe = primitives.reviveBridgePayload(parsedMalicious);
-  assert.strictEqual(({}).polluted, undefined, "Object.prototype must never be polluted by primitives.reviveBridgePayload");
+  assert.strictEqual(
+    /** @type {any} */ ({}).polluted,
+    undefined,
+    "Object.prototype must never be polluted by primitives.reviveBridgePayload"
+  );
   assert.strictEqual(Object.prototype.hasOwnProperty.call(mainSafe, "__proto__"), true);
   assert.strictEqual(mainSafe.__proto__.polluted, "yes");
   assert.ok(mainSafe.__proto__.nested instanceof Map);
   assert.strictEqual(mainSafe.__proto__.nested.get(1), "ok");
 
   const rendererSafe = renderer.reviveBridgePayload(parsedMalicious);
-  assert.strictEqual(({}).polluted, undefined, "Object.prototype must never be polluted by renderer.reviveBridgePayload");
+  assert.strictEqual(
+    /** @type {any} */ ({}).polluted,
+    undefined,
+    "Object.prototype must never be polluted by renderer.reviveBridgePayload"
+  );
   assert.strictEqual(Object.prototype.hasOwnProperty.call(rendererSafe, "__proto__"), true);
   assert.strictEqual(rendererSafe.__proto__.polluted, "yes");
   assert.ok(rendererSafe.__proto__.nested instanceof Map);
   assert.strictEqual(rendererSafe.__proto__.nested.get(1), "ok");
 
   const encodedProto = renderer.encodeBridgeMaps(rendererSafe);
-  assert.strictEqual(({}).polluted, undefined, "Object.prototype must never be polluted by renderer.encodeBridgeMaps");
+  assert.strictEqual(
+    /** @type {any} */ ({}).polluted,
+    undefined,
+    "Object.prototype must never be polluted by renderer.encodeBridgeMaps"
+  );
   assert.strictEqual(Object.prototype.hasOwnProperty.call(encodedProto, "__proto__"), true);
 
   // 3. KNOWN_MAP_FIELDS (`msgAttributeInfos`, `thumbPath`, `picThumbPath`)
@@ -361,14 +622,16 @@ test("Split core modules (image_probe, ntqq_meta, media_downloader, media_securi
       res.writeHead(200, { "Content-Type": "image/png", "Content-Length": String(pngBuf.length) });
       res.end(pngBuf);
     });
-    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const port = server.address().port;
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(null)));
+    const addr = server.address();
+    assert.ok(addr && typeof addr === "object");
+    const port = addr.port;
     const url = `http://127.0.0.1:${port}/sample.png`;
 
     try {
       await assert.rejects(
         () => mediaDownloader.downloadBufferFromUrl(url, { allowPrivateUrls: false }),
-        (err) => err && err.code === "ERR_SSRF_BLOCKED"
+        (/** @type {any} */ err) => Boolean(err && err.code === "ERR_SSRF_BLOCKED")
       );
       const downloadedBuf = await mediaDownloader.downloadBufferFromUrl(url, { allowPrivateUrls: true });
       assert.deepStrictEqual(downloadedBuf, pngBuf);
@@ -381,7 +644,7 @@ test("Split core modules (image_probe, ntqq_meta, media_downloader, media_securi
       assert.strictEqual(streamed.fileSize, pngBuf.length);
       assert.ok(fs.existsSync(streamed.localPath));
     } finally {
-      await new Promise((resolve) => server.close(resolve));
+      await new Promise((resolve) => server.close(() => resolve(null)));
     }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -389,7 +652,6 @@ test("Split core modules (image_probe, ntqq_meta, media_downloader, media_securi
 });
 
 test("Load-order independence: requiring media_downloader.js BEFORE media_security.js has zero circular require bugs", () => {
-  const repoRoot = path.resolve(__dirname, "..", "..");
   const script = `
     const assert = require("assert");
     const dl = require("./src/core/media_downloader");
@@ -410,7 +672,7 @@ test("Load-order independence: requiring media_downloader.js BEFORE media_securi
     );
   `;
   const res = spawnSync(process.execPath, ["-e", script], {
-    cwd: repoRoot,
+    cwd: REPO_ROOT,
     encoding: "utf8",
   });
   assert.strictEqual(res.status, 0, `Load-order check failed: ${res.stderr || res.stdout}`);
@@ -439,6 +701,7 @@ test("Domain cleanup: buildNtMarketFaceUrl & stripTransientNtMedia live in segme
     "https://gxh.vip.qq.com/club/item/parcel/item/12/12345678/raw300.gif"
   );
 
+  /** @type {Record<string, any>} */
   const rawMsg = {
     msgId: "777001",
     chatType: 2,
@@ -446,11 +709,27 @@ test("Domain cleanup: buildNtMarketFaceUrl & stripTransientNtMedia live in segme
     elements: [
       {
         elementType: 2,
-        picElement: { md5HexStr: "aaa", __base64Uri: "base64://Zm9v" },
+        picElement: {
+          md5HexStr: "aaa",
+          __base64Uri: "base64://Zm9v",
+          __localFileUrl: "file:///tmp/a.jpg",
+        },
       },
       {
         elementType: 4,
-        pttElement: { md5HexStr: "bbb", __base64Uri: "base64://YmFy" },
+        pttElement: {
+          md5HexStr: "bbb",
+          __base64Uri: "base64://YmFy",
+          __localFileUrl: "file:///tmp/b.amr",
+        },
+      },
+      {
+        elementType: 5,
+        videoElement: {
+          videoMd5: "ccc",
+          __base64Uri: "base64://YmF6",
+          __localFileUrl: "file:///tmp/c.mp4",
+        },
       },
       {
         elementType: 11,
@@ -460,7 +739,11 @@ test("Domain cleanup: buildNtMarketFaceUrl & stripTransientNtMedia live in segme
   };
   segmentConverter.stripTransientNtMedia(rawMsg);
   assert.strictEqual(rawMsg.elements[0].picElement.__base64Uri, undefined);
+  assert.strictEqual(rawMsg.elements[0].picElement.__localFileUrl, undefined);
   assert.strictEqual(rawMsg.elements[1].pttElement.__base64Uri, undefined);
+  assert.strictEqual(rawMsg.elements[1].pttElement.__localFileUrl, undefined);
+  assert.strictEqual(rawMsg.elements[2].videoElement.__base64Uri, undefined);
+  assert.strictEqual(rawMsg.elements[2].videoElement.__localFileUrl, undefined);
 
   // MessageIdStore.indexMsgMedia still resolves marketFaceElement URLs cleanly via segment_converter.js
   const store = new storesMod.MessageIdStore(32);

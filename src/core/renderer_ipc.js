@@ -22,8 +22,11 @@ const {
   setBoundedMap,
 } = require("./primitives");
 const { isQuietLogsEnabled } = require("./env");
-const { loginRecoveryMixin } = require("./login_recovery");
+const { injectWireCodecIntoRendererSource } = require("./wire_codec");
 
+/** @typedef {import("../types").BridgeHost} BridgeHost */
+/** @typedef {import("../types").BridgeConfig} BridgeConfig */
+/** @typedef {import("../types").CapturedServices} CapturedServices */
 /** @typedef {import("../types").InvokeStats} InvokeStats */
 /** @typedef {import("../types").RendererHealthStats} RendererHealthStats */
 
@@ -157,7 +160,8 @@ function getRendererBridgeSource() {
       cachedRendererBridgeSource = "";
       return "";
     }
-    cachedRendererBridgeSource = fs.readFileSync(rendererPath, "utf8");
+    const rawSource = fs.readFileSync(rendererPath, "utf8");
+    cachedRendererBridgeSource = injectWireCodecIntoRendererSource(rawSource);
     return cachedRendererBridgeSource;
   } catch (_readErr) {
     // Benign: return empty string when renderer bundle cannot be read (e.g., stripped test env).
@@ -165,58 +169,28 @@ function getRendererBridgeSource() {
   }
 }
 
-const LEGACY_RENDERER_IPC_CTRL_SYM = Symbol("rosmontisLegacyRendererIpcController");
-const LEGACY_RENDERER_IPC_STATE_KEYS = Object.freeze([
-  "activeWebContents",
-  "_knownWebContents",
-  "_ipcAuthToken",
-  "_pendingRendererCmds",
-  "_ipcCmdAckInstalled",
-  "invokeStats",
-  "rendererHealthStats",
-  "_rendererReloadTimestamps",
-  "_rendererReloadTimers",
-]);
-
 /**
  * Composed Electron renderer IPC & 3-tier NTQQ invocation controller.
  */
 class RendererIpcController {
   /**
-   * @param {any} [bridge]
+   * @param {BridgeHost | Partial<BridgeHost>} [bridge={}]
    */
   constructor(bridge = {}) {
-    /** @type {any} */
-    this.bridge = bridge || {};
+    /** @type {BridgeHost} */
+    this.bridge = /** @type {BridgeHost} */ (bridge || {});
     /** @type {any} */
     this.activeWebContents = Object.prototype.hasOwnProperty.call(this.bridge, "activeWebContents")
       ? this.bridge.activeWebContents
       : null;
     /** @type {Set<any>} */
-    this._knownWebContents =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_knownWebContents") &&
-      this.bridge._knownWebContents instanceof Set
-        ? this.bridge._knownWebContents
-        : new Set();
+    this._knownWebContents = new Set();
     /** @type {string} */
-    this._ipcAuthToken =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_ipcAuthToken") &&
-      typeof this.bridge._ipcAuthToken === "string"
-        ? this.bridge._ipcAuthToken
-        : crypto.randomBytes(32).toString("hex");
+    this._ipcAuthToken = crypto.randomBytes(32).toString("hex");
     /** @type {Map<string, any>} */
-    this._pendingRendererCmds =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_pendingRendererCmds") &&
-      this.bridge._pendingRendererCmds instanceof Map
-        ? this.bridge._pendingRendererCmds
-        : new Map();
+    this._pendingRendererCmds = new Map();
     /** @type {boolean} */
-    this._ipcCmdAckInstalled = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_ipcCmdAckInstalled"
-    )
-      ? Boolean(this.bridge._ipcCmdAckInstalled)
-      : false;
+    this._ipcCmdAckInstalled = false;
     /** @type {InvokeStats} */
     this.invokeStats =
       Object.prototype.hasOwnProperty.call(this.bridge, "invokeStats") &&
@@ -238,33 +212,27 @@ class RendererIpcController {
       this.bridge,
       "rendererHealthStats"
     )
-      ? this.bridge.rendererHealthStats
+      ? this.bridge.rendererHealthStats ?? null
       : null;
     /** @type {number[]} */
-    this._rendererReloadTimestamps =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_rendererReloadTimestamps") &&
-      Array.isArray(this.bridge._rendererReloadTimestamps)
-        ? this.bridge._rendererReloadTimestamps
-        : [];
+    this._rendererReloadTimestamps = [];
     /** @type {Map<any, ReturnType<typeof setTimeout>>} */
-    this._rendererReloadTimers =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_rendererReloadTimers") &&
-      this.bridge._rendererReloadTimers instanceof Map
-        ? this.bridge._rendererReloadTimers
-        : new Map();
+    this._rendererReloadTimers = new Map();
+    /** @type {Map<string, number>} */
+    this._fallbackLogThrottle = new Map();
   }
 
-  /** @returns {any} */
+  /** @returns {BridgeConfig | undefined} */
   get config() {
     return this.bridge.config;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("./primitives").BridgeLogger> | undefined} */
   get logger() {
     return this.bridge.logger;
   }
 
-  /** @returns {any} */
+  /** @returns {CapturedServices | undefined} */
   get capturedServices() {
     return this.bridge.capturedServices;
   }
@@ -472,8 +440,8 @@ class RendererIpcController {
     let electron = electronModule;
     if (!electron) {
       try {
-        // @ts-ignore - electron is only available inside the Electron host runtime
-        electron = require("electron");
+        const electronModuleId = "electron";
+        electron = require(electronModuleId);
       } catch (err) {
         this._debugSafe(err);
         return false;
@@ -482,11 +450,7 @@ class RendererIpcController {
     if (!electron || typeof electron !== "object") return false;
 
     const attachWc = (/** @type {any} */ wc) => {
-      if (this.bridge && typeof this.bridge._attachToWebContents === "function") {
-        this.bridge._attachToWebContents(wc);
-      } else {
-        this._attachToWebContents(wc);
-      }
+      this._attachToWebContents(wc);
     };
 
     const { app, ipcMain } = electron;
@@ -727,11 +691,9 @@ class RendererIpcController {
         const maybeTriggerQuickLogin = () => {
           if (!this.bridge.online && url.includes("login") && this.config?.autoQuickLogin !== false) {
             const timer = setTimeout(() => {
-              const fn =
-                typeof this.bridge._tryAutoQuickLogin === "function"
-                  ? this.bridge._tryAutoQuickLogin.bind(this.bridge)
-                  : this._tryAutoQuickLogin.bind(this);
-              fn({ webContents }).catch((/** @type {any} */ err) => this._debugSafe(err));
+              this._tryAutoQuickLogin({ webContents }).catch((/** @type {any} */ err) =>
+                this._debugSafe(err)
+              );
             }, 1500);
             if (timer && typeof timer.unref === "function") timer.unref();
           }
@@ -745,12 +707,13 @@ class RendererIpcController {
         const rawWid = Number(webContents.id || 1);
         const widJson = this._safeJsJson(Number.isFinite(rawWid) && rawWid > 0 ? rawWid : 1);
         const ipcAuthTokenJson = this._safeJsJson(this._ipcAuthToken);
+        const sc = this.bridge.sessionController;
         const syncPatchJson = this._safeJsJson({
-          activeAioPeer: this.bridge._activeAioPeer,
-          activeAioPeerKey: this.bridge._activeAioPeerKey,
-          focused: this.bridge._windowFocused,
+          activeAioPeer: sc ? sc.activeAioPeer : null,
+          activeAioPeerKey: sc ? sc.activeAioPeerKey : "",
+          focused: sc ? sc.windowFocused : false,
         });
-        const script = `(function(){ var wid = ${widJson}; var ipcAuthToken = ${ipcAuthTokenJson}; var syncPatch = ${syncPatchJson}; if (window.__ROSMONTIS_RENDERER_BRIDGE__) { if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken(ipcAuthToken); window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(wid); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(syncPatch); return true; } window.__ROSMONTIS_WINDOW_ID__ = wid; ${code}\n if (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: wid, autoRegisterListeners: true, ipcAuthToken: ipcAuthToken }); if (b && typeof b.setIpcAuthToken === "function") b.setIpcAuthToken(ipcAuthToken); if (b && typeof b.syncSessionState === "function") b.syncSessionState(syncPatch); } return true; })();`;
+        const script = `(function(){ var wid = ${widJson}; var ipcAuthToken = ${ipcAuthTokenJson}; var syncPatch = ${syncPatchJson}; if (window.__ROSMONTIS_RENDERER_BRIDGE__) { if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken(ipcAuthToken); window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(wid); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(syncPatch); return true; } window.__ROSMONTIS_WINDOW_ID__ = wid;\n${code}\nif (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: wid, autoRegisterListeners: true, ipcAuthToken: ipcAuthToken }); if (b && typeof b.setIpcAuthToken === "function") b.setIpcAuthToken(ipcAuthToken); if (b && typeof b.syncSessionState === "function") b.syncSessionState(syncPatch); } return true; })();`;
         const genAtStart = injectGen;
         injectPending = true;
         Promise.resolve(webContents.executeJavaScript(script, true))
@@ -824,10 +787,7 @@ class RendererIpcController {
 
         this._rejectPendingRendererCmds(webContents, `renderer process gone (${reason})`);
         try {
-          const resetRes = this.bridge._resetHumanSessionState?.({ resetRenderer: false });
-          if (resetRes && typeof resetRes.catch === "function") {
-            resetRes.catch((/** @type {any} */ err) => this._debugSafe(err));
-          }
+          this.bridge.sessionController?.reset({ resetRenderer: false });
         } catch (err) {
           this._debugSafe(err);
         }
@@ -955,15 +915,15 @@ class RendererIpcController {
   }
 
   /**
-   * Delegates auto-quick-login recovery to `InboundPipeline` / `loginRecoveryMixin`.
+   * Delegates auto-quick-login recovery to `InboundPipeline`.
    * @param {Record<string, any>} [options={}]
    * @returns {Promise<any>}
    */
   async _tryAutoQuickLogin(options = {}) {
-    if (this.bridge?.inboundPipeline && typeof this.bridge.inboundPipeline._tryAutoQuickLogin === "function") {
+    if (this.bridge.inboundPipeline) {
       return await this.bridge.inboundPipeline._tryAutoQuickLogin(options);
     }
-    return await loginRecoveryMixin._tryAutoQuickLogin.call(this.bridge, options);
+    return { skipped: true, reason: "inbound_unavailable", online: Boolean(this.bridge.online) };
   }
 
   /**
@@ -989,11 +949,11 @@ class RendererIpcController {
     if (!data || typeof data !== "object") return;
     const cmdName = String(data.cmdName || "");
     const eventName = String(data.eventName || "");
-    const shortEvent = cmdName.includes("/") ? cmdName.split("/").pop() : cmdName;
+    const shortEvent = cmdName.includes("/") ? cmdName.split("/").pop() || "" : cmdName;
     const listenerName = cmdName.includes("/") ? cmdName.split("/")[0] : eventName;
     const payload = data.payload;
     if (shortEvent) {
-      this.bridge._handleKernelEvent?.(
+      this.bridge.inboundPipeline?._handleKernelEvent(
         listenerName,
         shortEvent,
         Array.isArray(payload) ? payload : [payload]
@@ -1091,8 +1051,10 @@ class RendererIpcController {
           typeof cmdPayload.argsSerialized === "string"
             ? cmdPayload.argsSerialized
             : this._serializeBridgeArgs(cmdPayload.args ?? [null, null]);
+        const effectiveTimeout = Math.max(100, Number(timeoutMs) || 15000);
+        const timeoutJson = this._safeJsJson(effectiveTimeout);
         const notReady = this._safeJsJson(`${BRIDGE_UNAVAILABLE_TAG}: Renderer bridge not ready`);
-        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized(${cmdJson}, ${argsJson}) : (window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi(${cmdJson}, ${argsJson}) : Promise.reject(new Error(${notReady}))`;
+        js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApiSerialized(${cmdJson}, ${argsJson}, ${timeoutJson}) : (window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi) ? window.__ROSMONTIS_RENDERER_BRIDGE__.invokeNtApi(${cmdJson}, ${argsJson}, ${timeoutJson}) : Promise.reject(new Error(${notReady}))`;
       } else if (type === "simulateSession") {
         const optsJson = this._safeJsJson(cmdPayload.opts || {});
         js = `(window.__ROSMONTIS_RENDERER_BRIDGE__ && window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow) ? window.__ROSMONTIS_RENDERER_BRIDGE__.simulateHumanSessionFlow(${optsJson}) : null`;
@@ -1157,12 +1119,9 @@ class RendererIpcController {
     }
     if (isQuietLogsEnabled(this.config)) return;
     const now = Date.now();
-    if (!this.bridge._logThrottle) {
-      this.bridge._logThrottle = new Map();
-    }
-    const last = this.bridge._logThrottle.get(key);
+    const last = this._fallbackLogThrottle.get(key);
     if (last !== undefined && now - last < 60000) return;
-    setBoundedMap(this.bridge._logThrottle, key, now, 500);
+    setBoundedMap(this._fallbackLogThrottle, key, now, 500);
     try {
       process.stderr.write(`[rosmontis] WARN: ${message}\n`);
     } catch (_writeErr) {
@@ -1182,12 +1141,9 @@ class RendererIpcController {
     }
     if (isQuietLogsEnabled(this.config)) return;
     const now = Date.now();
-    if (!this.bridge._logThrottle) {
-      this.bridge._logThrottle = new Map();
-    }
-    const last = this.bridge._logThrottle.get(key);
+    const last = this._fallbackLogThrottle.get(key);
     if (last !== undefined && now - last < intervalMs) return;
-    setBoundedMap(this.bridge._logThrottle, key, now, 500);
+    setBoundedMap(this._fallbackLogThrottle, key, now, 500);
     try {
       process.stderr.write(`[rosmontis] ${message}\n`);
     } catch (_writeErr) {
@@ -1222,6 +1178,7 @@ class RendererIpcController {
           typeof this.capturedServices.ntApi.invoke["nodeIKernelMsgService/sendMsg"] === "function"
         ? this.capturedServices.ntApi.invoke
         : this.capturedServices.ntApi;
+    /** @type {any} */
     let handler = null;
     try {
       handler = ntApiTarget[cmd];
@@ -1315,10 +1272,7 @@ class RendererIpcController {
       }
     }
 
-    const canInvokeRenderer =
-      this.bridge && typeof this.bridge._canInvokeRenderer === "function"
-        ? Boolean(this.bridge._canInvokeRenderer(this.activeWebContents))
-        : this._canInvokeRenderer(this.activeWebContents);
+    const canInvokeRenderer = this._canInvokeRenderer(this.activeWebContents);
 
     // Tier 1: Execute via Renderer structured IPC (`__ROSMONTIS_BRIDGE_CMD__`) or safe fallback
     if (typeof rendererExecute === "function") {
@@ -1336,11 +1290,7 @@ class RendererIpcController {
           Number.isFinite(Number(invokeOptions?.timeoutMs)) && Number(invokeOptions?.timeoutMs) > 0
             ? Number(invokeOptions?.timeoutMs)
             : 15000;
-        const invokeRendererCmd =
-          this.bridge && typeof this.bridge._invokeRendererCommand === "function"
-            ? this.bridge._invokeRendererCommand.bind(this.bridge)
-            : this._invokeRendererCommand.bind(this);
-        const res = await invokeRendererCmd(
+        const res = await this._invokeRendererCommand(
           "invokeNt",
           {
             cmd,
@@ -1414,83 +1364,6 @@ class RendererIpcController {
   }
 }
 
-/**
- * Resolves or lazily binds a `RendererIpcController` for legacy `rendererIpcMixin` hosts.
- * @param {any} host
- * @returns {RendererIpcController}
- */
-function _resolveLegacyRendererIpcController(host) {
-  if (host instanceof RendererIpcController) return host;
-  if (host && host.rendererIpc instanceof RendererIpcController) return host.rendererIpc;
-  if (host && host[LEGACY_RENDERER_IPC_CTRL_SYM] instanceof RendererIpcController) {
-    return host[LEGACY_RENDERER_IPC_CTRL_SYM];
-  }
-  const ctrl = new RendererIpcController(host);
-  if (host && typeof host === "object") {
-    Object.defineProperty(host, LEGACY_RENDERER_IPC_CTRL_SYM, {
-      value: ctrl,
-      enumerable: false,
-      configurable: true,
-    });
-    for (const key of LEGACY_RENDERER_IPC_STATE_KEYS) {
-      const desc = Object.getOwnPropertyDescriptor(host, key);
-      if (!desc || ("value" in desc && desc.configurable !== false)) {
-        Object.defineProperty(host, key, {
-          enumerable: true,
-          configurable: true,
-          get() {
-            return /** @type {any} */ (ctrl)[key];
-          },
-          set(val) {
-            /** @type {any} */ (ctrl)[key] = val;
-          },
-        });
-      }
-    }
-  }
-  return ctrl;
-}
-
-const RENDERER_IPC_METHODS = /** @type {const} */ ([
-  "_safeJsJson",
-  "_isTrustedRendererUrl",
-  "_isTrustedIpcEvent",
-  "_handleRendererCmdAck",
-  "_ensureRendererHealthStats",
-  "_clearRendererReloadTimers",
-  "_rejectPendingRendererCmds",
-  "installElectronHooks",
-  "_isWebContentsAlive",
-  "_canInvokeRenderer",
-  "_isMainChatUrl",
-  "_shouldPromoteWebContents",
-  "_attachToWebContents",
-  "_tryAutoQuickLogin",
-  "_reviveBridgeResult",
-  "_reviveBridgePayload",
-  "_handleRendererForwardedEvent",
-  "_serializeBridgeArgs",
-  "_serializeBridgePayload",
-  "_invokeRendererCommand",
-  "_recordInvokeTier",
-  "_logInvokeWarning",
-  "_logWarn",
-  "_invokeTier2NtApi",
-  "invokeNt",
-]);
-
-/**
- * Backward-compatible mixin facade delegating to `RendererIpcController`.
- * @type {Record<string, (...args: any[]) => any>}
- */
-const rendererIpcMixin = {};
-for (const methodName of RENDERER_IPC_METHODS) {
-  rendererIpcMixin[methodName] = function (/** @type {any[]} */ ...args) {
-    const ctrl = _resolveLegacyRendererIpcController(this);
-    return /** @type {any} */ (ctrl)[methodName](...args);
-  };
-}
-
 module.exports = {
   safeJsJson,
   SERVICE_GETTER_MAP,
@@ -1501,5 +1374,4 @@ module.exports = {
   isBridgeUnavailableError,
   getRendererBridgeSource,
   RendererIpcController,
-  rendererIpcMixin,
 };

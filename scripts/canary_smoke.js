@@ -6,6 +6,7 @@ const { execFileSync } = require("child_process");
 const container = process.env.CONTAINER_NAME || "rosmontis-canary";
 const token = process.env.CANARY_TOKEN || "";
 const httpPort = Number(process.env.HTTP_PORT || "3000");
+const REQUEST_TIMEOUT_MS = 20000;
 
 let completed = false;
 process.on("beforeExit", (code) => {
@@ -55,7 +56,7 @@ function requestJson(method, reqPath, body = undefined) {
         path: reqPath,
         method,
         headers,
-        timeout: 20000,
+        timeout: REQUEST_TIMEOUT_MS,
       },
       (res) => {
         const chunks = [];
@@ -72,7 +73,7 @@ function requestJson(method, reqPath, body = undefined) {
       }
     );
     req.on("timeout", () => {
-      req.destroy(new Error(`HTTP ${method} ${reqPath} timed out after 10000ms`));
+      req.destroy(new Error(`HTTP ${method} ${reqPath} timed out after ${REQUEST_TIMEOUT_MS}ms`));
     });
     req.on("error", reject);
     if (payloadBuf) {

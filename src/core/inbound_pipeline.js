@@ -6,8 +6,8 @@
  *
  * Composed controller (`InboundPipeline`) coordinating incoming NTQQ kernel events,
  * per-peer causal message ordering with bounded cross-peer media hydration concurrency,
- * UID->UIN resolution, `mediaHydratorMixin` (`./media_hydrator`), and
- * `loginRecoveryMixin` (`./login_recovery`).
+ * UID->UIN resolution, `MediaHydrator` (`./media_hydrator`), and
+ * `LoginRecovery` (`./login_recovery`).
  */
 
 const bridgeOnebot = require("../bridge_onebot");
@@ -20,8 +20,12 @@ const {
 const { isPrefixedEnvFlagOne } = require("./env");
 const { BoundedMap, setBoundedMap } = require("./primitives");
 const { pickPositiveUin } = require("./nt_normalizer");
-const { mediaHydratorMixin, stripTransientMedia } = require("./media_hydrator");
-const { loginRecoveryMixin } = require("./login_recovery");
+const { MediaHydrator, stripTransientMedia } = require("./media_hydrator");
+const { LoginRecovery } = require("./login_recovery");
+
+/** @typedef {import("../types").BridgeHost} BridgeHost */
+/** @typedef {import("../types").BridgeConfig} BridgeConfig */
+/** @typedef {import("../types").InvokeNtOptions} InvokeNtOptions */
 
 /**
  * @param {any} v
@@ -105,181 +109,82 @@ function _collectTemplParamUids(templParam, out) {
   }
 }
 
-const LEGACY_INBOUND_CTRL_SYM = Symbol("rosmontisLegacyInboundPipeline");
-const LEGACY_INBOUND_STATE_KEYS = Object.freeze([
-  "_pttTextWaiters",
-  "_richMediaWaiters",
-  "_groupNotifiesCache",
-  "_buddyReqsCache",
-  "_groupListCache",
-  "_buddyCategoriesCache",
-  "_groupListWaiters",
-  "_qrCodeWaiters",
-  "_buddyListWaiters",
-  "_profileDetailWaiters",
-  "_doubtBuddyWaiters",
-  "_recentSentMsgByPeer",
-  "_inboundMediaActive",
-  "_inboundMediaWaiters",
-  "_inboundPeerChains",
-  "_emojiLikesSnapshot",
-  "_memberCardCache",
-  "_autoQuickLoginAttempts",
-  "_lastAutoQuickLoginAt",
-]);
-
 /**
  * Composed inbound kernel event routing, media hydration & login recovery pipeline.
  */
 class InboundPipeline {
   /**
-   * @param {any} [bridge]
+   * @param {BridgeHost | Partial<BridgeHost>} [bridge={}]
    */
   constructor(bridge = {}) {
-    /** @type {any} */
-    this.bridge = bridge || {};
+    /** @type {BridgeHost} */
+    this.bridge = /** @type {BridgeHost} */ (bridge || {});
     /** @type {Map<string, any>} */
-    this._pttTextWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_pttTextWaiters") &&
-      this.bridge._pttTextWaiters instanceof Map
-        ? this.bridge._pttTextWaiters
-        : new Map();
-    /** @type {Map<string, Set<any>>} */
-    this._richMediaWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_richMediaWaiters") &&
-      this.bridge._richMediaWaiters instanceof Map
-        ? this.bridge._richMediaWaiters
-        : new Map();
+    this._pttTextWaiters = new Map();
+    /** @type {Map<string, Set<import("./media_hydrator").RichMediaWaiterEntry>>} */
+    this._richMediaWaiters = new Map();
     /** @type {Map<string, any>} */
-    this._groupNotifiesCache =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_groupNotifiesCache") &&
-      this.bridge._groupNotifiesCache instanceof Map
-        ? this.bridge._groupNotifiesCache
-        : new BoundedMap(2000);
+    this._groupNotifiesCache = new BoundedMap(2000);
     /** @type {Map<string, any>} */
-    this._buddyReqsCache =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_buddyReqsCache") &&
-      this.bridge._buddyReqsCache instanceof Map
-        ? this.bridge._buddyReqsCache
-        : new BoundedMap(2000);
+    this._buddyReqsCache = new BoundedMap(2000);
     /** @type {Map<string, any>} */
-    this._groupListCache =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_groupListCache") &&
-      this.bridge._groupListCache instanceof Map
-        ? this.bridge._groupListCache
-        : new BoundedMap(2000);
+    this._groupListCache = new BoundedMap(2000);
     /** @type {any[]} */
-    this._buddyCategoriesCache =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_buddyCategoriesCache") &&
-      Array.isArray(this.bridge._buddyCategoriesCache)
-        ? this.bridge._buddyCategoriesCache
-        : [];
+    this._buddyCategoriesCache = [];
     /** @type {Set<any>} */
-    this._groupListWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_groupListWaiters") &&
-      this.bridge._groupListWaiters instanceof Set
-        ? this.bridge._groupListWaiters
-        : new Set();
+    this._groupListWaiters = new Set();
+    /** @type {Set<(qrBase64: string) => void>} */
+    this._qrCodeWaiters = new Set();
     /** @type {Set<any>} */
-    this._qrCodeWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_qrCodeWaiters") &&
-      this.bridge._qrCodeWaiters instanceof Set
-        ? this.bridge._qrCodeWaiters
-        : new Set();
-    /** @type {Set<any>} */
-    this._buddyListWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_buddyListWaiters") &&
-      this.bridge._buddyListWaiters instanceof Set
-        ? this.bridge._buddyListWaiters
-        : new Set();
+    this._buddyListWaiters = new Set();
     /** @type {Map<string, Set<any>>} */
-    this._profileDetailWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_profileDetailWaiters") &&
-      this.bridge._profileDetailWaiters instanceof Map
-        ? this.bridge._profileDetailWaiters
-        : new Map();
+    this._profileDetailWaiters = new Map();
     /** @type {Set<any>} */
-    this._doubtBuddyWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_doubtBuddyWaiters") &&
-      this.bridge._doubtBuddyWaiters instanceof Set
-        ? this.bridge._doubtBuddyWaiters
-        : new Set();
+    this._doubtBuddyWaiters = new Set();
     /** @type {Map<string, any>} */
-    this._recentSentMsgByPeer =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_recentSentMsgByPeer") &&
-      this.bridge._recentSentMsgByPeer instanceof Map
-        ? this.bridge._recentSentMsgByPeer
-        : new BoundedMap(2000);
+    this._recentSentMsgByPeer = new BoundedMap(2000);
     /** @type {number} */
-    this._inboundMediaActive = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_inboundMediaActive"
-    )
-      ? Number(this.bridge._inboundMediaActive) || 0
-      : 0;
+    this._inboundMediaActive = 0;
     /** @type {Array<() => void>} */
-    this._inboundMediaWaiters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_inboundMediaWaiters") &&
-      Array.isArray(this.bridge._inboundMediaWaiters)
-        ? this.bridge._inboundMediaWaiters
-        : [];
+    this._inboundMediaWaiters = [];
     /** @type {Map<string, Promise<void>>} */
-    this._inboundPeerChains =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_inboundPeerChains") &&
-      this.bridge._inboundPeerChains instanceof Map
-        ? this.bridge._inboundPeerChains
-        : new Map();
+    this._inboundPeerChains = new Map();
     /** @type {Map<string, string>} */
-    this._emojiLikesSnapshot =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_emojiLikesSnapshot") &&
-      this.bridge._emojiLikesSnapshot instanceof Map
-        ? this.bridge._emojiLikesSnapshot
-        : new Map();
+    this._emojiLikesSnapshot = new Map();
     /** @type {Map<string, string>} */
-    this._memberCardCache =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_memberCardCache") &&
-      this.bridge._memberCardCache instanceof Map
-        ? this.bridge._memberCardCache
-        : new Map();
+    this._memberCardCache = new Map();
     /** @type {number} */
-    this._autoQuickLoginAttempts = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_autoQuickLoginAttempts"
-    )
-      ? Number(this.bridge._autoQuickLoginAttempts) || 0
-      : 0;
+    this._autoQuickLoginAttempts = 0;
     /** @type {number} */
-    this._lastAutoQuickLoginAt = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_lastAutoQuickLoginAt"
-    )
-      ? Number(this.bridge._lastAutoQuickLoginAt) || 0
-      : 0;
+    this._lastAutoQuickLoginAt = 0;
+
+    this.mediaHydrator = new MediaHydrator(this);
+    this.loginRecovery = new LoginRecovery(this);
   }
 
-  /** @returns {any} */
+  /** @returns {BridgeConfig | undefined} */
   get config() {
     return this.bridge.config;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("./primitives").BridgeLogger> | undefined} */
   get logger() {
     return this.bridge.logger;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("../onebot/stores").MessageIdStore> | undefined} */
   get messageIdStore() {
     return this.bridge.messageIdStore;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("../onebot/stores").UinUidStore> | undefined} */
   get uinUidStore() {
     return this.bridge.uinUidStore;
   }
 
   /** @returns {string} */
   get selfUin() {
-    return this.bridge.selfUin;
+    return this.bridge.selfUin || "";
   }
 
   /** @param {string} v */
@@ -289,7 +194,7 @@ class InboundPipeline {
 
   /** @returns {string} */
   get selfUid() {
-    return this.bridge.selfUid;
+    return this.bridge.selfUid || "";
   }
 
   /** @param {string} v */
@@ -299,7 +204,7 @@ class InboundPipeline {
 
   /** @returns {string} */
   get selfNickname() {
-    return this.bridge.selfNickname;
+    return this.bridge.selfNickname || "";
   }
 
   /** @param {string} v */
@@ -319,7 +224,7 @@ class InboundPipeline {
 
   /** @returns {string} */
   get lastQrCodeBase64() {
-    return this.bridge.lastQrCodeBase64;
+    return this.bridge.lastQrCodeBase64 || "";
   }
 
   /** @param {string} v */
@@ -332,53 +237,82 @@ class InboundPipeline {
     return this.bridge.activeWebContents;
   }
 
-  /** @returns {any} */
+  /** @returns {import("../types").CapturedServices | undefined} */
   get capturedServices() {
     return this.bridge.capturedServices;
   }
 
-  /** @returns {any} */
+  /** @returns {((cmd: string, args: any[]) => Promise<any>) | null | undefined} */
   get rendererExecute() {
     return this.bridge.rendererExecute;
   }
 
-  /** @returns {any} */
+  /** @returns {((service: string, method: string, args: any[]) => Promise<any>) | null | undefined} */
   get ntCall() {
     return this.bridge.ntCall;
   }
 
   /**
    * @param {string} cmd
-   * @param {any} [payload]
+   * @param {Record<string, any>} [payload]
    * @param {any[] | null} [positionalArgs]
-   * @param {any} [invokeOptions]
+   * @param {InvokeNtOptions | null} [invokeOptions]
+   * @returns {Promise<any>}
    */
   invokeNt(cmd, payload, positionalArgs, invokeOptions) {
-    return this.bridge.invokeNt?.(cmd, payload, positionalArgs, invokeOptions);
+    if (typeof this.bridge.invokeNt === "function") {
+      return this.bridge.invokeNt(cmd, payload, positionalArgs, invokeOptions);
+    }
+    return Promise.resolve(undefined);
+  }
+
+  /**
+   * @param {string} key
+   * @param {number} [ttlMs]
+   * @returns {boolean}
+   */
+  _isDuplicate(key, ttlMs) {
+    return Boolean(this.bridge.eventDedupe?.isDuplicate(key, ttlMs));
   }
 
   /** @param {Record<string, any>} [identity] */
-  _updateSelfIdentity(identity) {
-    return this.bridge._updateSelfIdentity?.(identity);
+  _updateSelfIdentity(identity = {}) {
+    if (this.bridge.ntCapture) {
+      this.bridge.ntCapture._updateSelfIdentity(identity);
+      return;
+    }
+    if (identity.uin && /^\d+$/.test(String(identity.uin))) {
+      this.selfUin = String(identity.uin);
+    }
+    if (identity.uid && String(identity.uid).trim()) {
+      this.selfUid = String(identity.uid).trim();
+    }
+    const incomingNick = identity.nick ?? identity.nickname;
+    if (incomingNick && String(incomingNick).trim()) {
+      this.selfNickname = String(incomingNick).trim();
+    }
+    if (identity.markOnline) {
+      this.online = true;
+    }
   }
 
   /** @param {Record<string, any>} [opts] */
   _resetHumanSessionState(opts) {
-    return this.bridge._resetHumanSessionState?.(opts);
+    return this.bridge.sessionController?.reset(opts || undefined);
   }
 
   /** @param {any} wc */
   _isWebContentsAlive(wc) {
-    if (typeof this.bridge._isWebContentsAlive === "function") {
-      return this.bridge._isWebContentsAlive(wc);
+    if (this.bridge.rendererIpc) {
+      return this.bridge.rendererIpc._isWebContentsAlive(wc);
     }
     return Boolean(wc && (typeof wc.isDestroyed !== "function" || !wc.isDestroyed()));
   }
 
   /** @param {any} url */
   _isTrustedRendererUrl(url) {
-    if (typeof this.bridge._isTrustedRendererUrl === "function") {
-      return this.bridge._isTrustedRendererUrl(url);
+    if (this.bridge.rendererIpc) {
+      return this.bridge.rendererIpc._isTrustedRendererUrl(url);
     }
     return true;
   }
@@ -395,10 +329,7 @@ class InboundPipeline {
       return Boolean(b.dispatcher?.ready);
     }
     if (typeof b.rendererExecute === "function") return true;
-    if (
-      typeof b._canInvokeRenderer === "function" &&
-      b._canInvokeRenderer(b.activeWebContents)
-    ) {
+    if (b.rendererIpc && b.rendererIpc._canInvokeRenderer(b.activeWebContents)) {
       return true;
     }
     if (b.capturedServices) {
@@ -448,13 +379,14 @@ class InboundPipeline {
     if (_isPositiveUin(cached)) return String(cached);
 
     if (typeof this.uinUidStore.resolveUin === "function") {
+      const ntCallFn = this.bridge.ntCall;
       const invoker =
         typeof this.bridge.invokeNt === "function"
           ? this.bridge.invokeNt.bind(this.bridge)
-          : typeof this.bridge.ntCall === "function"
+          : typeof ntCallFn === "function"
           ? (/** @type {string} */ cmd, /** @type {any} */ payload) => {
               const [service, method] = String(cmd).split("/");
-              return this.bridge.ntCall(service, method, [payload]);
+              return ntCallFn.call(this.bridge, service, method, [payload]);
             }
           : undefined;
       try {
@@ -750,10 +682,14 @@ class InboundPipeline {
   _handleAddSendMsgEvent(firstArg) {
     const ntMsg = firstArg?.msgRecord || firstArg;
     if (!ntMsg || typeof ntMsg !== "object" || !ntMsg.msgId) return;
-    if (this.bridge._isDuplicateEvent?.(`send:${ntMsg.msgId}`)) {
+    if (this._isDuplicate(`send:${ntMsg.msgId}`)) {
       return;
     }
-    this.bridge._matchSendEcho?.(ntMsg);
+    if (this.bridge.outboundPipeline) {
+      this.bridge.outboundPipeline._matchSendEcho(ntMsg);
+    } else {
+      this.bridge.echoCorrelator?.match(ntMsg);
+    }
     this.uinUidStore?.rememberFromNtMsg?.(ntMsg);
     try {
       const ev = formatNtMsgToOneBotEvent(ntMsg, {
@@ -809,7 +745,7 @@ class InboundPipeline {
             ? String(ntMsg.recallTime)
             : "revoke";
         const dedupKey = `recall:${ntMsg.msgId}:${recallTag}`;
-        if (!this.bridge._isDuplicateEvent?.(dedupKey)) {
+        if (!this._isDuplicate(dedupKey)) {
           await this._resolveNtMsgUids(ntMsg);
           try {
             const ev = formatNtMsgToOneBotEvent(ntMsg, {
@@ -847,12 +783,13 @@ class InboundPipeline {
         const updateKey = `msgu:${eventName}:${ntMsg.msgId}:${ntMsg.msgSeq || 0}:${
           ntMsg.recallTime || 0
         }:${elCount}:${emojiSig}`;
-        if (this.bridge._isDuplicateEvent?.(updateKey, 3000)) {
+        if (this._isDuplicate(updateKey, 3000)) {
           continue;
         }
       }
 
       await this._resolveNtMsgUids(ntMsg);
+      /** @type {any} */
       let hit = null;
       let oneBotId = 0;
       try {
@@ -1009,7 +946,7 @@ class InboundPipeline {
       // status === 1 means pending approval
       if (status === 1 && (notifyType === 1 || notifyType === 2 || notifyType === 7)) {
         const dedupKey = `group_req:${flag}`;
-        if (this.bridge._isDuplicateEvent?.(dedupKey)) continue;
+        if (this._isDuplicate(dedupKey)) continue;
         const userUid = item.user1?.uid || "";
         const resolvedUser1Uin =
           _pickPositiveUin(item.user1?.uin) || (await this._ensureUinForUid(userUid));
@@ -1056,7 +993,7 @@ class InboundPipeline {
       const flag = `${friendUid}:${reqExtra}`;
       setBoundedMap(this._buddyReqsCache, flag, req);
       const dedupKey = `friend_req:${friendUid}:${req.reqTime || req.flag || req.postscript || req.extWords || ""}`;
-      if (this.bridge._isDuplicateEvent?.(dedupKey)) continue;
+      if (this._isDuplicate(dedupKey)) continue;
       const resolvedUin =
         positiveReqUin || (await this._ensureUinForUid(rawFriendUid || friendUid));
       if (_isPositiveUin(resolvedUin)) {
@@ -1445,7 +1382,7 @@ class InboundPipeline {
   async _processIncomingNtMessage(ntMsg) {
     if (!ntMsg || typeof ntMsg !== "object") return;
     const msgId = String(ntMsg.msgId || "");
-    if (msgId && this.bridge._isDuplicateEvent?.(`msg:${msgId}`)) {
+    if (msgId && this._isDuplicate(`msg:${msgId}`)) {
       return;
     }
 
@@ -1492,9 +1429,9 @@ class InboundPipeline {
     ) {
       const peerUid = String(ntMsg.peerUid);
       const peerKey = `1:${peerUid}:`;
-      this.bridge._sessionScheduler?.schedulePrivateRecvReaction?.(
+      this.bridge.sessionController?.scheduler.schedulePrivateRecvReaction(
         peerKey,
-        this.config.autoReadReactionDelayMs ?? [500, 1800],
+        this.config?.autoReadReactionDelayMs ?? [500, 1800],
         () =>
           this.bridge
             .simulateHumanSession?.({
@@ -1519,35 +1456,35 @@ class InboundPipeline {
 
   /** @param {any} firstArg */
   _handleRichMediaDownloadComplete(firstArg) {
-    return mediaHydratorMixin._handleRichMediaDownloadComplete.call(this, firstArg);
+    return this.mediaHydrator.handleRichMediaDownloadComplete(firstArg);
   }
 
   /** @param {Record<string, any>} [options={}] */
   _downloadRichMediaElement(options = {}) {
-    return mediaHydratorMixin._downloadRichMediaElement.call(this, options);
+    return this.mediaHydrator.downloadRichMediaElement(options);
   }
 
   /**
    * @param {any} ntMsg
    * @param {any} el
-   * @param {any} ctx
+   * @param {import("./media_hydrator").MediaHydrationContext} ctx
    */
   _hydratePicElement(ntMsg, el, ctx) {
-    return mediaHydratorMixin._hydratePicElement.call(this, ntMsg, el, ctx);
+    return this.mediaHydrator.hydratePicElement(ntMsg, el, ctx);
   }
 
   /**
    * @param {any} ntMsg
    * @param {any} el
-   * @param {any} ctx
+   * @param {import("./media_hydrator").MediaHydrationContext} ctx
    */
   _hydratePttElement(ntMsg, el, ctx) {
-    return mediaHydratorMixin._hydratePttElement.call(this, ntMsg, el, ctx);
+    return this.mediaHydrator.hydratePttElement(ntMsg, el, ctx);
   }
 
   /** @param {any} el */
   _hydrateVideoElement(el) {
-    return mediaHydratorMixin._hydrateVideoElement.call(this, el);
+    return this.mediaHydrator.hydrateVideoElement(el);
   }
 
   /**
@@ -1555,7 +1492,7 @@ class InboundPipeline {
    * @param {Record<string, any>} [options={}]
    */
   _hydrateNtMsgMedia(ntMsg, options = {}) {
-    return mediaHydratorMixin._hydrateNtMsgMedia.call(this, ntMsg, options);
+    return this.mediaHydrator.hydrateNtMsgMedia(ntMsg, options);
   }
 
   // --------------------------------------------------------------------------
@@ -1567,27 +1504,27 @@ class InboundPipeline {
    * @param {{ markOnline?: boolean }} [options]
    */
   _syncSelfIdentityFromLogin(rawIdentity, options) {
-    return loginRecoveryMixin._syncSelfIdentityFromLogin.call(this, rawIdentity, options);
+    return this.loginRecovery.syncSelfIdentityFromLogin(rawIdentity, options);
   }
 
   /** @param {any} firstArg */
   _handleQrCodeEvent(firstArg) {
-    return loginRecoveryMixin._handleQrCodeEvent.call(this, firstArg);
+    return this.loginRecovery.handleQrCodeEvent(firstArg);
   }
 
   /** @param {any} firstArg */
   _handleUserLoggedInEvent(firstArg) {
-    return loginRecoveryMixin._handleUserLoggedInEvent.call(this, firstArg);
+    return this.loginRecovery.handleUserLoggedInEvent(firstArg);
   }
 
   /** @param {any} firstArg */
   _handleSessionInitCompleteEvent(firstArg) {
-    return loginRecoveryMixin._handleSessionInitCompleteEvent.call(this, firstArg);
+    return this.loginRecovery.handleSessionInitCompleteEvent(firstArg);
   }
 
   /** @param {any} firstArg */
   _handleKickedOffLineEvent(firstArg) {
-    return loginRecoveryMixin._handleKickedOffLineEvent.call(this, firstArg);
+    return this.loginRecovery.handleKickedOffLineEvent(firstArg);
   }
 
   /**
@@ -1596,105 +1533,16 @@ class InboundPipeline {
    * @returns {boolean}
    */
   _handleLoginKernelEvent(eventName, args) {
-    return loginRecoveryMixin._handleLoginKernelEvent.call(this, eventName, args);
+    return this.loginRecovery.handleLoginKernelEvent(eventName, args);
   }
 
   /** @param {Record<string, any>} [options={}] */
   _tryAutoQuickLogin(options = {}) {
-    return loginRecoveryMixin._tryAutoQuickLogin.call(this, options);
+    return this.loginRecovery.tryAutoQuickLogin(options);
   }
-}
-
-/**
- * Resolves or lazily binds an `InboundPipeline` for legacy `inboundPipelineMixin` hosts.
- * @param {any} host
- * @returns {InboundPipeline}
- */
-function _resolveLegacyInboundPipeline(host) {
-  if (host instanceof InboundPipeline) return host;
-  if (host && host.inboundPipeline instanceof InboundPipeline) return host.inboundPipeline;
-  if (host && host[LEGACY_INBOUND_CTRL_SYM] instanceof InboundPipeline) {
-    return host[LEGACY_INBOUND_CTRL_SYM];
-  }
-  const ctrl = new InboundPipeline(host);
-  if (host && typeof host === "object") {
-    Object.defineProperty(host, LEGACY_INBOUND_CTRL_SYM, {
-      value: ctrl,
-      enumerable: false,
-      configurable: true,
-    });
-    for (const key of LEGACY_INBOUND_STATE_KEYS) {
-      const desc = Object.getOwnPropertyDescriptor(host, key);
-      if (!desc || ("value" in desc && desc.configurable !== false)) {
-        Object.defineProperty(host, key, {
-          enumerable: true,
-          configurable: true,
-          get() {
-            return /** @type {any} */ (ctrl)[key];
-          },
-          set(val) {
-            /** @type {any} */ (ctrl)[key] = val;
-          },
-        });
-      }
-    }
-  }
-  return ctrl;
-}
-
-const INBOUND_PIPELINE_METHODS = /** @type {const} */ ([
-  "_isPositiveUin",
-  "_isNtReady",
-  "_dispatchInboundEvent",
-  "_ensureUinForUid",
-  "_resolveNtMsgUids",
-  "_getInboundMediaMaxConcurrent",
-  "_acquireInboundMediaSlot",
-  "_releaseInboundMediaSlot",
-  "_enqueueInboundNtMessage",
-  "_handleAddSendMsgEvent",
-  "_handleMsgInfoUpdateEvent",
-  "_handleGroupNotifiesUpdatedEvent",
-  "_handleBuddyReqChangeEvent",
-  "_handleBuddyListChangeEvent",
-  "_handleProfileSimpleChangedEvent",
-  "_handleProfileDetailInfoChangedEvent",
-  "_handleDoubtBuddyReqChangeEvent",
-  "_handleGroupListUpdateEvent",
-  "_handleMemberInfoChangeEvent",
-  "_handleKernelEvent",
-  "_processIncomingNtMessage",
-  "_handleRichMediaDownloadComplete",
-  "_downloadRichMediaElement",
-  "_hydratePicElement",
-  "_hydratePttElement",
-  "_hydrateVideoElement",
-  "_hydrateNtMsgMedia",
-  "_syncSelfIdentityFromLogin",
-  "_handleQrCodeEvent",
-  "_handleUserLoggedInEvent",
-  "_handleSessionInitCompleteEvent",
-  "_handleKickedOffLineEvent",
-  "_handleLoginKernelEvent",
-  "_tryAutoQuickLogin",
-]);
-
-/**
- * Backward-compatible mixin facade delegating to `InboundPipeline`.
- * @type {Record<string, (...args: any[]) => any>}
- */
-const inboundPipelineMixin = {};
-for (const methodName of INBOUND_PIPELINE_METHODS) {
-  inboundPipelineMixin[methodName] = function (/** @type {any[]} */ ...args) {
-    const ctrl = _resolveLegacyInboundPipeline(this);
-    return /** @type {any} */ (ctrl)[methodName](...args);
-  };
 }
 
 module.exports = {
   InboundPipeline,
-  inboundPipelineMixin,
-  mediaHydratorMixin,
-  loginRecoveryMixin,
   _isPositiveUin,
 };

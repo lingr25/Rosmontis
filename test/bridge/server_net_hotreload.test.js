@@ -709,7 +709,7 @@ test("Webhook queue enforces bounded concurrency & drops overflow, retries 503/4
     const tasks = [];
     for (let i = 0; i < 6; i += 1) {
       tasks.push(
-        ...bridge._dispatchHttpWebhookEvent({
+        ...bridge.serverRuntime._dispatchHttpWebhookEvent({
           post_type: "message",
           message_type: "private",
           user_id: 100 + i,
@@ -748,7 +748,7 @@ test("Webhook queue enforces bounded concurrency & drops overflow, retries 503/4
       { name: "flaky503", url: `http://127.0.0.1:${retryPort}/flaky503` },
     ];
     await Promise.all(
-      bridge._dispatchHttpWebhookEvent({ post_type: "notice", notice_type: "poke" })
+      bridge.serverRuntime._dispatchHttpWebhookEvent({ post_type: "notice", notice_type: "poke" })
     );
     assert.strictEqual(routeHits.get("/flaky503"), 2);
     assert.strictEqual(bridge.webhookStats.ok, 5);
@@ -760,7 +760,7 @@ test("Webhook queue enforces bounded concurrency & drops overflow, retries 503/4
       { name: "bad400", url: `http://127.0.0.1:${retryPort}/bad400` },
     ];
     await Promise.all(
-      bridge._dispatchHttpWebhookEvent({ post_type: "notice", notice_type: "poke" })
+      bridge.serverRuntime._dispatchHttpWebhookEvent({ post_type: "notice", notice_type: "poke" })
     );
     assert.strictEqual(routeHits.get("/bad400"), 1, "400 must not be retried");
     assert.strictEqual(bridge.webhookStats.retries, 1);
@@ -771,7 +771,7 @@ test("Webhook queue enforces bounded concurrency & drops overflow, retries 503/4
       { name: "rate429", url: `http://127.0.0.1:${retryPort}/rate429` },
     ];
     await Promise.all(
-      bridge._dispatchHttpWebhookEvent({ post_type: "notice", notice_type: "poke" })
+      bridge.serverRuntime._dispatchHttpWebhookEvent({ post_type: "notice", notice_type: "poke" })
     );
     assert.strictEqual(routeHits.get("/rate429"), 3);
     assert.strictEqual(bridge.webhookStats.ok, 6);
@@ -790,19 +790,19 @@ test("Webhook queue enforces bounded concurrency & drops overflow, retries 503/4
         retryBaseMs: 30000,
       },
     ];
-    const pendingStopTasks = bridge._dispatchHttpWebhookEvent({
+    const pendingStopTasks = bridge.serverRuntime._dispatchHttpWebhookEvent({
       post_type: "notice",
       notice_type: "poke",
     });
-    for (let tries = 0; tries < 50 && bridge._webhookRetryTimers.size === 0; tries += 1) {
+    for (let tries = 0; tries < 50 && bridge.serverRuntime._webhookRetryTimers.size === 0; tries += 1) {
       await sleep(10);
     }
-    assert.strictEqual(bridge._webhookRetryTimers.size, 1);
+    assert.strictEqual(bridge.serverRuntime._webhookRetryTimers.size, 1);
     const stopStart = Date.now();
     await bridge.stopServers();
     await Promise.all(pendingStopTasks);
     assert.ok(Date.now() - stopStart < 500, "stopServers must cancel pending webhook retry timers immediately");
-    assert.strictEqual(bridge._webhookRetryTimers.size, 0);
+    assert.strictEqual(bridge.serverRuntime._webhookRetryTimers.size, 0);
   } finally {
     await bridge.stopServers();
     await new Promise((resolve) => slowServer.close(resolve));
@@ -867,8 +867,8 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
 
   // Spy on sessionScheduler.dispose and echoCorrelator.clear to verify hot reload never disposes QQ runtime state
   let schedulerDisposeCalls = 0;
-  const origSchedulerDispose = bridge._sessionScheduler.dispose.bind(bridge._sessionScheduler);
-  bridge._sessionScheduler.dispose = () => {
+  const origSchedulerDispose = bridge.sessionController.scheduler.dispose.bind(bridge.sessionController.scheduler);
+  bridge.sessionController.scheduler.dispose = () => {
     schedulerDisposeCalls += 1;
     return origSchedulerDispose();
   };
@@ -899,7 +899,7 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
     assert.strictEqual(initHealth.json.self_id, 88880001);
 
     // 1) Policy-only programmatic reload: should NOT restart HTTP server
-    const prevHttpServerRef = bridge._httpServers[0];
+    const prevHttpServerRef = bridge.serverRuntime._httpServers[0];
     writeConfigFile({
       selfUin: "88880001",
       logFormat: "json",
@@ -918,7 +918,7 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
     assert.strictEqual(policyRes.reloaded, true);
     assert.strictEqual(policyRes.network_restarted, false);
     assert.strictEqual(bridge.config.logFormat, "json");
-    assert.strictEqual(bridge._httpServers[0], prevHttpServerRef, "Policy-only reload must not restart servers");
+    assert.strictEqual(bridge.serverRuntime._httpServers[0], prevHttpServerRef, "Policy-only reload must not restart servers");
     assert.strictEqual(rateLimitUpdateCalls, 1);
     assert.strictEqual(lastRateLimitCfg.enabled, true);
     assert.strictEqual(lastRateLimitCfg.globalPerSec, 42);
@@ -963,8 +963,8 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
     assert.strictEqual(httpReloadRes.json.data.network_restart_scheduled, true);
 
     // Wait for deferred network restart to finish binding port2
-    if (bridge._pendingNetworkRestart) {
-      await bridge._pendingNetworkRestart;
+    if (bridge.serverRuntime._pendingNetworkRestart) {
+      await bridge.serverRuntime._pendingNetworkRestart;
     }
 
     // Old token rejected on port2, new token succeeds on port2
@@ -1012,8 +1012,8 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
     });
     assert.strictEqual(samePortReload.statusCode, 200);
     assert.strictEqual(samePortReload.json.data.reloaded, true);
-    if (bridge._pendingNetworkRestart) {
-      await bridge._pendingNetworkRestart;
+    if (bridge.serverRuntime._pendingNetworkRestart) {
+      await bridge.serverRuntime._pendingNetworkRestart;
     }
     const tok3Res = await httpRequest({
       port: port2,
@@ -1039,7 +1039,7 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
     ]);
     assert.strictEqual(rA.network_restarted, true);
     assert.strictEqual(rB.network_restarted, true);
-    assert.strictEqual(bridge._httpServers.length, 1);
+    assert.strictEqual(bridge.serverRuntime._httpServers.length, 1);
     const port3Res = await httpRequest({
       port: port3,
       path: "/health",
@@ -1057,7 +1057,7 @@ test("reloadConfig supports programmatic & live HTTP POST /reload_config without
     assert.strictEqual(bridge.uinUidStore.getUidSync("500001"), "u_500001");
     assert.strictEqual(schedulerDisposeCalls, 0, "Hot reload must never dispose _sessionScheduler");
     assert.strictEqual(echoClearCalls, 0, "Hot reload must never clear echoCorrelator");
-    const lockOk = await bridge._withAioLock(async () => "still-alive");
+    const lockOk = await bridge.sessionController.withLock(async () => "still-alive");
     assert.strictEqual(lockOk, "still-alive");
   } finally {
     await bridge.stopServers();

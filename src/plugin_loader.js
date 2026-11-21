@@ -168,7 +168,7 @@ function onBrowserWindowCreated(window) {
   const wc = window && (window.webContents || window);
   if (bridge && wc) {
     try {
-      bridge._attachToWebContents?.(wc);
+      bridge.rendererIpc?._attachToWebContents?.(wc);
     } catch (err) {
       bridge.logger?.debug?.("plugin_loader", err);
     }

@@ -116,6 +116,10 @@ function _normalizeDomainEntries(list) {
     .filter(Boolean);
 }
 
+/**
+ * @param {any} hostname
+ * @param {Iterable<string> | string[] | null} [extraDomains=null]
+ */
 function isTrustedTencentHost(hostname, extraDomains = null) {
   if (typeof hostname !== "string") return false;
   const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
@@ -126,6 +130,10 @@ function isTrustedTencentHost(hostname, extraDomains = null) {
   return domains.some((domain) => host === domain || host.endsWith(`.${domain}`));
 }
 
+/**
+ * @param {any} hostname
+ * @param {Iterable<string> | string[] | null} [allowedDomains=null]
+ */
 function isAllowedRedirectHost(hostname, allowedDomains = null) {
   if (typeof hostname !== "string") return false;
   const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
@@ -135,6 +143,10 @@ function isAllowedRedirectHost(hostname, allowedDomains = null) {
   return domains.some((domain) => host === domain || host.endsWith(`.${domain}`));
 }
 
+/**
+ * @param {URL | string} nextUrl
+ * @param {Iterable<string> | string[] | null} [allowedDomains=null]
+ */
 function assertSafeTencentRedirect(nextUrl, allowedDomains = null) {
   const parsed = nextUrl instanceof URL ? nextUrl : new URL(String(nextUrl));
   const proto = parsed.protocol.toLowerCase();
@@ -291,6 +303,7 @@ function _buildTransportSafetyOptions(options, allowPrivateUrls) {
 }
 
 function _sanitizeHeadersObject(rawHeaders = {}, includeDefaultUa = false) {
+  /** @type {Record<string, string>} */
   const out = {};
   if (includeDefaultUa) {
     out["User-Agent"] = sanitizeHeaderValue(buildNtqqUserAgent());

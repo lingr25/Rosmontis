@@ -4,10 +4,10 @@
 /**
  * Inbound Rich-Media Download & Hydration Subsystem (`src/core/media_hydrator.js`)
  *
- * Extracted from `src/core/inbound_pipeline.js`:
- * - `onRichMediaDownloadComplete` waiter resolution (`_handleRichMediaDownloadComplete`)
- * - Active NTQQ rich-media download with event waiter + fs stat polling (`_downloadRichMediaElement`)
- * - Inbound message media hydration for `picElement`, `pttElement`, and `videoElement` (`_hydrateNtMsgMedia`)
+ * Typed helper class (`MediaHydrator`) composed by `InboundPipeline`:
+ * - `onRichMediaDownloadComplete` waiter resolution (`handleRichMediaDownloadComplete`)
+ * - Active NTQQ rich-media download with event waiter + fs stat polling (`downloadRichMediaElement`)
+ * - Inbound message media hydration for `picElement`, `pttElement`, and `videoElement` (`hydrateNtMsgMedia`)
  * - Non-enumerable `__localFileUrl` / `__base64Uri` helpers & transient media stripping
  */
 
@@ -16,9 +16,46 @@ const { pathToFileURL } = require("url");
 
 const bridgeOnebot = require("../bridge_onebot");
 
+/** @typedef {import("../types").BridgeConfig} BridgeConfig */
+/** @typedef {import("../types").InvokeNtFn} InvokeNtFn */
+
+/**
+ * @typedef {{
+ *   msgId: string,
+ *   elementId: string,
+ *   targetPath: string,
+ *   resolve: (downloadedPath: string) => void
+ * } | ((downloadedPath: string) => void)} RichMediaWaiterEntry
+ */
+
+/**
+ * Host contract required by `MediaHydrator` (satisfied by `InboundPipeline`).
+ * @typedef {object} MediaHydratorHost
+ * @property {Map<string, Set<RichMediaWaiterEntry>>} _richMediaWaiters
+ * @property {() => boolean} _isNtReady
+ * @property {InvokeNtFn} invokeNt
+ * @property {((service: string, method: string, args: any[]) => Promise<any>) | null} [ntCall]
+ * @property {BridgeConfig} [config]
+ * @property {InstanceType<typeof import("./primitives").BridgeLogger>} [logger]
+ * @property {InstanceType<typeof import("../onebot/stores").MessageIdStore>} [messageIdStore]
+ */
+
+/**
+ * @typedef {object} MediaHydrationContext
+ * @property {boolean} skipRemoteDownload
+ * @property {number} downSourceType
+ * @property {number} fallbackChatType
+ * @property {string} fallbackPeerUid
+ * @property {(capMs: number) => number} remainingRemoteBudgetMs
+ */
+
 const MAX_HYDRATE_PIC_BYTES = 10 * 1024 * 1024;
 const MAX_HYDRATE_PTT_BYTES = 2 * 1024 * 1024;
 
+/**
+ * @param {string | null | undefined} filePath
+ * @returns {Promise<fs.Stats | null>}
+ */
 async function statPositiveFile(filePath) {
   if (!filePath) return null;
   try {
@@ -32,6 +69,10 @@ async function statPositiveFile(filePath) {
   return null;
 }
 
+/**
+ * @param {any} target
+ * @param {string} localPath
+ */
 function defineLocalFileUrl(target, localPath) {
   if (!target || typeof target !== "object" || !localPath) return;
   try {
@@ -46,6 +87,10 @@ function defineLocalFileUrl(target, localPath) {
   }
 }
 
+/**
+ * @param {any} target
+ * @param {Buffer} buf
+ */
 function defineBase64Uri(target, buf) {
   if (!target || typeof target !== "object" || !buf) return;
   Object.defineProperty(target, "__base64Uri", {
@@ -56,44 +101,36 @@ function defineBase64Uri(target, buf) {
   });
 }
 
+/**
+ * @param {any} ntMsg
+ */
 function stripTransientMedia(ntMsg) {
-  if (typeof bridgeOnebot.stripTransientNtMedia === "function") {
-    try {
-      bridgeOnebot.stripTransientNtMedia(ntMsg);
-    } catch (_) {
-      // Fallback to direct element cleanup below if facade strip helper fails.
-    }
-  }
-  if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
-  for (const el of ntMsg.elements) {
-    if (!el || typeof el !== "object") continue;
-    if (el.picElement && typeof el.picElement === "object") {
-      if ("__base64Uri" in el.picElement) delete el.picElement.__base64Uri;
-      if ("__localFileUrl" in el.picElement) delete el.picElement.__localFileUrl;
-    }
-    if (el.pttElement && typeof el.pttElement === "object") {
-      if ("__base64Uri" in el.pttElement) delete el.pttElement.__base64Uri;
-      if ("__localFileUrl" in el.pttElement) delete el.pttElement.__localFileUrl;
-    }
-    if (el.videoElement && typeof el.videoElement === "object") {
-      if ("__base64Uri" in el.videoElement) delete el.videoElement.__base64Uri;
-      if ("__localFileUrl" in el.videoElement) delete el.videoElement.__localFileUrl;
-    }
-  }
+  bridgeOnebot.stripTransientNtMedia(ntMsg);
 }
 
-const mediaHydratorMixin = {
-  /** @this {any} */
-  _handleRichMediaDownloadComplete(firstArg) {
+class MediaHydrator {
+  /**
+   * @param {MediaHydratorHost} host
+   */
+  constructor(host) {
+    /** @type {MediaHydratorHost} */
+    this.host = host;
+  }
+
+  /**
+   * @param {any} firstArg
+   */
+  handleRichMediaDownloadComplete(firstArg) {
     const info = firstArg?.notifyInfo || firstArg || {};
     const msgId = String(info.msgId || "");
     const elId = String(info.msgElementId || info.elementId || "");
     const filePath = String(info.filePath || "");
     const keys = [`${msgId}:${elId}`, `${msgId}:0`, filePath].filter(Boolean);
+    /** @type {Set<RichMediaWaiterEntry>} */
     const toInvoke = new Set();
 
     for (const k of keys) {
-      const set = this._richMediaWaiters?.get(k);
+      const set = this.host._richMediaWaiters?.get(k);
       if (!set) continue;
       for (const waiter of Array.from(set)) {
         if (typeof waiter === "function") {
@@ -114,7 +151,7 @@ const mediaHydratorMixin = {
         }
       }
       if (set.size === 0) {
-        this._richMediaWaiters.delete(k);
+        this.host._richMediaWaiters.delete(k);
       }
     }
 
@@ -126,15 +163,16 @@ const mediaHydratorMixin = {
           waiter.resolve(filePath);
         }
       } catch (err) {
-        this.logger?.debug?.("inbound", err);
+        this.host.logger?.debug?.("inbound", err);
       }
     }
-  },
+  }
 
   /**
-   * @this {any}
+   * @param {Record<string, any>} [options={}]
+   * @returns {Promise<string>}
    */
-  async _downloadRichMediaElement(
+  async downloadRichMediaElement(
     {
       msgId,
       chatType,
@@ -147,7 +185,7 @@ const mediaHydratorMixin = {
       thumbSize = 0,
       filePath = "",
       timeoutMs = 8000,
-    } = /** @type {Record<string, any>} */ ({})
+    } = {}
   ) {
     const targetPath = filePath ? String(filePath).trim() : "";
     if (targetPath) {
@@ -156,19 +194,22 @@ const mediaHydratorMixin = {
         return targetPath;
       }
     }
-    if (!this._isNtReady()) return "";
+    if (!this.host._isNtReady()) return "";
     if (!msgId || !peerUid) return "";
 
     const msgIdStr = String(msgId);
     const elIdStr = String(elementId || "0");
     const effectiveTimeout = Math.max(100, Number(timeoutMs) || 8000);
-    if (!this._richMediaWaiters) {
-      this._richMediaWaiters = new Map();
+    if (!this.host._richMediaWaiters) {
+      this.host._richMediaWaiters = new Map();
     }
     const waitKeys = [`${msgIdStr}:${elIdStr}`, `${msgIdStr}:0`, targetPath].filter(Boolean);
 
+    /** @type {ReturnType<typeof setTimeout> | null} */
     let timer = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
     let pollTimer = null;
+    /** @type {RichMediaWaiterEntry | null} */
     let waiterEntry = null;
     const cleanupWaiter = () => {
       if (timer) {
@@ -179,39 +220,45 @@ const mediaHydratorMixin = {
         clearInterval(pollTimer);
         pollTimer = null;
       }
-      if (waiterEntry && this._richMediaWaiters) {
+      if (waiterEntry && this.host._richMediaWaiters) {
         for (const k of waitKeys) {
-          const set = this._richMediaWaiters.get(k);
+          const set = this.host._richMediaWaiters.get(k);
           if (set) {
             set.delete(waiterEntry);
             if (set.size === 0) {
-              this._richMediaWaiters.delete(k);
+              this.host._richMediaWaiters.delete(k);
             }
           }
         }
       }
     };
 
+    /** @type {Promise<string>} */
     const waitDownload = new Promise((resolve) => {
       let settled = false;
       let polling = false;
+      /** @param {string} [candidate] */
       const finish = (candidate) => {
         if (settled) return;
         settled = true;
         cleanupWaiter();
         resolve(candidate || targetPath);
       };
-      waiterEntry = {
+      /** @type {RichMediaWaiterEntry} */
+      const entry = {
         msgId: msgIdStr,
         elementId: elIdStr,
         targetPath,
         resolve: (downloadedPath) => finish(downloadedPath || targetPath),
       };
+      waiterEntry = entry;
       for (const k of waitKeys) {
-        if (!this._richMediaWaiters.has(k)) {
-          this._richMediaWaiters.set(k, new Set());
+        let waiterSet = this.host._richMediaWaiters.get(k);
+        if (!waiterSet) {
+          waiterSet = new Set();
+          this.host._richMediaWaiters.set(k, waiterSet);
         }
-        this._richMediaWaiters.get(k).add(waiterEntry);
+        waiterSet.add(entry);
       }
       if (targetPath) {
         pollTimer = setInterval(async () => {
@@ -249,14 +296,14 @@ const mediaHydratorMixin = {
         filePath: targetPath,
       };
       const dlRes =
-        typeof this.invokeNt === "function"
-          ? await this.invokeNt(
+        typeof this.host.invokeNt === "function"
+          ? await this.host.invokeNt(
               "nodeIKernelMsgService/downloadRichMedia",
               { getReq },
               [getReq]
             )
-          : typeof this.ntCall === "function"
-          ? await this.ntCall("nodeIKernelMsgService", "downloadRichMedia", [{ getReq }])
+          : typeof this.host.ntCall === "function"
+          ? await this.host.ntCall("nodeIKernelMsgService", "downloadRichMedia", [{ getReq }])
           : null;
       const directPath =
         typeof dlRes === "string" ? dlRes : dlRes?.filePath ? String(dlRes.filePath) : "";
@@ -271,15 +318,19 @@ const mediaHydratorMixin = {
         return String(waitedPath);
       }
     } catch (err) {
-      this.logger?.debug?.("inbound", err);
+      this.host.logger?.debug?.("inbound", err);
     } finally {
       cleanupWaiter();
     }
     return "";
-  },
+  }
 
-  /** @this {any} */
-  async _hydratePicElement(ntMsg, el, ctx) {
+  /**
+   * @param {any} ntMsg
+   * @param {any} el
+   * @param {MediaHydrationContext} ctx
+   */
+  async hydratePicElement(ntMsg, el, ctx) {
     const pe = el.picElement;
     if (!pe || pe.__base64Uri) return;
     const origin = String(pe.originImageUrl || "").trim();
@@ -296,7 +347,7 @@ const mediaHydratorMixin = {
     let st = await statPositiveFile(localPath);
     if (!st && Number(pe.fileSize || 0) > MAX_HYDRATE_PIC_BYTES) return;
 
-    if (!ctx.skipRemoteDownload && !st && !localPath && pe.md5HexStr && this._isNtReady()) {
+    if (!ctx.skipRemoteDownload && !st && !localPath && pe.md5HexStr && this.host._isNtReady()) {
       try {
         const pathInfo = {
           md5HexStr: String(pe.md5HexStr),
@@ -308,7 +359,7 @@ const mediaHydratorMixin = {
           downloadType: 1,
           file_uuid: String(pe.fileUuid || ""),
         };
-        const pathRes = await this.invokeNt(
+        const pathRes = await this.host.invokeNt(
           "nodeIKernelMsgService/getRichMediaFilePathForGuild",
           { path_info: pathInfo },
           [pathInfo]
@@ -319,13 +370,13 @@ const mediaHydratorMixin = {
           st = await statPositiveFile(localPath);
         }
       } catch (err) {
-        this.logger?.debug?.("inbound", err);
+        this.host.logger?.debug?.("inbound", err);
       }
     }
 
     const origBudgetMs = ctx.remainingRemoteBudgetMs(8000);
     if (!st && origBudgetMs > 0 && ntMsg.msgId && ctx.fallbackPeerUid) {
-      const downloadedOrig = await this._downloadRichMediaElement({
+      const downloadedOrig = await this.downloadRichMediaElement({
         msgId: ntMsg.msgId,
         chatType: ctx.fallbackChatType,
         peerUid: ctx.fallbackPeerUid,
@@ -364,7 +415,7 @@ const mediaHydratorMixin = {
       const thumbBudgetMs = ctx.remainingRemoteBudgetMs(5000);
       if (!st && thumbBudgetMs > 0 && ntMsg.msgId && ctx.fallbackPeerUid) {
         const fallbackThumbPath = thumbs.length > 0 ? String(thumbs[0] || "") : "";
-        const downloadedThumb = await this._downloadRichMediaElement({
+        const downloadedThumb = await this.downloadRichMediaElement({
           msgId: ntMsg.msgId,
           chatType: ctx.fallbackChatType,
           peerUid: ctx.fallbackPeerUid,
@@ -393,14 +444,18 @@ const mediaHydratorMixin = {
           const buf = await fs.promises.readFile(localPath);
           defineBase64Uri(pe, buf);
         } catch (err) {
-          this.logger?.debug?.("inbound", err);
+          this.host.logger?.debug?.("inbound", err);
         }
       }
     }
-  },
+  }
 
-  /** @this {any} */
-  async _hydratePttElement(ntMsg, el, ctx) {
+  /**
+   * @param {any} ntMsg
+   * @param {any} el
+   * @param {MediaHydrationContext} ctx
+   */
+  async hydratePttElement(ntMsg, el, ctx) {
     const ptt = el.pttElement;
     if (!ptt || ptt.__base64Uri) return;
     let localPath = String(ptt.filePath || ptt.sourcePath || "").trim();
@@ -410,12 +465,12 @@ const mediaHydratorMixin = {
     if (
       !st &&
       pttBudgetMs > 0 &&
-      this._isNtReady() &&
+      this.host._isNtReady() &&
       ntMsg.msgId &&
       ctx.fallbackPeerUid &&
       el.elementId
     ) {
-      const downloadedPtt = await this._downloadRichMediaElement({
+      const downloadedPtt = await this.downloadRichMediaElement({
         msgId: ntMsg.msgId,
         chatType: ctx.fallbackChatType,
         peerUid: ctx.fallbackPeerUid,
@@ -432,7 +487,7 @@ const mediaHydratorMixin = {
       }
     }
 
-    if (!ctx.skipRemoteDownload && !st && this._isNtReady() && ptt.md5HexStr) {
+    if (!ctx.skipRemoteDownload && !st && this.host._isNtReady() && ptt.md5HexStr) {
       try {
         const pathInfo = {
           md5HexStr: String(ptt.md5HexStr),
@@ -444,7 +499,7 @@ const mediaHydratorMixin = {
           downloadType: 1,
           file_uuid: String(ptt.fileUuid || ""),
         };
-        const pathRes = await this.invokeNt(
+        const pathRes = await this.host.invokeNt(
           "nodeIKernelMsgService/getRichMediaFilePathForGuild",
           { path_info: pathInfo },
           [pathInfo]
@@ -458,7 +513,7 @@ const mediaHydratorMixin = {
           }
         }
       } catch (err) {
-        this.logger?.debug?.("inbound", err);
+        this.host.logger?.debug?.("inbound", err);
       }
     }
 
@@ -470,14 +525,16 @@ const mediaHydratorMixin = {
           const buf = await fs.promises.readFile(localPath);
           defineBase64Uri(ptt, buf);
         } catch (err) {
-          this.logger?.debug?.("inbound", err);
+          this.host.logger?.debug?.("inbound", err);
         }
       }
     }
-  },
+  }
 
-  /** @this {any} */
-  async _hydrateVideoElement(el) {
+  /**
+   * @param {any} el
+   */
+  async hydrateVideoElement(el) {
     const ve = el.videoElement;
     if (!ve || ve.__localFileUrl) return;
     const localPath = String(ve.filePath || ve.sourcePath || "").trim();
@@ -486,14 +543,13 @@ const mediaHydratorMixin = {
       ve.filePath = localPath;
       defineLocalFileUrl(ve, localPath);
     }
-  },
+  }
 
   /**
-   * @this {any}
    * @param {any} ntMsg
-   * @param {Record<string, any>} [options]
+   * @param {Record<string, any>} [options={}]
    */
-  async _hydrateNtMsgMedia(ntMsg, options = {}) {
+  async hydrateNtMsgMedia(ntMsg, options = {}) {
     if (!ntMsg || typeof ntMsg !== "object" || !Array.isArray(ntMsg.elements)) return;
     const skipRemoteDownload = Boolean(options?.skipRemoteDownload);
     const downSourceType = Number(options?.downSourceType ?? 0);
@@ -505,12 +561,13 @@ const mediaHydratorMixin = {
       100,
       Number(
         options?.timeoutMs ??
-          this.config?.mediaHydrationTimeoutMs ??
-          this.config?.richMediaDownloadTimeoutMs ??
+          this.host.config?.mediaHydrationTimeoutMs ??
+          this.host.config?.richMediaDownloadTimeoutMs ??
           8000
       ) || 8000
     );
     const deadlineMs = Number(options?.deadlineMs) > 0 ? Number(options.deadlineMs) : 0;
+    /** @param {number} capMs */
     const remainingRemoteBudgetMs = (capMs) => {
       if (skipRemoteDownload) return 0;
       if (deadlineMs > 0) {
@@ -521,6 +578,7 @@ const mediaHydratorMixin = {
       return Math.min(hydrationTimeout, capMs);
     };
 
+    /** @type {MediaHydrationContext} */
     const ctx = {
       skipRemoteDownload,
       downSourceType,
@@ -533,20 +591,20 @@ const mediaHydratorMixin = {
       if (!el || typeof el !== "object") continue;
       const elType = Number(el.elementType);
       if (elType === 2 && el.picElement) {
-        await this._hydratePicElement(ntMsg, el, ctx);
+        await this.hydratePicElement(ntMsg, el, ctx);
       } else if (elType === 4 && el.pttElement) {
-        await this._hydratePttElement(ntMsg, el, ctx);
+        await this.hydratePttElement(ntMsg, el, ctx);
       } else if (elType === 5 && el.videoElement) {
-        await this._hydrateVideoElement(el);
+        await this.hydrateVideoElement(el);
       }
     }
 
-    this.messageIdStore?.indexMsgMedia?.(ntMsg);
-  },
-};
+    this.host.messageIdStore?.indexMsgMedia?.(ntMsg);
+  }
+}
 
 module.exports = {
-  mediaHydratorMixin,
+  MediaHydrator,
   MAX_HYDRATE_PIC_BYTES,
   MAX_HYDRATE_PTT_BYTES,
   statPositiveFile,

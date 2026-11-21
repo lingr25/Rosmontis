@@ -74,7 +74,7 @@ test("Strict causal order, slow-image AIO anti-thrashing, set_input_status re-en
                 const realId = `7699000000000000${String(nextRealMsgCounter++).padStart(3, "0")}`;
                 const delay = typeof echoDelayMs === "function" ? echoDelayMs(arg0) : echoDelayMs;
                 const t = setTimeout(() => {
-                  bridgeRef._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+                  bridgeRef.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
                     {
                       msgId: realId,
                       msgSeq: String(1000 + nextRealMsgCounter),
@@ -482,16 +482,16 @@ test("Strict causal order, slow-image AIO anti-thrashing, set_input_status re-en
       assert.strictEqual(ipcCalls[1].payload.info_list[0].option, 1);
 
       // Verify onKickedOffLine clears active AIO, focus state, and idle timers
-      assert.ok(bridge._activeAioPeer !== null);
-      assert.strictEqual(bridge._windowFocused, true);
-      await bridge._handleKernelEvent("nodeIKernelLoginListener", "onKickedOffLine", [
+      assert.ok(bridge.sessionController.activeAioPeer !== null);
+      assert.strictEqual(bridge.sessionController.windowFocused, true);
+      await bridge.inboundPipeline._handleKernelEvent("nodeIKernelLoginListener", "onKickedOffLine", [
         { tipsTitle: "Kicked", tipsDesc: "Session expired" },
       ]);
-      assert.strictEqual(bridge._activeAioPeer, null);
-      assert.strictEqual(bridge._activeAioPeerKey, "");
-      assert.strictEqual(bridge._windowFocused, false);
-      assert.strictEqual(bridge._aioIdleTimer, null);
-      assert.strictEqual(bridge._focusBlurTimer, null);
+      assert.strictEqual(bridge.sessionController.activeAioPeer, null);
+      assert.strictEqual(bridge.sessionController.activeAioPeerKey, "");
+      assert.strictEqual(bridge.sessionController.windowFocused, false);
+      assert.strictEqual(bridge.sessionController.aioIdleTimer, null);
+      assert.strictEqual(bridge.sessionController.focusBlurTimer, null);
     } finally {
       await bridge.stopServers();
     }
@@ -627,7 +627,7 @@ test("Strict causal order, slow-image AIO anti-thrashing, set_input_status re-en
       const b = new mainMod.NtqqOneBotBridge({
         config: { httpServers: [], wsServers: [], wsClients: [] },
       });
-      assert.strictEqual(b._mapHookReleaseDisabled(), true);
+      assert.strictEqual(b.ntCapture._mapHookReleaseDisabled(), true);
 
       // XIAO_BRIDGE_TEMP_DIR fallback in resolveMediaSource
       process.env.XIAO_BRIDGE_TEMP_DIR = customTempDir;

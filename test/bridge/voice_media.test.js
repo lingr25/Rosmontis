@@ -61,7 +61,7 @@ test("Outbound record stages to NTQQ Ptt cache, normalizes raw SILK v3, computes
           const pttEl = payload.msgElements.find((e) => e.elementType === 4)?.pttElement;
           const seq = ++echoSeq;
           setTimeout(() => {
-            voiceBridge._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
+            voiceBridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
               {
                 msgRecord: {
                   msgId: `790000000000000${seq}`,
@@ -189,7 +189,7 @@ test("Outbound record stages to NTQQ Ptt cache, normalizes raw SILK v3, computes
     voiceBridge.broadcastOneBotEvent = (ev) => {
       if (ev.post_type === "message") inboundEvents.push(ev);
     };
-    await voiceBridge._processIncomingNtMessage({
+    await voiceBridge.inboundPipeline._processIncomingNtMessage({
       msgId: "790000000000000999",
       msgSeq: "601",
       msgTime: String(Math.floor(Date.now() / 1000)),

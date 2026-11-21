@@ -3,6 +3,24 @@
 
 const fs = require("fs");
 const { isQuietLogsEnabled, isDebugLogsEnabled, getLogFormat } = require("./env");
+const {
+  KNOWN_MAP_FIELDS,
+  MAX_CODEC_DEPTH,
+  WIRE_CODEC_INJECTION_MARKER,
+  safeJsJson,
+  getObjectTag,
+  isMapLike,
+  isSetLike,
+  toUint8View,
+  setOwnProp,
+  encodeBridgeValue,
+  encodeBridgeMaps,
+  serializeBridgeResult,
+  serializeBridgePayload,
+  reviveBridgePayload,
+  getInlineWireCodecSource,
+  injectWireCodecIntoRendererSource,
+} = require("./wire_codec");
 
 /**
  * Shared Zero-Dependency Runtime Primitives (`src/core/primitives.js`)
@@ -24,7 +42,7 @@ const { isQuietLogsEnabled, isDebugLogsEnabled, getLogFormat } = require("./env"
 class BoundedMap extends Map {
   /**
    * @param {number} [maxEntries=2000]
-   * @param {Iterable<readonly [K, V]>} [iterable]
+   * @param {Iterable<readonly [K, V]> | null} [iterable]
    */
   constructor(maxEntries = 2000, iterable = undefined) {
     super();
@@ -42,12 +60,12 @@ class BoundedMap extends Map {
   /**
    * Reads `key` and refreshes its recency order (LRU) when present.
    *
-   * @param {any} key
-   * @returns {any}
+   * @param {K} key
+   * @returns {V | undefined}
    */
   get(key) {
     if (!super.has(key)) return undefined;
-    const val = super.get(key);
+    const val = /** @type {V} */ (super.get(key));
     super.delete(key);
     super.set(key, val);
     return val;
@@ -57,8 +75,8 @@ class BoundedMap extends Map {
    * Inserts or updates `key`, refreshing insertion order (LRU) and evicting
    * oldest entries while `this.size > this.maxEntries`.
    *
-   * @param {any} key
-   * @param {any} value
+   * @param {K} key
+   * @param {V} value
    * @returns {this}
    */
   set(key, value) {
@@ -218,6 +236,7 @@ class TempCleanupQueue {
     for (const fn of callbacks) {
       if (typeof fn !== "function") continue;
       let called = false;
+      /** @type {ReturnType<typeof setTimeout> | null} */
       let timer = null;
       const runOnce = () => {
         if (called) return;
@@ -312,15 +331,20 @@ function createEventWaiter(waiterSet, timeoutMs, predicate = null) {
     };
   }
 
-  const hasPredicate = typeof predicate === "function";
   const waitMs = Math.max(0, Number(timeoutMs) || 0);
   let settled = false;
+  /** @type {ReturnType<typeof setTimeout> | null} */
   let timer = null;
+  /** @type {((value: T | null) => void) | null} */
   let resolvePromise = null;
 
+  /**
+   * @param {T} arg
+   * @param {...any} rest
+   */
   const listener = (arg, ...rest) => {
     if (settled) return;
-    if (hasPredicate) {
+    if (typeof predicate === "function") {
       let matched = false;
       try {
         matched = Boolean(predicate(arg, ...rest));
@@ -564,109 +588,14 @@ class BridgeLogger {
 }
 
 // ============================================================================
-// 6. Lossless Cross-Process Wire Codec
+// 6. Lossless Cross-Process Wire Codec (Re-exported from ./wire_codec)
 // ============================================================================
 
-function _escapeJsJsonChars(raw) {
-  return raw.replace(
-    /[<>&\u2028\u2029]/g,
-    (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0")
-  );
-}
-
-/**
- * JSON-encodes `val` safely for embedding inside JavaScript source/IPC strings.
- *
- * @param {any} val
- * @returns {string}
- */
-function safeJsJson(val) {
-  const raw = JSON.stringify(val);
-  if (typeof raw !== "string") return "undefined";
-  return _escapeJsJsonChars(raw);
-}
-
-/**
- * Serializes cross-process bridge payloads while preserving `Map` and
- * `Uint8Array` instances and `bigint` values losslessly, handling top-level/array
- * `undefined`, and escaping HTML/JS line-terminator characters (`[<>&\u2028\u2029]`).
- *
- * @param {any} value
- * @returns {string}
- */
-function serializeBridgePayload(value) {
-  const raw = JSON.stringify(value, (_key, val) => {
-    if (val instanceof Map) {
-      return { __rosmontisMap__: Array.from(val.entries()) };
-    }
-    if (val instanceof Uint8Array) {
-      return { __rosmontisUint8Array__: Array.from(val) };
-    }
-    if (typeof val === "bigint") {
-      return val.toString();
-    }
-    return val;
-  });
-  if (typeof raw !== "string") return "undefined";
-  return _escapeJsJsonChars(raw);
-}
-
-/**
- * Revives wire-decoded payloads produced by `serializeBridgePayload` or
- * `bridge_renderer.js` (`{ __rosmontisMap__ }`, `{ __rosmontisVoid__ }`,
- * `{ __rosmontisUint8Array__ }`).
- *
- * @param {any} val
- * @returns {any}
- */
-function reviveBridgePayload(val) {
-  if (val === null || val === undefined || typeof val !== "object") {
-    return val;
-  }
-  if (
-    val instanceof Map ||
-    val instanceof Uint8Array ||
-    (typeof Buffer !== "undefined" && Buffer.isBuffer(val)) ||
-    ArrayBuffer.isView(val)
-  ) {
-    return val;
-  }
-  if (Array.isArray(val)) {
-    return val.map((item) => reviveBridgePayload(item));
-  }
-  const keys = Object.keys(val);
-  if (keys.length === 1) {
-    if (val.__rosmontisVoid__ === true) {
-      return undefined;
-    }
-    if (Array.isArray(val.__rosmontisMap__)) {
-      return new Map(
-        val.__rosmontisMap__.map((entry) => [
-          Array.isArray(entry) ? reviveBridgePayload(entry[0]) : undefined,
-          Array.isArray(entry) ? reviveBridgePayload(entry[1]) : undefined,
-        ])
-      );
-    }
-    if (Array.isArray(val.__rosmontisUint8Array__)) {
-      return Uint8Array.from(val.__rosmontisUint8Array__);
-    }
-  }
-  const out = {};
-  for (const [k, v] of Object.entries(val)) {
-    const revived = reviveBridgePayload(v);
-    if (k === "__proto__") {
-      Object.defineProperty(out, k, {
-        value: revived,
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
-    } else {
-      out[k] = revived;
-    }
-  }
-  return out;
-}
+// `KNOWN_MAP_FIELDS`, `MAX_CODEC_DEPTH`, `WIRE_CODEC_INJECTION_MARKER`, `safeJsJson`,
+// `getObjectTag`, `isMapLike`, `isSetLike`, `toUint8View`, `setOwnProp`,
+// `encodeBridgeValue`, `encodeBridgeMaps`, `serializeBridgeResult`,
+// `serializeBridgePayload`, `reviveBridgePayload`, `getInlineWireCodecSource`,
+// and `injectWireCodecIntoRendererSource` live in `./wire_codec.js` (single source of truth).
 
 // ============================================================================
 // 7. Declarative OneBot Action Router
@@ -676,7 +605,8 @@ function reviveBridgePayload(val) {
  * Builds a validated `{ HANDLED_ACTIONS, dispatch, handlers, aliases }` router
  * for an action domain module.
  *
- * @param {Record<string, (p: Record<string, any>, context: Record<string, any>, action: string) => any>} handlers
+ * @template [THost=any]
+ * @param {Record<string, (this: THost, p: Record<string, any>, context: any, action: string) => any>} handlers
  * @param {Record<string, string>} [aliases={}]
  */
 function createActionRouter(handlers, aliases = {}) {
@@ -707,13 +637,21 @@ function createActionRouter(handlers, aliases = {}) {
 
   const HANDLED_ACTIONS = new Set([...Object.keys(handlers), ...Object.keys(aliases)]);
 
+  /**
+   * @this {THost}
+   * @param {string} action
+   * @param {Record<string, any>} [p={}]
+   * @param {Record<string, any>} [context={}]
+   * @returns {Promise<any>}
+   */
   async function dispatch(action, p = {}, context = {}) {
     const canonical = Object.prototype.hasOwnProperty.call(aliases, action)
       ? aliases[action]
       : action;
-    const fn = Object.prototype.hasOwnProperty.call(handlers, canonical)
-      ? handlers[canonical]
-      : null;
+    const fn =
+      typeof canonical === "string" && Object.prototype.hasOwnProperty.call(handlers, canonical)
+        ? handlers[canonical]
+        : null;
     if (typeof fn !== "function") {
       throw new Error(`Unsupported OneBot action: ${action}`);
     }
@@ -736,8 +674,21 @@ module.exports = {
   createEventWaiter,
   waitForEventOnce,
   BridgeLogger,
+  KNOWN_MAP_FIELDS,
+  MAX_CODEC_DEPTH,
+  WIRE_CODEC_INJECTION_MARKER,
   safeJsJson,
+  getObjectTag,
+  isMapLike,
+  isSetLike,
+  toUint8View,
+  setOwnProp,
+  encodeBridgeValue,
+  encodeBridgeMaps,
+  serializeBridgeResult,
   serializeBridgePayload,
   reviveBridgePayload,
+  getInlineWireCodecSource,
+  injectWireCodecIntoRendererSource,
   createActionRouter,
 };

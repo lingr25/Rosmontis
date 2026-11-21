@@ -639,6 +639,7 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
   const socket = isSecure ? tls.connect(connectOpts) : net.connect(connectOpts);
   let upgraded = false;
   let headerBuf = Buffer.alloc(0);
+  /** @type {Rfc6455Connection | null} */
   let wsConn = null;
 
   socket.setTimeout(timeoutMs, () => {
@@ -710,22 +711,23 @@ function connectReverseWebSocket(urlStr, headers = {}, onOpen, onMessage, onClos
     socket.setTimeout(0);
     socket.removeListener("data", onSocketData);
 
-    wsConn = new Rfc6455Connection(socket, {
+    const conn = new Rfc6455Connection(socket, {
       isClient: true,
       maxPayloadBytes: opts.maxPayloadBytes,
       maxSendBufferBytes: opts.maxSendBufferBytes,
     });
-    wsConn.on("message", (msg) => {
-      if (onMessage) onMessage(msg, wsConn);
+    wsConn = conn;
+    conn.on("message", (msg) => {
+      if (onMessage) onMessage(msg, conn);
     });
-    wsConn.on("close", () => {
+    conn.on("close", () => {
       notifyCloseOnce(null);
     });
-    wsConn.on("error", () => {});
+    conn.on("error", () => {});
 
-    if (onOpen) onOpen(wsConn);
+    if (onOpen) onOpen(conn);
     if (rest.length > 0) {
-      wsConn._onData(rest);
+      conn._onData(rest);
     }
   };
 

@@ -74,12 +74,23 @@ function extractAccessTokenFromRequest(req, parsedUrl, { allowQueryToken = true 
   return "";
 }
 
+/**
+ * @param {any} req
+ * @param {string | null | undefined} expectedToken
+ * @param {{ allowQueryToken?: boolean, parsedUrl?: URL | null }} [options]
+ * @returns {boolean}
+ */
 function checkRequestAuth(req, expectedToken, { allowQueryToken = true, parsedUrl = null } = {}) {
   if (!expectedToken) return true;
   const providedToken = extractAccessTokenFromRequest(req, parsedUrl, { allowQueryToken });
   return verifyAccessTokenConstantTime(providedToken, expectedToken);
 }
 
+/**
+ * @param {any} req
+ * @param {{ allowedOrigins?: string[] }} [options]
+ * @returns {{ allowed: boolean, origin: string | null, reason?: string }}
+ */
 function checkOriginHeader(req, { allowedOrigins = [] } = {}) {
   const headers = req && req.headers ? req.headers : null;
   const rawOrigin = headers

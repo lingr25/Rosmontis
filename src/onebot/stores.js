@@ -1296,8 +1296,9 @@ class UinUidStore {
       });
     }
     if (uid && typeof uid === "object") {
-      meta = uid;
-      uid = meta.uid ?? "";
+      const objMeta = uid;
+      meta = objMeta;
+      uid = objMeta.uid ?? "";
     }
     return this.remember(uin, uid, {
       ...(meta && typeof meta === "object" ? meta : {}),

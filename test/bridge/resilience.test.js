@@ -394,10 +394,10 @@ test("renderer_ipc self-heals on render-process-gone: rejects pending cmds, rese
   });
 
   const wc = createFakeWebContents(10);
-  bridge._ipcCmdAckInstalled = true;
-  bridge._attachToWebContents(wc);
+  bridge.rendererIpc._ipcCmdAckInstalled = true;
+  bridge.rendererIpc._attachToWebContents(wc);
   // Duplicate attach must be a no-op (no duplicate render-process-gone / unresponsive listeners)
-  bridge._attachToWebContents(wc);
+  bridge.rendererIpc._attachToWebContents(wc);
 
   // Trigger initial injection
   wc.emit("did-finish-load");
@@ -408,16 +408,16 @@ test("renderer_ipc self-heals on render-process-gone: rejects pending cmds, rese
   assert.strictEqual(wc.__rosmontisCmdChannelReady, true);
 
   // Seed human session state to verify crash resets it without invoking dead renderer
-  bridge._activeAioPeer = { chatType: 1, peerUid: "u_friend_1", guildId: "" };
-  bridge._activeAioPeerKey = "1:u_friend_1:";
-  bridge._windowFocused = true;
+  bridge.sessionController.activeAioPeer = { chatType: 1, peerUid: "u_friend_1", guildId: "" };
+  bridge.sessionController.activeAioPeerKey = "1:u_friend_1:";
+  bridge.sessionController.windowFocused = true;
 
   // Create an in-flight pending renderer IPC command
-  const pendingCmdPromise = bridge._invokeRendererCommand("invokeNt", {
+  const pendingCmdPromise = bridge.rendererIpc._invokeRendererCommand("invokeNt", {
     cmd: "nodeIKernelGroupService/getGroupList",
     argsSerialized: "[{},null]",
   }, 10000);
-  assert.strictEqual(bridge._pendingRendererCmds.size, 1);
+  assert.strictEqual(bridge.rendererIpc._pendingRendererCmds.size, 1);
 
   try {
     // Emit render-process-gone (#1)
@@ -428,15 +428,15 @@ test("renderer_ipc self-heals on render-process-gone: rejects pending cmds, rese
       () => pendingCmdPromise,
       /ROSMONTIS_BRIDGE_UNAVAILABLE.*renderer process gone \(crashed\)/
     );
-    assert.strictEqual(bridge._pendingRendererCmds.size, 0);
+    assert.strictEqual(bridge.rendererIpc._pendingRendererCmds.size, 0);
 
     // Flags, session state, activeWebContents cleared
     assert.strictEqual(wc.__rosmontisBridgeInjected, false);
     assert.strictEqual(wc.__rosmontisCmdChannelReady, false);
     assert.strictEqual(bridge.activeWebContents, null);
-    assert.strictEqual(bridge._activeAioPeer, null);
-    assert.strictEqual(bridge._activeAioPeerKey, "");
-    assert.strictEqual(bridge._windowFocused, false);
+    assert.strictEqual(bridge.sessionController.activeAioPeer, null);
+    assert.strictEqual(bridge.sessionController.activeAioPeerKey, "");
+    assert.strictEqual(bridge.sessionController.windowFocused, false);
 
     // Wait for backoff=0 reload timer to fire
     await sleep(25);
@@ -471,7 +471,7 @@ test("renderer_ipc self-heals on render-process-gone: rejects pending cmds, rese
     assert.strictEqual(bridge.rendererHealthStats.reloadSuppressed, 1);
 
     // Age out old reload timestamps (> 60s) -> reload is permitted again
-    bridge._rendererReloadTimestamps = bridge._rendererReloadTimestamps.map((ts) => ts - 65000);
+    bridge.rendererIpc._rendererReloadTimestamps = bridge.rendererIpc._rendererReloadTimestamps.map((ts) => ts - 65000);
     wc.emit("render-process-gone", {}, { reason: "crashed", exitCode: 11 });
     await sleep(25);
     assert.strictEqual(wc._getReloadCount(), 4);
@@ -503,7 +503,7 @@ test("renderer_ipc tracks unresponsive/responsive state, reload failures, and ca
       }
     },
   });
-  bridge._attachToWebContents(wc);
+  bridge.rendererIpc._attachToWebContents(wc);
 
   try {
     // Unresponsive -> responsive transitions
@@ -545,7 +545,7 @@ test("renderer_ipc tracks unresponsive/responsive state, reload failures, and ca
 
     // Schedule reload on a second wc, then call stopServers() before timer fires -> reload skipped
     const wc2 = createFakeWebContents(21);
-    bridge._attachToWebContents(wc2);
+    bridge.rendererIpc._attachToWebContents(wc2);
     wc2.emit("render-process-gone", {}, { reason: "crashed" });
     await bridge.stopServers();
     await sleep(120);

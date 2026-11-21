@@ -8,7 +8,7 @@ const {
   parseJsonpOrJson,
 } = require("../core/web_http");
 const { isWebCredentialApiEnabled } = require("../core/qzone_actions");
-const { createActionRouter, waitForEventOnce } = require("../core/primitives");
+const { createActionRouter, setBoundedMap, waitForEventOnce } = require("../core/primitives");
 const { hasKernelMethod } = require("../core/capability_probe");
 const {
   pickPositiveUin,
@@ -41,6 +41,10 @@ function entriesFromMapOrObject(mapOrObj) {
   return [];
 }
 
+/**
+ * @param {any} raw
+ * @param {number | string} [fallbackGroupId]
+ */
 function formatOneBotGroupRecord(raw, fallbackGroupId = undefined) {
   const g = raw && typeof raw === "object" ? raw : {};
   const info =
@@ -98,6 +102,12 @@ function formatOneBotGroupRecord(raw, fallbackGroupId = undefined) {
   };
 }
 
+/**
+ * @param {any} m
+ * @param {number} groupId
+ * @param {any} uinUidStore
+ * @param {number | string} [fallbackUserId]
+ */
 function toOneBotGroupMember(m, groupId, uinUidStore, fallbackUserId = undefined) {
   const norm = normalizeGroupMember(m, groupId);
   const resolvedUin =
@@ -128,6 +138,10 @@ function toOneBotGroupMember(m, groupId, uinUidStore, fallbackUserId = undefined
   };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {boolean} doubt
+ */
 async function fetchGroupSystemNotifies(bridge, doubt) {
   const res = await bridge.invokeNt(
     "nodeIKernelGroupService/getSingleScreenNotifies",
@@ -144,7 +158,7 @@ async function fetchGroupSystemNotifies(bridge, doubt) {
     const flag = `${seq}:${nType}:${gid}`;
     const cachedItem =
       typeof item.doubt === "boolean" ? item : { ...item, doubt: Boolean(doubt) };
-    bridge._setBoundedMap(bridge._groupNotifiesCache, flag, cachedItem);
+    setBoundedMap(bridge.inboundPipeline._groupNotifiesCache, flag, cachedItem);
     const entry = {
       request_id: Number(seq || 0),
       invitor_uin: pickPositiveUin(
@@ -173,6 +187,11 @@ async function fetchGroupSystemNotifies(bridge, doubt) {
   return { invited_requests, join_requests };
 }
 
+/**
+ * @param {import("../types").BridgeHost} bridge
+ * @param {Record<string, any>} p
+ * @param {boolean} isAdd
+ */
 async function updateGroupEssence(bridge, p, isAdd) {
   const entry =
     bridge.messageIdStore.resolveByOneBotId?.(p.message_id) ||
@@ -191,11 +210,11 @@ async function updateGroupEssence(bridge, p, isAdd) {
   return {};
 }
 
-/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
+/** @type {Record<string, import("../types").BridgeActionHandler>} */
 const ACTION_HANDLERS = {
   async get_group_list(p) {
     const waitGroupEvent = waitForEventOnce(
-      this._groupListWaiters,
+      this.inboundPipeline._groupListWaiters,
       GROUP_LIST_WAIT_TIMEOUT_MS
     );
 
@@ -208,7 +227,7 @@ const ACTION_HANDLERS = {
 
     const hasDirectGroups =
       Array.isArray(res) || Array.isArray(res?.groupList) || Array.isArray(res?.groups);
-    if (!hasDirectGroups && (force || this._groupListCache.size === 0)) {
+    if (!hasDirectGroups && (force || this.inboundPipeline._groupListCache.size === 0)) {
       await waitGroupEvent;
     }
 
@@ -216,12 +235,12 @@ const ACTION_HANDLERS = {
       ? Array.isArray(res)
         ? res
         : res?.groupList || res?.groups || []
-      : Array.from(this._groupListCache.values());
+      : Array.from(this.inboundPipeline._groupListCache.values());
 
     return rawGroups.map((g) => {
       const formatted = formatOneBotGroupRecord(g);
       if (formatted.group_id > 0) {
-        this._setBoundedMap(this._groupListCache, String(formatted.group_id), g);
+        setBoundedMap(this.inboundPipeline._groupListCache, String(formatted.group_id), g);
       }
       return formatted;
     });
@@ -370,6 +389,7 @@ const ACTION_HANDLERS = {
     const groupId = Number(p.group_id || 0);
     const groupCode = String(groupId);
     const forceFetch = Boolean(p.no_cache);
+    /** @type {any} */
     let infos = null;
     let sceneId = "";
     try {
@@ -382,6 +402,7 @@ const ACTION_HANDLERS = {
       if (sceneId) {
         const MAX_PAGES = 10;
         const mergedMap = new Map();
+        /** @type {string | undefined} */
         let lastId = undefined;
         for (let page = 0; page < MAX_PAGES; page += 1) {
           const listRes = await this.invokeNt(
@@ -403,6 +424,7 @@ const ACTION_HANDLERS = {
 
           let pageEntryCount = 0;
           let addedCount = 0;
+          /** @type {string | undefined} */
           let lastKeyInPage = undefined;
           for (let i = 0; i < rawEntries.length; i += 1) {
             const [rawKey, m] = rawEntries[i];
@@ -708,7 +730,7 @@ const ACTION_HANDLERS = {
 
   async set_group_add_request(p) {
     const flag = String(p.flag || "");
-    const cached = this._groupNotifiesCache.get(flag);
+    const cached = this.inboundPipeline._groupNotifiesCache.get(flag);
     const parts = flag.split(":");
     const seq = cached?.seq || parts[0] || flag;
     const notifyType = Number(cached?.type || parts[1] || (p.sub_type === "invite" ? 2 : 1));

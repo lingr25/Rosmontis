@@ -125,7 +125,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
         const fileEl = els.find((e) => e?.elementType === 3 && e.fileElement)?.fileElement;
         if (fileEl) {
           setImmediate(() => {
-            bridge
+            bridge.inboundPipeline
               ._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
                 {
                   msgId: "7720000999",
@@ -164,7 +164,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
         forwardEchoCounter += 1;
         const fwdMsgId = `772999${forwardEchoCounter}`;
         setImmediate(() => {
-          bridge
+          bridge.inboundPipeline
             ._handleKernelEvent("nodeIKernelMsgListener", "onAddSendMsg", [
               {
                 msgId: fwdMsgId,
@@ -193,7 +193,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
 
   try {
     // 1) revokeElement via _processIncomingNtMessage & onMsgInfoListUpdate
-    await bridge._processIncomingNtMessage({
+    await bridge.inboundPipeline._processIncomingNtMessage({
       msgId: "772001",
       msgSeq: "11",
       msgType: 5,
@@ -219,7 +219,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(revIncoming.operator_id, 111222);
     assert.strictEqual(revIncoming.user_id, 222333);
 
-    await bridge._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", [
+    await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", [
       [
         {
           msgId: "772002",
@@ -251,7 +251,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(revUpdate.user_id, 888222);
 
     // 2) groupElement single-member shutUp vs whole-group mute, and type:3 kick with memberUin===0
-    await bridge._processIncomingNtMessage({
+    await bridge.inboundPipeline._processIncomingNtMessage({
       msgId: "772003",
       msgSeq: "13",
       msgType: 5,
@@ -280,7 +280,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(singleBan.user_id, 222333);
     assert.strictEqual(singleBan.operator_id, 111222);
 
-    await bridge._processIncomingNtMessage({
+    await bridge.inboundPipeline._processIncomingNtMessage({
       msgId: "772004",
       msgSeq: "14",
       msgType: 5,
@@ -310,7 +310,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(wholeBan.user_id, 0);
     assert.strictEqual(wholeBan.operator_id, 111222);
 
-    await bridge._processIncomingNtMessage({
+    await bridge.inboundPipeline._processIncomingNtMessage({
       msgId: "772005",
       msgSeq: "15",
       msgType: 5,
@@ -337,7 +337,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(kickNotice.sub_type, "kick");
 
     // 3) buddyElement friend_add with peerUin: "0", peerUid: "u_friend"
-    await bridge._processIncomingNtMessage({
+    await bridge.inboundPipeline._processIncomingNtMessage({
       msgId: "772006",
       msgSeq: "16",
       msgType: 5,
@@ -362,7 +362,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(friendAdd.user_id, 333444);
 
     // 4) templParam uid_str1 / uid_str2 poke
-    await bridge._processIncomingNtMessage({
+    await bridge.inboundPipeline._processIncomingNtMessage({
       msgId: "772007",
       msgSeq: "17",
       msgType: 5,
@@ -394,7 +394,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(pokeEv.target_id, 555666);
 
     // 5) onGroupNotifiesUpdated & onBuddyReqChange with "0" UIN
-    await bridge._handleKernelEvent("nodeIKernelGroupListener", "onGroupNotifiesUpdated", [
+    await bridge.inboundPipeline._handleKernelEvent("nodeIKernelGroupListener", "onGroupNotifiesUpdated", [
       false,
       [
         {
@@ -412,7 +412,7 @@ test("UinUidStore/pickPositiveUin \"0\" hardening, grayTip/recall/request UID->U
     assert.strictEqual(grpReqEv.request_type, "group");
     assert.strictEqual(grpReqEv.user_id, 666777);
 
-    await bridge._handleKernelEvent("nodeIKernelBuddyListener", "onBuddyReqChange", [
+    await bridge.inboundPipeline._handleKernelEvent("nodeIKernelBuddyListener", "onBuddyReqChange", [
       {
         buddyReqs: [
           {

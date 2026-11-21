@@ -12,6 +12,9 @@
 
 const { isPrefixedEnvFlagOne } = require("./env");
 
+/** @typedef {import("../types").BridgeHost} BridgeHost */
+/** @typedef {import("../types").BridgeConfig} BridgeConfig */
+/** @typedef {import("../types").CapturedServices} CapturedServices */
 /** @typedef {import("../types").MapHookReleaseRecord} MapHookReleaseRecord */
 
 // Native `Map.prototype.set`, captured at module load before any bridge hook is installed.
@@ -20,7 +23,7 @@ const NATIVE_MAP_SET = Map.prototype.set;
 /**
  * Process-wide state of the temporary `Map.prototype.set` capture hook (one per process).
  * @type {{
- *   owner: any,
+ *   owner: NtCaptureController | null,
  *   hookFn: ((this: Map<any, any>, key: any, value: any) => Map<any, any>) | null,
  *   orig: ((this: Map<any, any>, key: any, value: any) => Map<any, any>) | null,
  *   inspecting: boolean,
@@ -33,76 +36,59 @@ const MAP_HOOK_STATE = {
   inspecting: false,
 };
 
-const LEGACY_CAPTURE_CTRL_SYM = Symbol("rosmontisLegacyNtCaptureController");
-const LEGACY_CAPTURE_STATE_KEYS = Object.freeze([
-  "_mapSetHook",
-  "_mapHookMaxTimer",
-  "_mapHookReleaseTimer",
-  "mapHookRelease",
-  "_moduleLoadHook",
-  "_attachedEmitters",
-  "_persistedAutoLogin",
-]);
-
 /**
  * Composed NTQQ runtime capture & emitter-attachment controller.
  */
 class NtCaptureController {
   /**
-   * @param {any} [bridge]
+   * @param {BridgeHost | Partial<BridgeHost>} [bridge={}]
    */
   constructor(bridge = {}) {
-    /** @type {any} */
-    this.bridge = bridge || {};
+    /** @type {BridgeHost} */
+    this.bridge = /** @type {BridgeHost} */ (bridge || {});
+    if (!this.bridge.capturedServices) {
+      this.bridge.capturedServices = {
+        ntApi: null,
+        ntApiContainer: null,
+        ntStore: null,
+        WindowApi: null,
+        PerformanceApi: null,
+        LoggerApi: null,
+        UserBehaviorReportService: null,
+        SubWindowApi: null,
+        ScreenRecordApi: null,
+        ntCall: null,
+        ntSessionManager: null,
+        wrapperSession: null,
+      };
+    }
     /** @type {((this: Map<any, any>, key: any, value: any) => Map<any, any>) | null} */
-    this._mapSetHook = Object.prototype.hasOwnProperty.call(this.bridge, "_mapSetHook")
-      ? this.bridge._mapSetHook
-      : null;
+    this._mapSetHook = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
-    this._mapHookMaxTimer = Object.prototype.hasOwnProperty.call(this.bridge, "_mapHookMaxTimer")
-      ? this.bridge._mapHookMaxTimer
-      : null;
+    this._mapHookMaxTimer = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
-    this._mapHookReleaseTimer = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_mapHookReleaseTimer"
-    )
-      ? this.bridge._mapHookReleaseTimer
-      : null;
+    this._mapHookReleaseTimer = null;
     /** @type {MapHookReleaseRecord | null} */
-    this.mapHookRelease = Object.prototype.hasOwnProperty.call(this.bridge, "mapHookRelease")
-      ? this.bridge.mapHookRelease
-      : null;
+    this.mapHookRelease = null;
     /** @type {{ Module: any, origLoad: Function, wrappedLoad: Function } | null} */
-    this._moduleLoadHook = Object.prototype.hasOwnProperty.call(this.bridge, "_moduleLoadHook")
-      ? this.bridge._moduleLoadHook
-      : null;
+    this._moduleLoadHook = null;
     /** @type {WeakSet<object>} */
-    this._attachedEmitters =
-      Object.prototype.hasOwnProperty.call(this.bridge, "_attachedEmitters") &&
-      this.bridge._attachedEmitters instanceof WeakSet
-        ? this.bridge._attachedEmitters
-        : new WeakSet();
+    this._attachedEmitters = new WeakSet();
     /** @type {boolean} */
-    this._persistedAutoLogin = Object.prototype.hasOwnProperty.call(
-      this.bridge,
-      "_persistedAutoLogin"
-    )
-      ? Boolean(this.bridge._persistedAutoLogin)
-      : false;
+    this._persistedAutoLogin = false;
   }
 
-  /** @returns {any} */
+  /** @returns {BridgeConfig | undefined} */
   get config() {
     return this.bridge.config;
   }
 
-  /** @returns {any} */
+  /** @returns {InstanceType<typeof import("./primitives").BridgeLogger> | undefined} */
   get logger() {
     return this.bridge.logger;
   }
 
-  /** @returns {any} */
+  /** @returns {CapturedServices} */
   get capturedServices() {
     return this.bridge.capturedServices;
   }
@@ -266,11 +252,7 @@ class NtCaptureController {
     const releaseMsg = `Map.prototype.set hook released (reason=${reason}, restored=${restored}${
       missing.length ? `, missing=${missing.join("/")}` : ""
     })`;
-    if (typeof this.bridge._logWarn === "function") {
-      this.bridge._logWarn("map-hook-release", releaseMsg, 0);
-    } else {
-      this.logger?.warnThrottled?.("map-hook-release", releaseMsg, 0);
-    }
+    this.logger?.warnThrottled?.("map-hook-release", releaseMsg, 0);
     return restored;
   }
 
@@ -582,8 +564,8 @@ class NtCaptureController {
       let ipcMain = opts.ipcMain || opts.electron?.ipcMain || null;
       if (!ipcMain && process.versions?.electron) {
         try {
-          // @ts-ignore - electron is only available inside the Electron host runtime
-          const electronMod = require("electron");
+          const electronModuleId = "electron";
+          const electronMod = require(electronModuleId);
           if (electronMod && typeof electronMod === "object") {
             ipcMain = electronMod.ipcMain || null;
           }
@@ -831,7 +813,7 @@ class NtCaptureController {
   _reconnectUnidentifiedReverseWs() {
     const bridge = this.bridge;
     if (!bridge.selfUin || bridge.selfUin === "0") return;
-    const clients = bridge.serverRuntime?._reverseWsClients || bridge._reverseWsClients || [];
+    const clients = bridge.serverRuntime?._reverseWsClients || bridge.reverseWsClients || [];
     for (const rev of clients) {
       if (!rev.stopped && rev.conn && (!rev.connectedSelfId || rev.connectedSelfId === "0")) {
         rev.immediateReconnectOnce = true;
@@ -1031,7 +1013,7 @@ class NtCaptureController {
           const listenerName = name.slice(0, sepIdx);
           const shortEvent = name.slice(sepIdx + 1);
           if (listenerName && shortEvent) {
-            self.bridge._handleKernelEvent?.(listenerName, shortEvent, args);
+            self.bridge.inboundPipeline?._handleKernelEvent(listenerName, shortEvent, args);
           }
         }
       } catch (err) {
@@ -1095,7 +1077,7 @@ class NtCaptureController {
       const origEmit = emitterOrMap.emit;
       emitterOrMap.emit = function (/** @type {any} */ eventName, /** @type {any[]} */ ...args) {
         try {
-          self.bridge._handleKernelEvent?.(listenerName, String(eventName), args);
+          self.bridge.inboundPipeline?._handleKernelEvent(listenerName, String(eventName), args);
         } catch (err) {
           self._debugSafe(err);
         }
@@ -1105,81 +1087,8 @@ class NtCaptureController {
   }
 }
 
-/**
- * Resolves or lazily binds an `NtCaptureController` for legacy `ntCaptureMixin` hosts.
- * @param {any} host
- * @returns {NtCaptureController}
- */
-function _resolveLegacyCaptureController(host) {
-  if (host instanceof NtCaptureController) return host;
-  if (host && host.ntCapture instanceof NtCaptureController) return host.ntCapture;
-  if (host && host[LEGACY_CAPTURE_CTRL_SYM] instanceof NtCaptureController) {
-    return host[LEGACY_CAPTURE_CTRL_SYM];
-  }
-  const ctrl = new NtCaptureController(host);
-  if (host && typeof host === "object") {
-    Object.defineProperty(host, LEGACY_CAPTURE_CTRL_SYM, {
-      value: ctrl,
-      enumerable: false,
-      configurable: true,
-    });
-    for (const key of LEGACY_CAPTURE_STATE_KEYS) {
-      const desc = Object.getOwnPropertyDescriptor(host, key);
-      if (!desc || ("value" in desc && desc.configurable !== false)) {
-        Object.defineProperty(host, key, {
-          enumerable: true,
-          configurable: true,
-          get() {
-            return /** @type {any} */ (ctrl)[key];
-          },
-          set(val) {
-            /** @type {any} */ (ctrl)[key] = val;
-          },
-        });
-      }
-    }
-  }
-  return ctrl;
-}
-
-const NT_CAPTURE_METHODS = /** @type {const} */ ([
-  "installMapPrototypeHook",
-  "_mapHookReleaseDisabled",
-  "_scheduleMapHookMaxLifetime",
-  "_mapHookCapturesComplete",
-  "_maybeScheduleMapHookRelease",
-  "releaseMapPrototypeHook",
-  "installWrapperHook",
-  "_restoreModuleLoad",
-  "_hookWrapperExports",
-  "probeExistingRuntime",
-  "_inspectMapEntry",
-  "_watchBindingCacheProperty",
-  "_updateSelfIdentity",
-  "_reconnectUnidentifiedReverseWs",
-  "_inspectInversifyCache",
-  "_inspectNtStore",
-  "_patchListenerEmitterMapInstance",
-  "_attachNtStoreRootEmitter",
-  "_hookNtSessionManager",
-  "_attachKernelListenerEmitter",
-]);
-
-/**
- * Backward-compatible mixin facade delegating to `NtCaptureController`.
- * @type {Record<string, (...args: any[]) => any>}
- */
-const ntCaptureMixin = {};
-for (const methodName of NT_CAPTURE_METHODS) {
-  ntCaptureMixin[methodName] = function (/** @type {any[]} */ ...args) {
-    const ctrl = _resolveLegacyCaptureController(this);
-    return /** @type {any} */ (ctrl)[methodName](...args);
-  };
-}
-
 module.exports = {
   NATIVE_MAP_SET,
   MAP_HOOK_STATE,
   NtCaptureController,
-  ntCaptureMixin,
 };

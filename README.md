@@ -190,7 +190,7 @@ Rosmontis 默认原生兼容 **NoneBot2**、**Koishi**、**AstrBot** 等标准 O
 
 ## 开发与测试
 
-本项目包含基于 Node.js 原生 `node --test` 的并行领域测试套件（`test/bridge/*.test.js` 20 个分域文件——含 `composition_architecture.test.js` 与 `wire_codec_parity.test.js`——加上 `test/test_core_modules.js` 与 `test/test_media_security.js`，共 70 项契约、安全与端到端测试，零外部依赖），全部 41 个 `src/**/*.js` 模块 100% 启用 `// @ts-check`，通过 `scripts/typecheck.js`（`npm run typecheck`）在隔离临时环境中执行零运行时依赖的 JSDoc 静态类型检查：
+本项目包含基于 Node.js 原生 `node --test` 的并行领域测试套件（`test/bridge/*.test.js` 20 个分域文件——含 `composition_architecture.test.js` 与 `wire_codec_parity.test.js`——加上 `test/test_core_modules.js` 与 `test/test_media_security.js`，共 72 项契约、安全与端到端测试，零外部依赖），全部 42 个 `src/**/*.js` 模块 100% 启用 `// @ts-check` 且开启 `strictNullChecks: true`（具象 `BridgeHost` 契约，0 处 `@ts-ignore`），通过 `scripts/typecheck.js`（`npm run typecheck`）在隔离临时环境中执行零运行时依赖的 JSDoc 静态类型检查：
 
 ```bash
 npm test

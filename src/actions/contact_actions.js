@@ -32,11 +32,11 @@ function entriesFromMapOrObject(mapOrObj) {
   return [];
 }
 
-/** @type {Record<string, (this: any, p?: Record<string, any>, context?: any, action?: string) => any>} */
+/** @type {Record<string, import("../types").BridgeActionHandler>} */
 const ACTION_HANDLERS = {
   async get_friend_list(p) {
     const waitBuddyEvent = waitForEventOnce(
-      this._buddyListWaiters,
+      this.inboundPipeline._buddyListWaiters,
       BUDDY_LIST_WAIT_TIMEOUT_MS
     );
 
@@ -90,13 +90,13 @@ const ACTION_HANDLERS = {
 
     if (directCats.length > 0) {
       this.uinUidStore.rememberFromBuddyList(res);
-      this._buddyCategoriesCache = directCats;
-    } else if (forceRefresh || this._buddyCategoriesCache.length === 0) {
+      this.inboundPipeline._buddyCategoriesCache = directCats;
+    } else if (forceRefresh || this.inboundPipeline._buddyCategoriesCache.length === 0) {
       await waitBuddyEvent;
     }
 
     const categories =
-      directCats.length > 0 ? directCats : this._buddyCategoriesCache;
+      directCats.length > 0 ? directCats : this.inboundPipeline._buddyCategoriesCache;
 
     // Collect any V2 buddyUids across categories and batch-hydrate UIN + CoreInfo
     const v2Uids = [];
@@ -203,6 +203,7 @@ const ACTION_HANDLERS = {
   async get_stranger_info(p) {
     const userId = Number(p.user_id || 0);
     const uid = await this.uinUidStore.resolveUid(userId, this.invokeNt.bind(this));
+    /** @type {Record<string, any> | null} */
     let detail = null;
     if (uid) {
       const extractDetail = (res) => {
@@ -235,13 +236,16 @@ const ACTION_HANDLERS = {
         );
         detail = extractDetail(res);
       } catch (_) {
-        let cleanupWaiter = null;
+        /** @type {{ fn: (() => void) | null }} */
+        const waiterCleanup = { fn: null };
+        const profileWaiters = this.inboundPipeline._profileDetailWaiters;
         const waitDetail =
-          this._profileDetailWaiters instanceof Map
+          profileWaiters instanceof Map
             ? new Promise((resolve) => {
+                /** @type {NodeJS.Timeout | null} */
                 let timer = setTimeout(() => {
                   timer = null;
-                  cleanupWaiter?.();
+                  if (waiterCleanup.fn) waiterCleanup.fn();
                   resolve(null);
                 }, 300);
                 timer.unref?.();
@@ -250,20 +254,22 @@ const ACTION_HANDLERS = {
                     clearTimeout(timer);
                     timer = null;
                   }
-                  cleanupWaiter?.();
+                  if (waiterCleanup.fn) waiterCleanup.fn();
                   resolve(info);
                 };
-                cleanupWaiter = () => {
-                  const set = this._profileDetailWaiters.get(uid);
+                waiterCleanup.fn = () => {
+                  const set = profileWaiters.get(uid);
                   if (set) {
                     set.delete(onDetail);
-                    if (set.size === 0) this._profileDetailWaiters.delete(uid);
+                    if (set.size === 0) profileWaiters.delete(uid);
                   }
                 };
-                if (!this._profileDetailWaiters.has(uid)) {
-                  this._profileDetailWaiters.set(uid, new Set());
+                let waiterSet = profileWaiters.get(uid);
+                if (!waiterSet) {
+                  waiterSet = new Set();
+                  profileWaiters.set(uid, waiterSet);
                 }
-                this._profileDetailWaiters.get(uid).add(onDetail);
+                waiterSet.add(onDetail);
               })
             : Promise.resolve(null);
         try {
@@ -274,7 +280,7 @@ const ACTION_HANDLERS = {
           );
           detail = extractDetail(fallbackRes) || (await waitDetail);
         } catch (_) {
-          cleanupWaiter?.();
+          if (waiterCleanup.fn) waiterCleanup.fn();
         }
       }
     }
@@ -311,7 +317,7 @@ const ACTION_HANDLERS = {
   async set_friend_add_request(p) {
     const flag = String(p.flag || "");
     const [friendUidPart, reqTimePart] = flag.split(":");
-    const cached = this._buddyReqsCache.get(flag);
+    const cached = this.inboundPipeline._buddyReqsCache.get(flag);
     const friendUid =
       cached?.friendUid ||
       (friendUidPart?.startsWith("u_")
@@ -346,8 +352,8 @@ const ACTION_HANDLERS = {
     const reqId = String(Date.now());
     const reqNum = Math.max(1, Number(p?.count || 50));
     const cookie = String(p?.cookie || "");
-    const waitDoubt = this._doubtBuddyWaiters
-      ? waitForEventOnce(this._doubtBuddyWaiters, 200)
+    const waitDoubt = this.inboundPipeline._doubtBuddyWaiters
+      ? waitForEventOnce(this.inboundPipeline._doubtBuddyWaiters, 200)
       : Promise.resolve(null);
     const res = await this.invokeNt(
       "nodeIKernelBuddyService/getDoubtBuddyReq",

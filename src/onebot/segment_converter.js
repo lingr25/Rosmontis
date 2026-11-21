@@ -85,8 +85,29 @@ function buildNtMarketFaceUrl(marketFaceElement) {
 }
 
 /**
- * Removes transient hydrated `__base64Uri` properties attached to NTQQ raw
- * message elements so stored raw messages do not retain megabytes of base64 data.
+ * Removes transient hydrated `__base64Uri` / `__localFileUrl` properties from a
+ * single NTQQ element sub-record (`picElement`, `pttElement`, or `videoElement`).
+ *
+ * @param {any} target
+ */
+function _deleteTransientMediaProps(target) {
+  if (!target || typeof target !== "object") return;
+  for (const key of ["__base64Uri", "__localFileUrl"]) {
+    if (key in target) {
+      try {
+        delete target[key];
+      } catch (_deleteErr) {
+        // Non-configurable or proxy-backed element; clear property value directly
+        target[key] = undefined;
+      }
+    }
+  }
+}
+
+/**
+ * Removes transient hydrated `__base64Uri` and `__localFileUrl` properties
+ * attached to NTQQ raw message elements (`picElement`, `pttElement`, `videoElement`)
+ * so stored raw messages do not retain megabytes of base64 data or stale file URLs.
  *
  * @template T
  * @param {T} ntMsg
@@ -97,22 +118,9 @@ function stripTransientNtMedia(ntMsg) {
   if (msgObj && Array.isArray(msgObj.elements)) {
     for (const el of msgObj.elements) {
       if (!el || typeof el !== "object") continue;
-      if (el.picElement && typeof el.picElement === "object") {
-        try {
-          delete el.picElement.__base64Uri;
-        } catch (_deleteErr) {
-          // Non-configurable or proxy-backed element; clear property value directly
-          el.picElement.__base64Uri = undefined;
-        }
-      }
-      if (el.pttElement && typeof el.pttElement === "object") {
-        try {
-          delete el.pttElement.__base64Uri;
-        } catch (_deleteErr) {
-          // Non-configurable or proxy-backed element; clear property value directly
-          el.pttElement.__base64Uri = undefined;
-        }
-      }
+      _deleteTransientMediaProps(el.picElement);
+      _deleteTransientMediaProps(el.pttElement);
+      _deleteTransientMediaProps(el.videoElement);
     }
   }
   return ntMsg;
@@ -854,6 +862,7 @@ async function oneBotSegmentsToNtElements(message, ctx = {}) {
 
     if (type === "reply") {
       const rawId = data.id ?? data.message_id;
+      /** @type {Record<string, any> | null} */
       let entry = null;
       if (messageIdStore && rawId !== undefined && rawId !== null) {
         entry = messageIdStore.getByShortId(rawId) || messageIdStore.getByMsgId(rawId);

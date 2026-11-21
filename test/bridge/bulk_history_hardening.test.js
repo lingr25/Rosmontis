@@ -289,8 +289,8 @@ test("onMsgInfoListUpdate deduplicates identical main + renderer deliveries whil
   ];
 
   // Deliver twice (simulating main ntStore.emitter + renderer-forwarded RM_IPCFROM_MAIN)
-  await bridge._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", dupPayload);
-  await bridge._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", dupPayload);
+  await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", dupPayload);
+  await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", dupPayload);
 
   assert.strictEqual(
     getUinCalls,
@@ -313,7 +313,7 @@ test("onMsgInfoListUpdate deduplicates identical main + renderer deliveries whil
       },
     ],
   ];
-  await bridge._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", updatedPayload);
+  await bridge.inboundPipeline._handleKernelEvent("nodeIKernelMsgListener", "onMsgInfoListUpdate", updatedPayload);
   const emojiNotices = emitted.filter((e) => e.notice_type === "group_msg_emoji_like");
   assert.strictEqual(
     emojiNotices.length,

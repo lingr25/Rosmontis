@@ -325,7 +325,7 @@ test("MessageIdStore maxRawEntries eviction, hoisted msgRandom, offline get_msg,
       ],
     };
 
-    await bridge._processIncomingNtMessage(inboundMediaMsg);
+    await bridge.inboundPipeline._processIncomingNtMessage(inboundMediaMsg);
     assert.strictEqual(emitted.length, 1);
     const msgEv = emitted[0];
     const imgSeg = msgEv.message.find((s) => s.type === "image");

@@ -175,6 +175,7 @@ class CausalSessionScheduler {
     if (advisory === true) {
       return {
         allowed: false,
+        waitMs: 0,
         skippedByCooldown: true,
         remainingMs,
       };
@@ -263,6 +264,7 @@ class CausalSessionScheduler {
     }
 
     return new Promise((/** @type {() => void} */ resolve) => {
+      /** @type {{ timer: NodeJS.Timeout | null, resolve: () => void }} */
       const sleepRecord = { timer: null, resolve };
       const timer = setTimeout(() => {
         this._activeTimers.delete(timer);
@@ -295,6 +297,7 @@ class CausalSessionScheduler {
       delaySpec !== undefined && delaySpec !== null ? delaySpec : this.defaultPrivateRecvDelay;
     const delayMs = this.computeDelayMs(effectiveSpec, 500);
 
+    /** @type {{ peerKey: string, timer: NodeJS.Timeout | null, delayMs: number }} */
     const entry = { peerKey: key, timer: null, delayMs };
     const timer = setTimeout(() => {
       this._activeTimers.delete(timer);

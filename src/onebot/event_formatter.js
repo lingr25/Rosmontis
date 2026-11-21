@@ -45,6 +45,7 @@ function parseGrayTipEvent(ntMsg, el, ctx = {}) {
   // 1. Revoke / recall
   if (gt.revokeElement) {
     const rev = gt.revokeElement;
+    /** @type {Record<string, any> | null} */
     let hit = null;
     if (messageIdStore) {
       hit =

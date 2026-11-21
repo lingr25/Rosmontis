@@ -447,8 +447,8 @@ test("bridge_main.js survives globalIPCMainMap ntApi overwrite, executes 65+ act
 
   // Start HTTP & WebSocket servers and test real network transport + kernel event broadcast
   await controller.startServers();
-  const httpPort = controller._httpServers[0].address().port;
-  const wsPort = controller._wsServers[0].address().port;
+  const httpPort = controller.serverRuntime._httpServers[0].address().port;
+  const wsPort = controller.serverRuntime._wsServers[0].address().port;
 
   try {
     // Test HTTP POST /get_login_info

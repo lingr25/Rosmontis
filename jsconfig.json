@@ -5,6 +5,7 @@
     "allowJs": true,
     "checkJs": false,
     "strict": false,
+    "strictNullChecks": true,
     "noEmit": true,
     "skipLibCheck": true,
     "types": ["node"]

@@ -57,7 +57,7 @@ const {
   SIDE_EFFECT_NT_METHODS,
   isSideEffectNtCmd,
   makeBridgeUnavailableError,
-  rendererIpcMixin,
+  RendererIpcController,
 } = require("../src/core/renderer_ipc");
 const storesMod = require("../src/onebot/stores");
 const cqCodecMod = require("../src/onebot/cq_codec");
@@ -835,14 +835,14 @@ async function runTests() {
       assert.match(fs.readFileSync(bootLogPath, "utf8"), /installMainBridge ok/);
 
       let attachedWc = null;
-      const origAttach = bridge._attachToWebContents;
-      bridge._attachToWebContents = (wc) => {
+      const origAttach = bridge.rendererIpc._attachToWebContents;
+      bridge.rendererIpc._attachToWebContents = (wc) => {
         attachedWc = wc;
       };
       const fakeWc = { id: 42 };
       pluginLoader.onBrowserWindowCreated({ webContents: fakeWc });
       assert.strictEqual(attachedWc, fakeWc);
-      bridge._attachToWebContents = origAttach;
+      bridge.rendererIpc._attachToWebContents = origAttach;
       bridge.releaseMapPrototypeHook("test_cleanup");
 
       // Desktop Windows QQ "Documents/Tencent Files/<uin>/nt_qq/nt_data/Pic/..." cache whitelist vs nt_db block
@@ -972,47 +972,45 @@ async function runTests() {
 
     // Verify Tier 3 wrapperSession dispatch for nodeIKernelNodeMiscService & legacy alias + side-effect replay block
     const tier3Calls = [];
-    const mockHost = Object.assign(
-      {
-        config: { quietLogs: true },
-        activeWebContents: null,
-        rendererExecute: null,
-        invokeStats: {
-          tier1: 0,
-          tier2: 0,
-          tier3: 0,
-          degraded: 0,
-          blockedReplays: 0,
-          failed: 0,
-        },
-        capturedServices: {
-          wrapperSession: {
-            getNodeMiscService: () => ({
-              wantWinScreenOCR: async (...args) => {
-                tier3Calls.push({ svc: "misc", method: "wantWinScreenOCR", args });
-                return { result: 0, texts: ["hello"] };
-              },
-            }),
-            getGroupService: () => ({
-              setMemberShutUp: async (...args) => {
-                tier3Calls.push({ svc: "group", method: "setMemberShutUp", args });
-                return { result: 0 };
-              },
-            }),
-          },
+    const mockHost = {
+      config: { quietLogs: true },
+      activeWebContents: null,
+      rendererExecute: null,
+      invokeStats: {
+        tier1: 0,
+        tier2: 0,
+        tier3: 0,
+        degraded: 0,
+        blockedReplays: 0,
+        failed: 0,
+      },
+      capturedServices: {
+        wrapperSession: {
+          getNodeMiscService: () => ({
+            wantWinScreenOCR: async (...args) => {
+              tier3Calls.push({ svc: "misc", method: "wantWinScreenOCR", args });
+              return { result: 0, texts: ["hello"] };
+            },
+          }),
+          getGroupService: () => ({
+            setMemberShutUp: async (...args) => {
+              tier3Calls.push({ svc: "group", method: "setMemberShutUp", args });
+              return { result: 0 };
+            },
+          }),
         },
       },
-      rendererIpcMixin
-    );
+    };
+    const rendererCtrl = new RendererIpcController(mockHost);
 
-    const ocrRes1 = await mockHost.invokeNt(
+    const ocrRes1 = await rendererCtrl.invokeNt(
       "nodeIKernelNodeMiscService/wantWinScreenOCR",
       { url: "/tmp/ocr1.png" },
       ["/tmp/ocr1.png"]
     );
     assert.deepStrictEqual(ocrRes1, { result: 0, texts: ["hello"] });
 
-    const ocrRes2 = await mockHost.invokeNt(
+    const ocrRes2 = await rendererCtrl.invokeNt(
       "nodeIKernelMiscService/wantWinScreenOCR",
       { url: "/tmp/ocr2.png" },
       ["/tmp/ocr2.png"]
@@ -1029,14 +1027,14 @@ async function runTests() {
     };
     await assert.rejects(
       () =>
-        mockHost.invokeNt(
+        rendererCtrl.invokeNt(
           "nodeIKernelGroupService/setMemberShutUp",
           { groupCode: "7654321", memList: [{ uid: "u_m2", timeStamp: 60 }] },
           ["7654321", [{ uid: "u_m2", timeStamp: 60 }]]
         ),
       /risk control timeout after dispatch/
     );
-    assert.strictEqual(mockHost.invokeStats.blockedReplays, 1);
+    assert.strictEqual(rendererCtrl.invokeStats.blockedReplays, 1);
     assert.strictEqual(
       tier3Calls.some((c) => c.method === "setMemberShutUp"),
       false,
@@ -1047,7 +1045,7 @@ async function runTests() {
     mockHost.rendererExecute = async () => {
       throw makeBridgeUnavailableError("renderer gone before dispatch");
     };
-    await mockHost.invokeNt(
+    await rendererCtrl.invokeNt(
       "nodeIKernelGroupService/setMemberShutUp",
       { groupCode: "7654321", memList: [{ uid: "u_m2", timeStamp: 60 }] },
       ["7654321", [{ uid: "u_m2", timeStamp: 60 }]]
@@ -1066,7 +1064,7 @@ async function runTests() {
   // =========================================================================
   {
     const os = require("os");
-    const { ntCaptureMixin } = require("../src/core/nt_capture");
+    const { NtCaptureController } = require("../src/core/nt_capture");
     const { resolveMediaSource } = require("../src/core/media_security");
 
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "rosmontis-core-s9-"));
@@ -1149,21 +1147,17 @@ async function runTests() {
           exports: fakeWrapperExports,
         },
       };
-      const probeHost = Object.assign(
-        {
-          config: { keepMapHook: true },
-          capturedServices: {
-            ntApi: null,
-            ntApiContainer: null,
-            ntStore: null,
-            wrapperSession: null,
-          },
-          _attachedEmitters: new WeakSet(),
-          _maybeScheduleMapHookRelease() {},
+      const probeHost = {
+        config: { keepMapHook: true },
+        capturedServices: {
+          ntApi: null,
+          ntApiContainer: null,
+          ntStore: null,
+          wrapperSession: null,
         },
-        ntCaptureMixin
-      );
-      const probeSummary = probeHost.probeExistingRuntime({
+      };
+      const captureCtrl = new NtCaptureController(probeHost);
+      const probeSummary = captureCtrl.probeExistingRuntime({
         moduleCache: fakeModuleCache,
         ipcMain: fakeIpcMain,
       });
