@@ -307,6 +307,8 @@ function loadBridgeConfig(customConfigDir) {
           "ffmpegPath",
           "silkDecoderPath",
           "silkEncoderPath",
+          "silkAddonPath",
+          "nodeBinPath",
           "stateDir",
         ]) {
           if (raw && raw[optKey] !== undefined) {
@@ -628,6 +630,24 @@ function loadBridgeConfig(customConfigDir) {
   );
   if (resolvedSilkEncoder) {
     defaultConfig.silkEncoderPath = resolvedSilkEncoder;
+  }
+
+  const envSilkAddonPath = pickPrefixedEnv("SILK_ADDON_PATH", ["FFMPEG_ADDON_PATH"]);
+  const rawSilkAddonPath = String(
+    envSilkAddonPath || loadedRaw.silkAddonPath || loadedRaw.silk_addon_path || ""
+  ).trim();
+  if (rawSilkAddonPath) {
+    defaultConfig.silkAddonPath = rawSilkAddonPath;
+  } else if (loadedRaw.silkAddonPath === false || loadedRaw.silk_addon_path === false) {
+    defaultConfig.silkAddonPath = false;
+  }
+
+  const envNodeBinPath = pickPrefixedEnv("NODE_BIN", ["NODE_BIN"]);
+  const rawNodeBinPath = String(
+    envNodeBinPath || loadedRaw.nodeBinPath || loadedRaw.node_bin_path || ""
+  ).trim();
+  if (rawNodeBinPath) {
+    defaultConfig.nodeBinPath = rawNodeBinPath;
   }
 
   const resolvedStateDir = resolveStateDirFromEnv(

@@ -729,6 +729,20 @@ const ACTION_HANDLERS = {
     throw err;
   },
 
+  async reload_bridge(p) {
+    if (typeof this.reloadBridge === "function") {
+      return await this.reloadBridge({
+        source: String(p?.source || "onebot_action"),
+        reloadConfig: p?.reload_config !== false,
+        reloadRenderer: p?.reload_renderer !== false,
+      });
+    }
+    /** @type {Error & { retcode?: number }} */
+    const err = new Error("reload_bridge is not supported on this bridge instance");
+    err.retcode = 1404;
+    throw err;
+  },
+
   clean_cache() {
     this.flushTempCleanup();
     return {};
@@ -817,6 +831,45 @@ const ACTION_HANDLERS = {
     if (
       !rawMsg &&
       entry &&
+      entry.inVisit &&
+      entry.forwardPeer?.peerUid &&
+      entry.rootMsgId &&
+      entryMsgId
+    ) {
+      try {
+        const multiRes = await this.invokeNt(
+          "nodeIKernelMsgService/getMultiMsg",
+          {
+            peer: entry.forwardPeer,
+            rootMsgId: String(entry.rootMsgId),
+            parentMsgId: String(entry.parentMsgId || entry.rootMsgId),
+          },
+          [
+            entry.forwardPeer,
+            String(entry.rootMsgId),
+            String(entry.parentMsgId || entry.rootMsgId),
+          ]
+        );
+        const multiList = Array.isArray(multiRes?.msgList) ? multiRes.msgList : [];
+        rawMsg =
+          multiList.find((/** @type {any} */ item) => String(item?.msgId || "") === entryMsgId) ||
+          multiList.find(
+            (/** @type {any} */ item) =>
+              entry.msgSeq &&
+              String(item?.msgSeq || "") === String(entry.msgSeq) &&
+              (!entry.senderUid || String(item?.senderUid || "") === String(entry.senderUid)) &&
+              (!entry.msgTime || String(item?.msgTime || "") === String(entry.msgTime))
+          ) ||
+          null;
+      } catch (multiErr) {
+        this.logger?.debug?.("message_actions", multiErr);
+        rawMsg = null;
+      }
+    }
+    if (
+      !rawMsg &&
+      entry &&
+      !entry.inVisit &&
       entryPeer?.peerUid &&
       entryMsgId &&
       !/^(sent_|fwd_|echo_timeout_)/.test(entryMsgId)
@@ -828,13 +881,39 @@ const ACTION_HANDLERS = {
           [entryPeer, [entryMsgId]]
         );
         rawMsg = res?.msgList?.[0] || null;
-      } catch (_) {
+      } catch (getErr) {
+        this.logger?.debug?.("message_actions", getErr);
         rawMsg = null;
       }
     }
     if (rawMsg) {
       try {
-        await this.inboundPipeline._hydrateNtMsgMedia(rawMsg);
+        if (entry?.inVisit) {
+          const visitPeer =
+            entry.forwardPeer && entry.forwardPeer.peerUid ? entry.forwardPeer : entryPeer;
+          const visitForwardSenderUid = String(
+            entry.forwardSenderUid ||
+              (Number(visitPeer?.chatType) === 1 &&
+              visitPeer?.peerUid &&
+              String(visitPeer.peerUid) !== "0"
+                ? visitPeer.peerUid
+                : "") ||
+              ""
+          );
+          await this.inboundPipeline._hydrateNtMsgMedia(rawMsg, {
+            inVisit: true,
+            downSourceType: 1,
+            chatType: visitPeer?.chatType,
+            peerUid: visitPeer?.peerUid,
+            guildId: visitPeer?.guildId || "",
+            forwardSenderUid: visitForwardSenderUid,
+            senderUid: rawMsg.senderUid || entry.senderUid || "",
+          });
+          this.messageIdStore?.indexMsgMedia?.(rawMsg, entry.shortId ?? entry.oneBotId);
+        } else {
+          await this.inboundPipeline._hydrateNtMsgMedia(rawMsg);
+          this.messageIdStore?.indexMsgMedia?.(rawMsg, entry?.shortId ?? entry?.oneBotId);
+        }
         const refreshed = formatNtMsgToOneBotEvent(rawMsg, {
           selfId: this.selfUin,
           uinUidStore: this.uinUidStore,
@@ -918,6 +997,15 @@ const ACTION_HANDLERS = {
       fwdHit?.parentMsgId || entry?.msgId || entry?.ntMsgId || explicitMsgId || resId
     );
     const rootMsgId = String(fwdHit?.rootMsgId || entry?.rootMsgId || parentMsgId);
+    const forwardSenderUid = String(
+      fwdHit?.senderUid ||
+        entry?.forwardSenderUid ||
+        entry?.senderUid ||
+        (Number(peer?.chatType) === 1 && peer?.peerUid && String(peer.peerUid) !== "0"
+          ? peer.peerUid
+          : "") ||
+        ""
+    );
     const res = await this.invokeNt(
       "nodeIKernelMsgService/getMultiMsg",
       {
@@ -930,20 +1018,24 @@ const ACTION_HANDLERS = {
     const msgList = Array.isArray(res?.msgList) ? res.msgList : [];
     const totalHydrationBudgetMs = Math.max(
       200,
-      Number(this.config?.forwardMediaHydrationBudgetMs ?? 3500) || 3500
+      Number(this.config?.forwardMediaHydrationBudgetMs ?? 5000) || 5000
     );
     const hydrationDeadlineMs = Date.now() + totalHydrationBudgetMs;
-    const perNodeAttemptMs = Math.min(1200, totalHydrationBudgetMs);
+    const perNodeAttemptMs = Math.min(3000, totalHydrationBudgetMs);
     const messages = [];
     for (const m of msgList) {
       try {
         await this.inboundPipeline._hydrateNtMsgMedia(m, {
+          inVisit: true,
           downSourceType: 1,
           timeoutMs: perNodeAttemptMs,
           deadlineMs: hydrationDeadlineMs,
           skipRemoteDownload: Date.now() >= hydrationDeadlineMs,
           chatType: peer.chatType,
           peerUid: peer.peerUid,
+          guildId: peer.guildId || "",
+          forwardSenderUid,
+          senderUid: m.senderUid || "",
         });
         const nodeSenderUid = String(m.senderUid || m.senderUidStr || "").trim();
         let uin = bridgeOneBot.pickPositiveUin(
@@ -953,22 +1045,30 @@ const ACTION_HANDLERS = {
         if (!uin && nodeSenderUid && typeof this.inboundPipeline?._ensureUinForUid === "function") {
           uin = bridgeOneBot.pickPositiveUin(await this.inboundPipeline._ensureUinForUid(nodeSenderUid));
         }
+        const hasMsgPeer = Boolean(m.peerUid && String(m.peerUid) !== "0");
         const shortId = this.messageIdStore.register(
           m.msgId,
           {
-            chatType: Number(m.chatType || peer.chatType || 2),
-            peerUid: String(
-              m.peerUid && String(m.peerUid) !== "0" ? m.peerUid : peer.peerUid
+            chatType: Number(
+              hasMsgPeer ? m.chatType || peer.chatType || 2 : peer.chatType || m.chatType || 2
             ),
-            guildId: String(m.guildId || peer.guildId || ""),
+            peerUid: String(hasMsgPeer ? m.peerUid : peer.peerUid),
+            guildId: String(
+              hasMsgPeer ? m.guildId || peer.guildId || "" : peer.guildId || m.guildId || ""
+            ),
           },
           m.msgSeq,
           {
             senderUin: uin,
             senderUid: nodeSenderUid,
+            msgTime: m.msgTime,
+            msgRandom: m.msgRandom,
             rawMsg: m,
             rootMsgId,
+            parentMsgId,
             forwardPeer: peer,
+            forwardSenderUid,
+            inVisit: true,
           }
         );
         const { segments, raw_message } = ntMsgToOneBotSegments(m, {
@@ -1415,6 +1515,7 @@ const ACTION_ALIASES = {
   ".handle_quick_operation_async": ".handle_quick_operation",
   handle_quick_operation: ".handle_quick_operation",
   handle_quick_operation_async: ".handle_quick_operation",
+  _reload_bridge: "reload_bridge",
 };
 
 const { HANDLED_ACTIONS, dispatch } = createActionRouter(ACTION_HANDLERS, ACTION_ALIASES);

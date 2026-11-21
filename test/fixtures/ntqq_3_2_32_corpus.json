@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "ntqq_version": "3.2.32-52194",
+  "description": "Desensitized real-world Linux NTQQ 3.2.32 wrapper.node message/IPC fixtures capturing production edge cases (mface without URL, quote with string '0' UIN, virtual forward nodes with uncached media, nested rootMsgId forwards, wallet redbag, Ark JSON cards, and grayTip UID-only recalls).",
+  "uid_uin_map": {
+    "u_admin_1001": "10001001",
+    "u_peer_2002": "20002002",
+    "u_bot_9999": "1000000002"
+  },
+  "cases": {
+    "mface_standalone_and_quote": {
+      "mface_msg": {
+        "msgId": "759100101",
+        "msgRandom": "194827161",
+        "msgSeq": "812",
+        "msgTime": "1794591000",
+        "msgType": 2,
+        "subMsgType": 4096,
+        "chatType": 2,
+        "peerUid": "900100200",
+        "peerUin": "900100200",
+        "guildId": "",
+        "senderUid": "u_admin_1001",
+        "senderUin": "10001001",
+        "sendMemberName": "测试管理员",
+        "sendNickName": "AdminUser",
+        "elements": [
+          {
+            "elementId": "75910010101",
+            "elementType": 11,
+            "marketFaceElement": {
+              "itemType": 6,
+              "faceInfo": 1,
+              "emojiPackageId": 239814,
+              "subType": 3,
+              "faceName": "[抱着尾巴睡]",
+              "emojiId": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+              "key": "d41d8cd98f00b204",
+              "imageWidth": 300,
+              "imageHeight": 300
+            }
+          }
+        ]
+      },
+      "quote_ask_msg": {
+        "msgId": "759100102",
+        "msgRandom": "194827162",
+        "msgSeq": "813",
+        "msgTime": "1794591008",
+        "msgType": 9,
+        "subMsgType": 1,
+        "chatType": 2,
+        "peerUid": "900100200",
+        "peerUin": "900100200",
+        "guildId": "",
+        "senderUid": "u_admin_1001",
+        "senderUin": "0",
+        "sendMemberName": "测试管理员",
+        "sendNickName": "AdminUser",
+        "elements": [
+          {
+            "elementId": "75910010201",
+            "elementType": 7,
+            "replyElement": {
+              "replayMsgId": "759100101",
+              "replayMsgSeq": "812",
+              "sourceMsgText": "[抱着尾巴睡]",
+              "senderUid": "0",
+              "senderUidStr": "u_admin_1001"
+            }
+          },
+          {
+            "elementId": "75910010202",
+            "elementType": 1,
+            "textElement": {
+              "content": "@小晓",
+              "atType": 2,
+              "atUid": "u_bot_9999",
+              "atNtUid": "u_bot_9999",
+              "atTinyId": "0"
+            }
+          },
+          {
+            "elementId": "75910010203",
+            "elementType": 1,
+            "textElement": {
+              "content": " 能看到这个表情图片吗？",
+              "atType": 0
+            }
+          }
+        ]
+      }
+    },
+    "forward_multi_image_virtual_hang": {
+      "outer_msg": {
+        "msgId": "759200201",
+        "msgRandom": "284719201",
+        "msgSeq": "905",
+        "msgTime": "1794592400",
+        "msgType": 11,
+        "chatType": 1,
+        "peerUid": "u_admin_1001",
+        "peerUin": "0",
+        "guildId": "",
+        "senderUid": "u_admin_1001",
+        "senderUin": "10001001",
+        "sendNickName": "AdminUser",
+        "elements": [
+          {
+            "elementId": "75920020101",
+            "elementType": 16,
+            "multiForwardMsgElement": {
+              "resId": "v3_b64_ForwardResId_MultiImg_001",
+              "fileName": "{8F2C11A0-1234-4567-89AB-CDEF01234567}",
+              "xmlContent": "<?xml version=\"1.0\" encoding=\"utf-8\"?><msg serviceID=\"35\" action=\"viewMultiMsg\" m_resid=\"v3_b64_ForwardResId_MultiImg_001\"><item layout=\"1\"><title>群聊的聊天记录</title><title>AdminUser: 给我推荐几个测试工具</title><title>PeerUser: iplark.com 还有下面三张架构图</title><summary>查看2条转发消息</summary></item></msg>"
+            }
+          }
+        ]
+      },
+      "virtual_nodes": [
+        {
+          "msgId": "759200211",
+          "msgSeq": "11",
+          "msgTime": "1794592310",
+          "chatType": 2,
+          "peerUid": "0",
+          "senderUid": "u_admin_1001",
+          "senderUin": "0",
+          "sendNickName": "AdminUser",
+          "elements": [
+            {
+              "elementId": "921101",
+              "elementType": 1,
+              "textElement": { "content": "给我推荐几个测试工具" }
+            }
+          ]
+        },
+        {
+          "msgId": "759200212",
+          "msgSeq": "12",
+          "msgTime": "1794592350",
+          "chatType": 2,
+          "peerUid": "0",
+          "senderUid": "u_peer_2002",
+          "senderUin": "0",
+          "sendNickName": "PeerUser",
+          "elements": [
+            {
+              "elementId": "921200",
+              "elementType": 7,
+              "replyElement": {
+                "replayMsgId": "759200211",
+                "replayMsgSeq": "11"
+              }
+            },
+            {
+              "elementId": "921201",
+              "elementType": 1,
+              "textElement": { "content": "iplark.com 还有下面三张架构图" }
+            },
+            {
+              "elementId": "921202",
+              "elementType": 2,
+              "picElement": {
+                "fileName": "arch_diagram_1.jpg",
+                "md5HexStr": "11111111222222223333333344444444",
+                "fileSize": "182400",
+                "originImageUrl": "/download?appid=1406&fileid=FakeFileId_Img1&spec=0",
+                "sourcePath": "/nonexistent/ntqq_cache/arch_diagram_1.jpg"
+              }
+            },
+            {
+              "elementId": "921203",
+              "elementType": 2,
+              "picElement": {
+                "fileName": "arch_diagram_2.jpg",
+                "md5HexStr": "55555555666666667777777788888888",
+                "fileSize": "194000",
+                "originImageUrl": "/download?appid=1406&fileid=FakeFileId_Img2&spec=0",
+                "sourcePath": "/nonexistent/ntqq_cache/arch_diagram_2.jpg"
+              }
+            },
+            {
+              "elementId": "921204",
+              "elementType": 2,
+              "picElement": {
+                "fileName": "arch_diagram_3.jpg",
+                "md5HexStr": "99999999aaaaaaaabbbbbbbbcccccccc",
+                "fileSize": "210500",
+                "originImageUrl": "/download?appid=1406&fileid=FakeFileId_Img3&spec=0",
+                "sourcePath": "/nonexistent/ntqq_cache/arch_diagram_3.jpg"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "nested_forward_root_msgid": {
+      "outer_msg": {
+        "msgId": "759300301",
+        "msgRandom": "384719301",
+        "msgSeq": "930",
+        "msgTime": "1794593000",
+        "msgType": 11,
+        "chatType": 2,
+        "peerUid": "900100200",
+        "peerUin": "900100200",
+        "senderUid": "u_admin_1001",
+        "senderUin": "10001001",
+        "sendNickName": "AdminUser",
+        "elements": [
+          {
+            "elementId": "75930030101",
+            "elementType": 16,
+            "multiForwardMsgElement": {
+              "resId": "v3_OuterNestedResId_301",
+              "xmlContent": "<msg m_resid=\"v3_OuterNestedResId_301\"><item><title>群聊的聊天记录</title><title>AdminUser: 外层说明文字</title><title>PeerUser: [聊天记录]</title></item></msg>"
+            }
+          }
+        ]
+      },
+      "outer_children": [
+        {
+          "msgId": "759300311",
+          "msgSeq": "21",
+          "msgTime": "1794592950",
+          "chatType": 2,
+          "peerUid": "900100200",
+          "senderUid": "u_admin_1001",
+          "senderUin": "10001001",
+          "sendNickName": "AdminUser",
+          "elements": [
+            {
+              "elementId": "931101",
+              "elementType": 1,
+              "textElement": { "content": "外层说明文字" }
+            }
+          ]
+        },
+        {
+          "msgId": "759300312",
+          "msgSeq": "22",
+          "msgTime": "1794592960",
+          "chatType": 2,
+          "peerUid": "900100200",
+          "senderUid": "u_peer_2002",
+          "senderUin": "20002002",
+          "sendNickName": "PeerUser",
+          "elements": [
+            {
+              "elementId": "931201",
+              "elementType": 16,
+              "multiForwardMsgElement": {
+                "resId": "v3_InnerNestedResId_312",
+                "xmlContent": "<msg m_resid=\"v3_InnerNestedResId_312\"><item><title>聊天记录</title><title>PeerUser: 内层嵌套的关键日志结论</title></item></msg>"
+              }
+            }
+          ]
+        }
+      ],
+      "inner_children": [
+        {
+          "msgId": "759300321",
+          "msgSeq": "31",
+          "msgTime": "1794592900",
+          "chatType": 2,
+          "peerUid": "900100200",
+          "senderUid": "u_peer_2002",
+          "senderUin": "0",
+          "sendNickName": "PeerUser",
+          "elements": [
+            {
+              "elementId": "932101",
+              "elementType": 1,
+              "textElement": { "content": "内层嵌套的关键日志结论" }
+            }
+          ]
+        }
+      ]
+    },
+    "wallet_redbag_and_ark_json": {
+      "redbag_msg": {
+        "msgId": "759400401",
+        "msgSeq": "940",
+        "msgTime": "1794593500",
+        "msgType": 10,
+        "chatType": 2,
+        "peerUid": "900100200",
+        "peerUin": "900100200",
+        "senderUid": "u_peer_2002",
+        "senderUin": "20002002",
+        "sendNickName": "PeerUser",
+        "elements": [
+          {
+            "elementId": "75940040101",
+            "elementType": 9,
+            "walletElement": {
+              "billNo": "1000049202611140001",
+              "msgType": 6,
+              "receiver": {
+                "title": "版本上线大吉",
+                "notice": "[QQ红包]版本上线大吉"
+              }
+            }
+          }
+        ]
+      },
+      "ark_bili_msg": {
+        "msgId": "759400402",
+        "msgSeq": "941",
+        "msgTime": "1794593510",
+        "msgType": 11,
+        "chatType": 2,
+        "peerUid": "900100200",
+        "peerUin": "900100200",
+        "senderUid": "u_admin_1001",
+        "senderUin": "10001001",
+        "sendNickName": "AdminUser",
+        "elements": [
+          {
+            "elementId": "75940040201",
+            "elementType": 10,
+            "arkElement": {
+              "bytesData": "{\"app\":\"com.tencent.miniapp_01\",\"prompt\":\"[QQ小程序]哔哩哔哩\",\"meta\":{\"detail_1\":{\"title\":\"哔哩哔哩\",\"desc\":\"明日方舟终末地技术解析\",\"qqdocurl\":\"https://www.bilibili.com/video/BV1xx411c7mD\"}}}"
+            }
+          }
+        ]
+      }
+    },
+    "graytip_recall_truthy_zero_uin": {
+      "recall_msg": {
+        "msgId": "759500501",
+        "msgSeq": "950",
+        "msgTime": "1794593600",
+        "msgType": 5,
+        "subMsgType": 4,
+        "chatType": 2,
+        "peerUid": "900100200",
+        "peerUin": "900100200",
+        "senderUid": "u_peer_2002",
+        "senderUin": "0",
+        "elements": [
+          {
+            "elementId": "75950050101",
+            "elementType": 8,
+            "grayTipElement": {
+              "subElementType": 1,
+              "revokeElement": {
+                "operatorUid": "u_admin_1001",
+                "operatorUin": "0",
+                "origMsgSenderUid": "u_peer_2002",
+                "origMsgSenderUin": "0",
+                "origMsgSeq": "940",
+                "wording": ""
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

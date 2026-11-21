@@ -19,6 +19,12 @@ const { pathToFileURL } = require("url");
 const { resolveMediaSource } = require("../core/media_security");
 const { transcodeRecordOutFormat } = require("../core/audio_codec");
 const { createActionRouter, createEventWaiter } = require("../core/primitives");
+const { extractNtRichMediaAppId } = require("../core/nt_normalizer");
+const {
+  isNtMultimediaDownloadUrl,
+  downloadNtMultimediaWithRKey,
+  getOneBotRKeyList,
+} = require("../core/rkey_manager");
 const {
   computeBkn,
   cookieObjToString,
@@ -127,6 +133,8 @@ async function maybeTranscodeGetRecordOutput(bridge, action, rawOutFormat, local
       : {}),
     ffmpegPath: bridge.config?.ffmpegPath,
     silkDecoderPath: bridge.config?.silkDecoderPath,
+    silkAddonPath: bridge.config?.silkAddonPath,
+    nodeBinPath: bridge.config?.nodeBinPath,
   });
   if (!converted) return null;
   trackActionTempMedia(bridge, converted);
@@ -203,32 +211,202 @@ async function resolveOneBotMediaAction(p, _context, action) {
   let kernelRemoteUrl = "";
 
   if (mediaDesc && !kernelStat && Number(mediaDesc.elementType) !== 11) {
-    const ntMsgId = String(mediaDesc.ntMsgId || "");
-    const chatType = Number(mediaDesc.chatType || 1);
-    const peerUid = String(mediaDesc.peerUid || "");
-    const elementId = String(mediaDesc.elementId || "");
-    const safeTargetPath = mediaDesc.sourcePath ? String(mediaDesc.sourcePath) : "";
-    if (ntMsgId && !/^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) && peerUid && elementId) {
+    const desc = mediaDesc;
+    const ntMsgId = String(desc.ntMsgId || "");
+    const chatType = Number(desc.chatType || 1);
+    const peerUid = String(desc.peerUid || "");
+    const elementId = String(desc.elementId || "");
+    let safeTargetPath = desc.sourcePath ? String(desc.sourcePath) : "";
+    /** @type {string[]} */
+    const altFilePaths = [];
+    if (
+      desc.inVisit &&
+      desc.elementType === 2 &&
+      desc.md5 &&
+      typeof this.invokeNt === "function" &&
+      (typeof this.inboundPipeline?._isNtReady !== "function" || this.inboundPipeline._isNtReady())
+    ) {
+      try {
+        const pathInfo = {
+          md5HexStr: String(desc.md5),
+          fileName: String(desc.fileName || `${desc.md5}.jpg`),
+          elementType: 2,
+          elementSubType: Number(desc.elem?.picElement?.picSubType || 0),
+          thumbSize: 0,
+          needCreate: true,
+          downloadType: 1,
+          file_uuid: String(desc.fileUuid || ""),
+        };
+        const pathRes = await this.invokeNt(
+          "nodeIKernelMsgService/getRichMediaFilePathForGuild",
+          { path_info: pathInfo },
+          [pathInfo]
+        );
+        const resolvedPath = String(
+          (typeof pathRes === "string" ? pathRes : pathRes?.path) || ""
+        ).trim();
+        if (resolvedPath) {
+          const cachedStat = await statNonEmptyFile(resolvedPath);
+          if (cachedStat) {
+            kernelLocalPath = resolvedPath;
+            kernelStat = cachedStat;
+          } else if (!safeTargetPath) {
+            safeTargetPath = resolvedPath;
+          } else if (resolvedPath !== safeTargetPath) {
+            altFilePaths.push(resolvedPath);
+          }
+        }
+      } catch (pathErr) {
+        this.logger?.debug?.("media_profile_actions", pathErr);
+      }
+    }
+    if (
+      !kernelStat &&
+      (ntMsgId || desc.inVisit) &&
+      !/^(sent_|fwd_|echo_timeout_)/.test(ntMsgId) &&
+      peerUid &&
+      (elementId || desc.inVisit)
+    ) {
       if (typeof this.inboundPipeline?._downloadRichMediaElement === "function") {
-        try {
+        /**
+         * @param {{ overrideMsgId?: string, overrideElementId?: string, overrideElem?: any, timeoutMs?: number }} [attemptOpts]
+         */
+        const attemptVisitOrMsgDownload = async ({
+          overrideMsgId = "",
+          overrideElementId = "",
+          overrideElem = null,
+          timeoutMs = Number(this.config?.richMediaDownloadTimeoutMs) || 8000,
+        } = {}) => {
           const dlPath = await this.inboundPipeline._downloadRichMediaElement({
-            msgId: ntMsgId,
+            msgId: overrideMsgId || ntMsgId || "0",
             chatType,
             peerUid,
-            elementId,
+            altChatType: Number(desc.msgChatType || 0),
+            altPeerUid: String(desc.msgPeerUid || ""),
+            altGuildId: String(desc.msgGuildId || ""),
+            elementId: overrideElementId || elementId || "0",
             downloadType: 1,
-            downSourceType: 0,
+            downSourceType: desc.inVisit ? 1 : 0,
             downloadScene: 0,
-            fileModelId: String(mediaDesc.fileModelId || "0"),
+            fileModelId: String(desc.fileModelId || "0"),
             thumbSize: 0,
             filePath: safeTargetPath,
-            timeoutMs: Number(this.config?.richMediaDownloadTimeoutMs) || 8000,
+            altFilePaths,
+            md5: desc.md5 || "",
+            inVisit: Boolean(desc.inVisit),
+            elem: overrideElem || desc.elem || null,
+            msgRandom: desc.msgRandom || "0",
+            msgSeq: desc.msgSeq || "0",
+            msgTime: desc.msgTime || "0",
+            forwardSenderUid:
+              desc.forwardSenderUid ||
+              (Number(chatType) === 1 && peerUid && peerUid !== "0" ? peerUid : ""),
+            senderUid: desc.senderUid || "",
+            guildId: desc.guildId || "",
+            timeoutMs,
           });
           const candidate = String(dlPath || safeTargetPath || "");
           const st = await statNonEmptyFile(candidate);
           if (st) {
             kernelLocalPath = candidate;
             kernelStat = st;
+            desc.sourcePath = candidate;
+            if (desc.elem && typeof desc.elem === "object") {
+              if (desc.elem.picElement) desc.elem.picElement.sourcePath = candidate;
+              if (desc.elem.fileElement) desc.elem.fileElement.filePath = candidate;
+              if (desc.elem.pttElement) desc.elem.pttElement.filePath = candidate;
+              if (desc.elem.videoElement) desc.elem.videoElement.filePath = candidate;
+            }
+          }
+        };
+
+        try {
+          const canWarmMultiCache = Boolean(
+            desc.inVisit &&
+              desc.forwardPeer?.peerUid &&
+              desc.rootMsgId &&
+              typeof this.invokeNt === "function"
+          );
+          const defaultTimeout = Number(this.config?.richMediaDownloadTimeoutMs) || 8000;
+          await attemptVisitOrMsgDownload({
+            timeoutMs: canWarmMultiCache ? Math.min(5000, defaultTimeout) : defaultTimeout,
+          });
+          if (!kernelStat && canWarmMultiCache) {
+            let refreshedMsgId = "";
+            let refreshedElementId = "";
+            let refreshedElem = null;
+            try {
+              const multiRes = await this.invokeNt(
+                "nodeIKernelMsgService/getMultiMsg",
+                {
+                  peer: desc.forwardPeer,
+                  rootMsgId: String(desc.rootMsgId),
+                  parentMsgId: String(desc.parentMsgId || desc.rootMsgId),
+                },
+                [
+                  desc.forwardPeer,
+                  String(desc.rootMsgId),
+                  String(desc.parentMsgId || desc.rootMsgId),
+                ]
+              );
+              const multiList = Array.isArray(multiRes?.msgList) ? multiRes.msgList : [];
+              const targetMd5Lower = String(desc.md5 || "").toLowerCase();
+              const targetUuid = String(desc.fileUuid || "");
+              for (const item of multiList) {
+                if (!item || !Array.isArray(item.elements)) continue;
+                const foundElem = item.elements.find((/** @type {any} */ e) => {
+                  if (
+                    String(item.msgId || "") === ntMsgId &&
+                    elementId &&
+                    String(e?.elementId || "") === elementId
+                  ) {
+                    return true;
+                  }
+                  if (
+                    targetMd5Lower &&
+                    String(
+                      e?.picElement?.md5HexStr ||
+                        e?.fileElement?.fileMd5 ||
+                        e?.videoElement?.videoMd5 ||
+                        e?.pttElement?.md5HexStr ||
+                        ""
+                    ).toLowerCase() === targetMd5Lower
+                  ) {
+                    return true;
+                  }
+                  if (
+                    targetUuid &&
+                    String(
+                      e?.picElement?.fileUuid ||
+                        e?.fileElement?.fileUuid ||
+                        e?.videoElement?.fileUuid ||
+                        e?.pttElement?.fileUuid ||
+                        ""
+                    ) === targetUuid
+                  ) {
+                    return true;
+                  }
+                  return false;
+                });
+                if (foundElem) {
+                  refreshedMsgId = String(item.msgId || "");
+                  refreshedElementId = String(foundElem.elementId || "");
+                  refreshedElem = foundElem;
+                  if (foundElem.picElement?.originImageUrl && !desc.url) {
+                    desc.url = String(foundElem.picElement.originImageUrl);
+                  }
+                  break;
+                }
+              }
+            } catch (multiErr) {
+              this.logger?.debug?.("media_profile_actions", multiErr);
+            }
+            await attemptVisitOrMsgDownload({
+              overrideMsgId: refreshedMsgId,
+              overrideElementId: refreshedElementId,
+              overrideElem: refreshedElem,
+              timeoutMs: Math.min(5000, defaultTimeout),
+            });
           }
         } catch (err) {
           this.logger?.debug?.("media_profile_actions", err);
@@ -239,7 +417,7 @@ async function resolveOneBotMediaAction(p, _context, action) {
             downSourceType: 0,
             downloadSourceType: 0,
             downloadScene: 0,
-            fileModelId: String(mediaDesc.fileModelId || "0"),
+            fileModelId: String(desc.fileModelId || "0"),
             triggerType: 1,
             msgId: ntMsgId,
             chatType,
@@ -262,6 +440,60 @@ async function resolveOneBotMediaAction(p, _context, action) {
           }
         } catch (err) {
           this.logger?.debug?.("media_profile_actions", err);
+        }
+      }
+    }
+
+    if (!kernelStat) {
+      const rawNtUrl = String(desc.url || desc.elem?.picElement?.originImageUrl || "").trim();
+      if (isNtMultimediaDownloadUrl(rawNtUrl)) {
+        try {
+          const rkeyDl = await downloadNtMultimediaWithRKey(this, rawNtUrl, {
+            targetPath: safeTargetPath,
+            appId: extractNtRichMediaAppId(desc.elem || rawNtUrl, desc.fileUuid),
+            isGroup: Number(chatType) === 2,
+            md5: desc.md5 || "",
+            fileName: desc.fileName || "",
+            mediaKind:
+              action === "get_record"
+                ? "record"
+                : desc.elementType === 5
+                ? "video"
+                : "image",
+            timeoutMs: Number(this.config?.richMediaDownloadTimeoutMs) || 8000,
+          });
+          if (rkeyDl?.localPath) {
+            const rkeyStat = await statNonEmptyFile(rkeyDl.localPath);
+            if (rkeyStat) {
+              kernelLocalPath = rkeyDl.localPath;
+              kernelStat = rkeyStat;
+              trackActionTempMedia(this, rkeyDl);
+              desc.sourcePath = rkeyDl.localPath;
+              if (desc.elem && typeof desc.elem === "object") {
+                if (desc.elem.picElement) desc.elem.picElement.sourcePath = rkeyDl.localPath;
+                if (desc.elem.fileElement) desc.elem.fileElement.filePath = rkeyDl.localPath;
+                if (desc.elem.pttElement) desc.elem.pttElement.filePath = rkeyDl.localPath;
+                if (desc.elem.videoElement) desc.elem.videoElement.filePath = rkeyDl.localPath;
+              }
+              const ownerId = desc.oneBotId ?? desc.shortId ?? null;
+              const ownerEntry = ownerId != null ? resolveMessageEntry(this, ownerId) : null;
+              if (ownerEntry?.rawMsg && Array.isArray(ownerEntry.rawMsg.elements)) {
+                for (const el of ownerEntry.rawMsg.elements) {
+                  if (
+                    (elementId && String(el?.elementId || "") === elementId) ||
+                    (desc.md5 &&
+                      String(el?.picElement?.md5HexStr || "").toLowerCase() ===
+                        String(desc.md5).toLowerCase())
+                  ) {
+                    if (el.picElement) el.picElement.sourcePath = rkeyDl.localPath;
+                  }
+                }
+                this.messageIdStore?.indexMsgMedia?.(ownerEntry.rawMsg, ownerEntry.oneBotId);
+              }
+            }
+          }
+        } catch (rkeyErr) {
+          this.logger?.debug?.("media_profile_actions", rkeyErr);
         }
       }
     }
@@ -734,6 +966,14 @@ const ACTION_HANDLERS = {
   comment_qzone: handleWebCredentialOrQzoneAction,
 
   async get_rkey() {
+    try {
+      const ssoRkeys = await getOneBotRKeyList(this);
+      if (Array.isArray(ssoRkeys) && ssoRkeys.length > 0) {
+        return { rkeys: ssoRkeys };
+      }
+    } catch (rkeyErr) {
+      this.logger?.debug?.("media_profile_actions", rkeyErr);
+    }
     const res = await this.invokeNt(
       "nodeIKernelUnitedConfigService/loadUnitedConfig",
       { id: "100293", group: "100293" },

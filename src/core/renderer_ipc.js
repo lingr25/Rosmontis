@@ -109,6 +109,13 @@ const SIDE_EFFECT_NT_METHODS = new Set([
   "quickLoginWithUin",
 ]);
 
+// Kernel commands that trigger asynchronous background work via listener events
+// and legitimately resolve to `undefined` (`void`) when dispatched over IPC.
+const VOID_ASYNC_NT_METHODS = new Set([
+  "downloadRichMedia",
+  "downloadRichMediaInVisit",
+]);
+
 /**
  * @param {string} cmd
  * @returns {boolean}
@@ -116,6 +123,15 @@ const SIDE_EFFECT_NT_METHODS = new Set([
 function isSideEffectNtCmd(cmd) {
   const method = String(cmd || "").split("/").pop() || "";
   return SIDE_EFFECT_NT_METHODS.has(method);
+}
+
+/**
+ * @param {string} cmd
+ * @returns {boolean}
+ */
+function isVoidAsyncNtCmd(cmd) {
+  const method = String(cmd || "").split("/").pop() || "";
+  return VOID_ASYNC_NT_METHODS.has(method);
 }
 
 /**
@@ -142,12 +158,17 @@ function isBridgeUnavailableError(err) {
 /** @type {string | null} */
 let cachedRendererBridgeSource = null;
 
+function invalidateRendererBridgeCache() {
+  cachedRendererBridgeSource = null;
+}
+
 /**
  * Loads and caches the self-contained `src/bridge_renderer.js` script source.
+ * @param {{ forceReload?: boolean }} [options]
  * @returns {string}
  */
-function getRendererBridgeSource() {
-  if (cachedRendererBridgeSource !== null) {
+function getRendererBridgeSource(options = {}) {
+  if (cachedRendererBridgeSource !== null && !options?.forceReload) {
     return cachedRendererBridgeSource;
   }
   try {
@@ -289,12 +310,17 @@ class RendererIpcController {
   /**
    * @param {any} event
    * @param {any} payload
+   * @param {string} [expectedTokenOverride]
    * @returns {boolean}
    */
-  _isTrustedIpcEvent(event, payload) {
+  _isTrustedIpcEvent(event, payload, expectedTokenOverride = undefined) {
+    const expectedToken =
+      typeof expectedTokenOverride === "string" && expectedTokenOverride.length > 0
+        ? expectedTokenOverride
+        : this._ipcAuthToken;
     if (!event || !event.sender) {
       if (payload && typeof payload === "object" && payload.__ipcToken !== undefined) {
-        return verifyAccessTokenConstantTime(String(payload.__ipcToken || ""), this._ipcAuthToken);
+        return verifyAccessTokenConstantTime(String(payload.__ipcToken || ""), expectedToken);
       }
       return true;
     }
@@ -322,7 +348,7 @@ class RendererIpcController {
         payload && typeof payload === "object" && typeof payload.__ipcToken === "string"
           ? payload.__ipcToken
           : "";
-      if (!verifyAccessTokenConstantTime(provided, this._ipcAuthToken)) {
+      if (!verifyAccessTokenConstantTime(provided, expectedToken)) {
         return false;
       }
     }
@@ -334,10 +360,10 @@ class RendererIpcController {
    * @param {any} ack
    */
   _handleRendererCmdAck(_event, ack) {
-    if (!this._isTrustedIpcEvent(_event, ack)) return;
     if (!ack || typeof ack !== "object" || !ack.reqId) return;
     const reqId = String(ack.reqId);
     const pending = this._pendingRendererCmds.get(reqId);
+    if (!this._isTrustedIpcEvent(_event, ack, pending?.expectedToken)) return;
     if (!pending) return;
     if (pending.webContents && _event && _event.sender && _event.sender !== pending.webContents) {
       return;
@@ -368,6 +394,98 @@ class RendererIpcController {
       }
       pending.reject(err);
     }
+  }
+
+  _invalidateRendererBridgeCache() {
+    invalidateRendererBridgeCache();
+  }
+
+  /**
+   * Re-injects the updated renderer bridge script into all live trusted `webContents`
+   * while rotating `_ipcAuthToken` atomically (rolling back the token if every target fails).
+   * @param {string | null} [customCode=null]
+   * @returns {Promise<{ reloadedCount: number, failedCount: number }>}
+   */
+  async _reloadRendererWebContents(customCode = null) {
+    invalidateRendererBridgeCache();
+    const code =
+      typeof customCode === "string" && customCode.length > 0
+        ? injectWireCodecIntoRendererSource(customCode)
+        : getRendererBridgeSource({ forceReload: true });
+    if (!code) {
+      return { reloadedCount: 0, failedCount: 0 };
+    }
+
+    /** @type {Set<any>} */
+    const targets = new Set();
+    if (this._knownWebContents instanceof Set) {
+      for (const wc of this._knownWebContents) {
+        if (wc) targets.add(wc);
+      }
+    }
+    if (this.activeWebContents) {
+      targets.add(this.activeWebContents);
+    }
+
+    /** @type {any[]} */
+    const liveTargets = [];
+    for (const wc of targets) {
+      if (!this._isWebContentsAlive(wc) || typeof wc.executeJavaScript !== "function") {
+        continue;
+      }
+      if (typeof wc.getURL === "function") {
+        let url = "";
+        try {
+          url = wc.getURL();
+        } catch (err) {
+          this._debugSafe(err);
+          continue;
+        }
+        if (!this._isTrustedRendererUrl(url)) {
+          continue;
+        }
+      }
+      liveTargets.push(wc);
+    }
+
+    if (liveTargets.length === 0) {
+      return { reloadedCount: 0, failedCount: 0 };
+    }
+
+    const previousIpcAuthToken = this._ipcAuthToken;
+    this._ipcAuthToken = crypto.randomBytes(24).toString("hex");
+    const ipcAuthTokenJson = this._safeJsJson(this._ipcAuthToken);
+    const sc = this.bridge.sessionController;
+    const syncPatchJson = this._safeJsJson({
+      activeAioPeer: sc ? sc.activeAioPeer : null,
+      activeAioPeerKey: sc ? sc.activeAioPeerKey : "",
+      focused: sc ? sc.windowFocused : false,
+    });
+
+    let reloadedCount = 0;
+    let failedCount = 0;
+    for (const wc of liveTargets) {
+      try {
+        const rawWid = Number(wc.id || 1);
+        const widJson = this._safeJsJson(Number.isFinite(rawWid) && rawWid > 0 ? rawWid : 1);
+        const script = `(function(){ var wid = ${widJson}; var ipcAuthToken = ${ipcAuthTokenJson}; var syncPatch = ${syncPatchJson}; window.__ROSMONTIS_WINDOW_ID__ = wid; Object.defineProperty(window, "__ROSMONTIS_SKIP_AUTO_INSTALL__", { value: true, enumerable: false, configurable: true, writable: true }); try {\n${code}\nif (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: wid, forceReinstall: true, preserveSessionState: true, autoRegisterListeners: false, ipcAuthToken: ipcAuthToken }); if (b && typeof b.syncSessionState === "function") b.syncSessionState(syncPatch); } } finally { try { delete window.__ROSMONTIS_SKIP_AUTO_INSTALL__; } catch (_delErr) { /* ignore non-configurable flag */ } } return true; })();`;
+        await Promise.resolve(wc.executeJavaScript(script, true));
+        wc.__rosmontisBridgeInjected = true;
+        wc.__rosmontisIpcTokenInjected = true;
+        if (typeof wc.send === "function" && this._ipcCmdAckInstalled) {
+          wc.__rosmontisCmdChannelReady = true;
+        }
+        reloadedCount += 1;
+      } catch (err) {
+        this._debugSafe(err);
+        failedCount += 1;
+      }
+    }
+
+    if (reloadedCount === 0 && failedCount > 0) {
+      this._ipcAuthToken = previousIpcAuthToken;
+    }
+    return { reloadedCount, failedCount };
   }
 
   /** @returns {RendererHealthStats} */
@@ -713,7 +831,7 @@ class RendererIpcController {
           activeAioPeerKey: sc ? sc.activeAioPeerKey : "",
           focused: sc ? sc.windowFocused : false,
         });
-        const script = `(function(){ var wid = ${widJson}; var ipcAuthToken = ${ipcAuthTokenJson}; var syncPatch = ${syncPatchJson}; if (window.__ROSMONTIS_RENDERER_BRIDGE__) { if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken(ipcAuthToken); window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(wid); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(syncPatch); return true; } window.__ROSMONTIS_WINDOW_ID__ = wid;\n${code}\nif (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: wid, autoRegisterListeners: true, ipcAuthToken: ipcAuthToken }); if (b && typeof b.setIpcAuthToken === "function") b.setIpcAuthToken(ipcAuthToken); if (b && typeof b.syncSessionState === "function") b.syncSessionState(syncPatch); } return true; })();`;
+        const script = `(function(){ var wid = ${widJson}; var ipcAuthToken = ${ipcAuthTokenJson}; var syncPatch = ${syncPatchJson}; if (window.__ROSMONTIS_RENDERER_BRIDGE__) { if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.setIpcAuthToken(ipcAuthToken); window.__ROSMONTIS_RENDERER_BRIDGE__.setWindowId(wid); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.reattachListeners(); if (typeof window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState === "function") window.__ROSMONTIS_RENDERER_BRIDGE__.syncSessionState(syncPatch); return true; } window.__ROSMONTIS_WINDOW_ID__ = wid; Object.defineProperty(window, "__ROSMONTIS_SKIP_AUTO_INSTALL__", { value: true, enumerable: false, configurable: true, writable: true }); try {\n${code}\nif (typeof installRendererBridge === "function") { var b = installRendererBridge(window, { windowId: wid, autoRegisterListeners: true, ipcAuthToken: ipcAuthToken }); if (b && typeof b.setIpcAuthToken === "function") b.setIpcAuthToken(ipcAuthToken); if (b && typeof b.syncSessionState === "function") b.syncSessionState(syncPatch); } } finally { try { delete window.__ROSMONTIS_SKIP_AUTO_INSTALL__; } catch (_delErr) { /* ignore non-configurable flag */ } } return true; })();`;
         const genAtStart = injectGen;
         injectPending = true;
         Promise.resolve(webContents.executeJavaScript(script, true))
@@ -1027,6 +1145,7 @@ class RendererIpcController {
           reqId,
           type,
           webContents: wc,
+          expectedToken: envelope.__ipcToken,
           timer,
           resolve,
           reject,
@@ -1195,8 +1314,8 @@ class RendererIpcController {
           },
         };
         const res = await handler(payload, fakeIpcEvent);
-        // A resolved side-effect call has been dispatched even if it returns void.
-        if (res !== undefined || sideEffect) {
+        // A resolved side-effect or void-async call has been dispatched even if it returns void.
+        if (res !== undefined || sideEffect || isVoidAsyncNtCmd(cmd)) {
           this._recordInvokeTier(cmd, 2, errors, options);
           return { handled: true, value: res };
         }
@@ -1369,9 +1488,12 @@ module.exports = {
   SERVICE_GETTER_MAP,
   BRIDGE_UNAVAILABLE_TAG,
   SIDE_EFFECT_NT_METHODS,
+  VOID_ASYNC_NT_METHODS,
   isSideEffectNtCmd,
+  isVoidAsyncNtCmd,
   makeBridgeUnavailableError,
   isBridgeUnavailableError,
+  invalidateRendererBridgeCache,
   getRendererBridgeSource,
   RendererIpcController,
 };

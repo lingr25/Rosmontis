@@ -115,6 +115,9 @@
  * @property {string} [ffmpegPath]
  * @property {string} [silkDecoderPath]
  * @property {string} [silkEncoderPath]
+ * @property {string | false} [silkAddonPath]
+ * @property {string} [nodeBinPath]
+ * @property {number} [maxTempFiles]
  * @property {string} [stateDir]
  * @property {boolean} [persistStores]
  * @property {number} [statePersistDebounceMs]
@@ -516,6 +519,11 @@
  * and OneBot v11 action routers (`src/actions/*.js`).
  * @typedef {object} BridgeHostMembers
  * @property {string | undefined} [_configDir]
+ * @property {boolean} [_explicitConfig]
+ * @property {string} [_bridgeRootDir]
+ * @property {Record<string, any>} [_rkeyState]
+ * @property {Map<string, (action: string, p: Record<string, any>, context?: ActionContext) => Promise<any>>} [_actionDispatchMap]
+ * @property {(nextMap: Map<string, any>) => void} [_syncModuleActionDispatchMap]
  * @property {BridgeConfig} config
  * @property {InstanceType<typeof import("./onebot/stores").MessageIdStore>} messageIdStore
  * @property {InstanceType<typeof import("./onebot/stores").UinUidStore>} uinUidStore
@@ -544,6 +552,9 @@
  * @property {InstanceType<typeof import("./core/inbound_pipeline").InboundPipeline>} inboundPipeline
  * @property {InstanceType<typeof import("./core/outbound_pipeline").OutboundPipeline>} outboundPipeline
  * @property {InstanceType<typeof import("./core/server_runtime").ServerRuntime>} serverRuntime
+ * @property {InstanceType<typeof import("./core/hot_reload").HotReloadController>} hotReload
+ * @property {Record<string, any>} richMediaStats
+ * @property {Record<string, any>} reloadStats
  * @property {SendEchoStats} sendEchoStats
  * @property {MapHookReleaseRecord | null} mapHookRelease
  * @property {any} activeWebContents
@@ -567,6 +578,8 @@
  * @property {() => Promise<void>} startServers
  * @property {() => Promise<void>} stopServers
  * @property {(options?: Record<string, any>) => Promise<ReloadConfigResult>} reloadConfig
+ * @property {(customRootDir?: string | null) => { codeDigest: string, fileCount: number, files: string[] }} getCodeDigestInfo
+ * @property {(options?: Record<string, any>) => Promise<Record<string, any>>} reloadBridge
  * @property {(eventObj: any, messageFormat: string) => any} _formatEventForEndpoint
  * @property {(event: any) => void} broadcastOneBotEvent
  * @property {() => Promise<{ clientKey: string, expireTime: string, keyIndex: string, url: string }>} _fetchClientKey

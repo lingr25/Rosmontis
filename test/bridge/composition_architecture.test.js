@@ -17,6 +17,7 @@ const rendererIpcMod = require(path.join(REPO_ROOT, "src", "core", "renderer_ipc
 const inboundPipelineMod = require(path.join(REPO_ROOT, "src", "core", "inbound_pipeline.js"));
 const outboundPipelineMod = require(path.join(REPO_ROOT, "src", "core", "outbound_pipeline.js"));
 const serverRuntimeMod = require(path.join(REPO_ROOT, "src", "core", "server_runtime.js"));
+const hotReloadMod = require(path.join(REPO_ROOT, "src", "core", "hot_reload.js"));
 const mediaHydratorMod = require(path.join(REPO_ROOT, "src", "core", "media_hydrator.js"));
 const loginRecoveryMod = require(path.join(REPO_ROOT, "src", "core", "login_recovery.js"));
 
@@ -25,6 +26,7 @@ const { RendererIpcController, getRendererBridgeSource } = rendererIpcMod;
 const { InboundPipeline } = inboundPipelineMod;
 const { OutboundPipeline } = outboundPipelineMod;
 const { ServerRuntime } = serverRuntimeMod;
+const { HotReloadController } = hotReloadMod;
 const { MediaHydrator } = mediaHydratorMod;
 const { LoginRecovery } = loginRecoveryMod;
 
@@ -88,6 +90,7 @@ test("NtqqOneBotBridge is a lean composition coordinator with zero private _xxx 
     },
     { rel: "src/core/outbound_pipeline.js", mod: outboundPipelineMod, forbidden: ["outboundPipelineMixin"] },
     { rel: "src/core/server_runtime.js", mod: serverRuntimeMod, forbidden: ["serverRuntimeMixin"] },
+    { rel: "src/core/hot_reload.js", mod: hotReloadMod, forbidden: ["hotReloadMixin"] },
     { rel: "src/core/media_hydrator.js", mod: mediaHydratorMod, forbidden: ["mediaHydratorMixin"] },
     { rel: "src/core/login_recovery.js", mod: loginRecoveryMod, forbidden: ["loginRecoveryMixin"] },
   ];
@@ -133,6 +136,7 @@ test("NtqqOneBotBridge is a lean composition coordinator with zero private _xxx 
     "src/core/inbound_pipeline.js",
     "src/core/outbound_pipeline.js",
     "src/core/server_runtime.js",
+    "src/core/hot_reload.js",
   ]) {
     const ctrlSrc = fs.readFileSync(path.join(REPO_ROOT, ctrlRel), "utf8");
     assert.match(
@@ -151,6 +155,7 @@ test("Subsystem state lives exclusively on composed controller instances and get
   assert.ok(bridge.inboundPipeline instanceof InboundPipeline);
   assert.ok(bridge.outboundPipeline instanceof OutboundPipeline);
   assert.ok(bridge.serverRuntime instanceof ServerRuntime);
+  assert.ok(bridge.hotReload instanceof HotReloadController);
   assert.ok(bridge.inboundPipeline.mediaHydrator instanceof MediaHydrator);
   assert.ok(bridge.inboundPipeline.loginRecovery instanceof LoginRecovery);
 
