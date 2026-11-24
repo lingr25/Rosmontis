@@ -802,18 +802,26 @@ class RendererIpcController {
         const url = rawUrl.trim().toLowerCase();
         if (this._isMainChatUrl(url)) {
           this.bridge.online = true;
+          this.bridge.inboundPipeline?._clearLoginError?.();
         }
         if (this._shouldPromoteWebContents(webContents)) {
           this.activeWebContents = webContents;
         }
         const maybeTriggerQuickLogin = () => {
-          if (!this.bridge.online && url.includes("login") && this.config?.autoQuickLogin !== false) {
-            const timer = setTimeout(() => {
-              this._tryAutoQuickLogin({ webContents }).catch((/** @type {any} */ err) =>
-                this._debugSafe(err)
+          if (!this.bridge.online && url.includes("login")) {
+            if (this.config?.autoQuickLogin !== false) {
+              const timer = setTimeout(() => {
+                this._tryAutoQuickLogin({ webContents }).catch((/** @type {any} */ err) =>
+                  this._debugSafe(err)
+                );
+              }, 1500);
+              if (timer && typeof timer.unref === "function") timer.unref();
+            } else {
+              this.bridge.inboundPipeline?.loginRecovery?.scheduleRendererPromptCheck?.(
+                webContents,
+                2500
               );
-            }, 1500);
-            if (timer && typeof timer.unref === "function") timer.unref();
+            }
           }
         };
         if (pageInjected || injectPending) {

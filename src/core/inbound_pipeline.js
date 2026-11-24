@@ -431,6 +431,7 @@ class InboundPipeline {
       liveness.degradedReason = "";
       liveness.consecutiveFailures = 0;
       liveness.lastKernelEventAt = Date.now();
+      this.loginRecovery?.clearLoginError?.();
     }
     if (this.bridge.ntCapture) {
       this.bridge.ntCapture._updateSelfIdentity(identity);
@@ -1732,6 +1733,15 @@ class InboundPipeline {
   /** @param {Record<string, any>} [options={}] */
   _tryAutoQuickLogin(options = {}) {
     return this.loginRecovery.tryAutoQuickLogin(options);
+  }
+
+  /** @returns {import("../types").LoginStateSnapshot} */
+  getLoginState() {
+    return this.loginRecovery.getLoginState();
+  }
+
+  _clearLoginError() {
+    this.loginRecovery.clearLoginError();
   }
 }
 

@@ -609,6 +609,10 @@ const ACTION_HANDLERS = {
           typeof this.inboundPipeline?._ensureLivenessState === "function"
             ? { ...this.inboundPipeline._ensureLivenessState() }
             : null,
+        login:
+          typeof this.inboundPipeline?.getLoginState === "function"
+            ? this.inboundPipeline.getLoginState()
+            : null,
         anomalies:
           typeof this.inboundPipeline?._ensureAnomalyRecorder === "function"
             ? this.inboundPipeline._ensureAnomalyRecorder().getSummary({ includePayloads: false })

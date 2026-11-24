@@ -409,12 +409,25 @@ class ServerRuntime {
     const rendererUnresponsive = Boolean(b.rendererHealthStats?.unresponsiveActive);
     const livenessState = b.inboundPipeline?._ensureLivenessState?.() || null;
     const livenessOk = livenessState ? Boolean(livenessState.healthy) : true;
+    const loginState = b.inboundPipeline?.getLoginState?.() || null;
+    const reloginRequired = !online && Boolean(loginState?.relogin_required);
     const ready = online && ntReady && !rendererUnresponsive && livenessOk;
     return {
       ready,
       online,
       nt_ready: ntReady,
       renderer_unresponsive: rendererUnresponsive,
+      ...(reloginRequired
+        ? {
+            relogin_required: true,
+            ...(loginState?.state ? { login_state: loginState.state } : {}),
+            ...(loginState?.reason ? { login_reason: loginState.reason } : {}),
+            ...(loginState?.error_code ? { login_error_code: loginState.error_code } : {}),
+            ...(loginState?.error_message
+              ? { login_error_message: loginState.error_message }
+              : {}),
+          }
+        : {}),
       ...(!livenessOk ? { liveness_ok: false } : {}),
       ...(livenessState?.degradedReason ? { degraded_reason: livenessState.degradedReason } : {}),
       self_id: Number(b.selfUin || 0),
@@ -479,6 +492,9 @@ class ServerRuntime {
       "# HELP rosmontis_ready Whether the bridge is ready to serve requests.",
       "# TYPE rosmontis_ready gauge",
       `rosmontis_ready ${readiness.ready ? 1 : 0}`,
+      "# HELP rosmontis_relogin_required Whether QQ requires manual re-login or re-authentication.",
+      "# TYPE rosmontis_relogin_required gauge",
+      `rosmontis_relogin_required ${readiness.relogin_required ? 1 : 0}`,
       "# HELP rosmontis_liveness_ok Whether silent kernel liveness checks report healthy.",
       "# TYPE rosmontis_liveness_ok gauge",
       `rosmontis_liveness_ok ${readiness.liveness_ok === false ? 0 : 1}`,
@@ -705,11 +721,22 @@ class ServerRuntime {
 
         const actionName = u.pathname.replace(/^\/+/, "");
         if (req.method === "GET" && (actionName === "health" || actionName === "")) {
+          const loginState = this.bridge.inboundPipeline?.getLoginState?.() || null;
+          const reloginRequired = !this.bridge.online && Boolean(loginState?.relogin_required);
           writeHttpJson(res, 200, {
             status: "ok",
             retcode: 0,
             self_id: Number(this.bridge.selfUin || 0),
             online: this.bridge.online,
+            ...(reloginRequired
+              ? {
+                  relogin_required: true,
+                  ...(loginState?.error_code ? { login_error_code: loginState.error_code } : {}),
+                  ...(loginState?.error_message
+                    ? { login_error_message: loginState.error_message }
+                    : {}),
+                }
+              : {}),
           });
           return;
         }

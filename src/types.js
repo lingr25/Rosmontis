@@ -655,4 +655,28 @@
  * @property {boolean} [autoStartServers]
  */
 
+/**
+ * Normalized login failure / re-login requirement detail captured from NTQQ kernel
+ * login events, quick-login responses, or login-page security prompts.
+ * @typedef {object} LoginErrorInfo
+ * @property {string} source
+ * @property {string} reason
+ * @property {string} code
+ * @property {string} message
+ * @property {number} at
+ */
+
+/**
+ * Snapshot of the bridge login/re-login state exposed by `LoginRecovery.getLoginState()`,
+ * `GET /ready`, `GET /health`, and `get_status`.
+ * @typedef {object} LoginStateSnapshot
+ * @property {"online" | "relogin_required" | "offline"} state
+ * @property {boolean} relogin_required
+ * @property {string} [reason]
+ * @property {string} [error_code]
+ * @property {string} [error_message]
+ * @property {string} [source]
+ * @property {number} [updated_at]
+ */
+
 module.exports = {};
